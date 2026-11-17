@@ -22,7 +22,8 @@
 | **D8** | CLI / MCP 无宿主 Agent | **未配置时走 sampling，已配置时用配置**；两者都无则显式降级并报告 | §3.3 |
 | **D9** | 先不写代码 | 本轮只收敛设计；路线图保留但**不启动实现** | §12 |
 | **D10** | LLMClient 保留**轻量 tool-calling**，支持多轮查询后再产出 | `Complete` 仍是单轮 primitive，**循环由 Gmem 拥有**，收敛由 Gmem 硬约束（§3.2） | §3.2 |
-| **D11** | P4 做**内嵌前端** | 允许引入前端库与构建链；但产物必须 `//go:embed` 进二进制，**运行时仍零外部依赖**（§9） | §9 |
+| **D11** | P4 做**内嵌前端** | 允许引入前端库与构建链（Node 作为**开发期**依赖可以接受）；产物 `//go:embed` 进二进制，运行时零外部依赖 | §9 |
+| **D12** | 双时态采用**系统时间版本化**（B-4/B-5 裁决） | `memories`/`edges` 主键改为 `(id, version)`；`Update` 插新版并把旧版置 `t_expired`；默认读当前版本，`as_of` 按版本区间选；FTS 索引所有版本 | §2 |
 
 **三条核心取舍，都必须先认下来：**
 
@@ -108,6 +109,7 @@ erDiagram
     }
     memories {
         text id PK
+        int  version PK
         text scope
         text concept_id FK
         text kind
@@ -125,16 +127,20 @@ erDiagram
         text scope
         text concept_id FK
         text canonical_name
+        text source_episode FK
         text props_json
     }
     edges {
         text id PK
+        int  version PK
         text from_id FK
         text to_id FK
         text relation
         real weight
         int  t_valid
         int  t_invalid
+        int  t_created
+        int  t_expired
     }
     concepts {
         text id PK
@@ -158,13 +164,20 @@ erDiagram
     concepts ||--o{ concepts : subtype_of
 ```
 
-**三处刻意的设计：**
+**四处刻意的设计：**
 
-1. **`episodes` 是不可变的事实来源**（Zep 的底线）。任何 `memories`/`nodes` 都能溯源回 episode，重建得出来。
-2. **`memories` 和 `edges` 都带四个时间戳**：`t_valid`/`t_invalid` 是世界时间，`t_created`/`t_expired` 是系统时间。矛盾只置 `t_invalid`，**永不物理删除**。
-3. **`concepts.status` 是 D1 的关键**：`draft` / `certified` / `deprecated`。只有 `certified` 参与硬契约。这是让"本体不拒绝写入"能成立的机制——概念先以草稿累积，认证后才约束召回。
+1. **`episodes` 是不可变的事实来源**（Zep 的底线）。任何 `memories`/`nodes` 都能溯源回 episode，重建得出来。因此 `nodes` 也必须有 `source_episode`。
+2. **两个时间轴，语义必须严格区分**（D12 裁决，见下）：
+   - **世界时间** `t_valid` / `t_invalid`：这个事实**在现实世界中**何时成立。矛盾发生 → 只置 `t_invalid`，**永不物理删除**。
+   - **系统时间** `t_created` / `t_expired`：**系统何时知道/何时不再认为它是当前版本**。`Update` 不改行，而是**插入新版本并把旧版本置 `t_expired`**。
+3. **版本化主键 `(id, version)`**：`id` 是用户可见的逻辑身份，`version` 从 1 递增。**默认读取 = 当前版本（`t_expired IS NULL`）**；`as_of` 选 `t_created ≤ as_of < t_expired` 的版本。这一条是 B-4 的裁决 —— 若不版本化，`t_created`/`t_expired` 就是两列死字段，双时态退化成单时态。
+4. **`concepts.status` 是 D1 的关键**：`draft` / `certified` / `deprecated`。只有 `certified` 参与硬契约。这是让"本体不拒绝写入"能成立的机制——概念先以草稿累积，认证后才约束召回。
 
 **派生索引**：`memories_fts`（FTS5 + bigram 列）、`vec_blob`（int8 量化快照）。二者都可从主表重建。
+
+> **FTS 与版本的关系（B-5 裁决）**：FTS 索引**每一行的每个版本**，查询时 join 到 `memories(id, version)` 并按上述有效性规则过滤。代价是索引体积随版本数增长（常见情况仅 1–2 版，可接受）；收益是 `as_of` 与词法检索可以组合，不会出现"回溯查询静默少了词法通道"。
+
+> **范围隔离是 Port 契约的一部分**：`NeighborQuery` 等一切查询**必须带 `Scope` 且在后端强制过滤**。漏一个字段就是跨 scope 泄漏（review 实测曾出现 user→agent 的边），这不是性能问题而是隔离缺陷。
 
 ---
 
@@ -930,6 +943,8 @@ flowchart TB
 
 3. **图不外包给图数据库**
    > `the graph here is two tables — graph_nodes and graph_edges — in the same database as the vectors... inside one transaction boundary.`
+
+   ⚠️ **实现警告（P0 review 实测）**："同一事务边界"不能靠"各 Port 各自持 `*sql.DB`"实现。当连接池上差点为 1 时，`Tx` 独占唯一连接，回调内再调 `Lexical.Index`/`Vector.Upsert`/`Graph.PutNode` 会**永久挂死**（表现为超时而非报错）。正确做法：`Tx` 必须把 `*sql.Tx` **注入**给后端的各个 Port 副本，使回调内调用落到同一事务；无法注入时必须**快速返回 `ErrTxConflict`**，绝不阻塞。
 
 ### Gmem 的具体注意点
 
