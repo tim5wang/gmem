@@ -15,13 +15,14 @@
 | D1 | 本体契约加在**召回侧** | 本体永不拒绝写入；只有召回时才做对齐、选路、判覆盖 | §5 |
 | D2 | 需要**本地**提取/消歧/链接管线 | 管线本体在 Gmem 内，不依赖外部服务编排 | §3 §4 |
 | D3 | 两种触发：自动 + Agent 调用 | 二者共享同一套原子 op，不允许两条代码路径 | §8 |
-| D4 | 可视化要能**以网络图看实体与关系** | 首版即 Graph View；零前端构建，`gmem serve` 起本地 HTTP | §9 |
+| D4 | 可视化要能**以网络图看实体与关系** | 首版即 Graph View；`gmem serve` 起本地 HTTP | §9 |
 | D5 | 三接入：CLI / MCP / Go package | 同一接口面三层薄壳，方法名对齐主流五动词 | §10 |
 | D6 | 双后端可迁移 | Phase 1 就定 Port 接口，SQLite 先落地，PG+pgvector 后接 | §11 |
 | **D7** | 实体抽取**需要 LLM**，但 LLM 由**主调方 Agent** 承担 | `LLMClient` / `Extractor` 两层抽象；Gmem **不直连任何 LLM、不 import 任何 LLM SDK** | §3.1 |
 | **D8** | CLI / MCP 无宿主 Agent | **未配置时走 sampling，已配置时用配置**；两者都无则显式降级并报告 | §3.3 |
 | **D9** | 先不写代码 | 本轮只收敛设计；路线图保留但**不启动实现** | §12 |
 | **D10** | LLMClient 保留**轻量 tool-calling**，支持多轮查询后再产出 | `Complete` 仍是单轮 primitive，**循环由 Gmem 拥有**，收敛由 Gmem 硬约束（§3.2） | §3.2 |
+| **D11** | P4 做**内嵌前端** | 允许引入前端库与构建链；但产物必须 `//go:embed` 进二进制，**运行时仍零外部依赖**（§9） | §9 |
 
 **三条核心取舍，都必须先认下来：**
 
@@ -732,7 +733,10 @@ flowchart TB
 
 ### 工程约束
 
-- **零前端构建**：单个 HTML + 原生 JS，力导向自己写（~150 行的迭代弹簧-电荷模型就够）。**禁止引入 d3 / npm**。
+- **内嵌前端（D11）**：允许使用前端库与构建链（力导向可改用成熟库，不必自己写弹簧-电荷模型），但产物必须通过 `//go:embed` 编进二进制。**运行时依然零外部依赖**——`go install` 下来就是完整可用的，不需要另跑前端服务、不需要 Node。
+  - 职责边界：`web/` 目录是构建输入（可以 npm），`web/dist/` 是构建产物并被 embed。**Go 代码只依赖 `web/dist/`，永不 import npm 包。**
+  - 代价（自觉接受）：构建产物必须提交进仓库，否则 `go build` 会失败；为此加一个 `make web-check` 校验 `web/dist/` 与 `web/src/` 是否同步，避免“改了源码忘了重建”。
+  - 若 CI/本地未装 Node：**已提交的 `web/dist/` 仍然可以构建整个 Go 二进制**，只有想改前端时才需要 Node。这是一条硬要求——不能因为前端而让 `go install` 变得不可用。
 - **渲染上限**：SVG ≤ 2k 节点；超过切 Canvas。超预算时**先聚簇折叠**，不降帧。
 - **数据接口**：`GET /api/graph?focus=&hops=&as_of=`、`GET /api/entity/{id}`、`POST /api/review`。返回预布局坐标缓存，避免前端抖动。
 - **只读优先**：默认只读；唯一的写入口是待审裁决，且必须二次确认。
@@ -972,7 +976,7 @@ flowchart LR
 | **P1** | Concept Aligner + Recall Planner + lane 选择 + `insufficient` + `Explain` | 关系型问句在**无 embedder** 时靠 graph lane 答出；覆盖率不足时返回 `Missing` |
 | **P2** | L0/L1 两级 + `LLMClient` / `Extractor` 抽象 + **轻量 tool-calling 循环与五条收敛门禁** + `FakeLLM` + 三区消歧 | 同一实体 5 种写法收敛为 1 节点；灰区不自动合并；`FakeLLM` 下全测试无网络依赖；**“永远返回 tool call” 的序列恰好 3 轮后强制终稿，总调用次数 == MaxTurns+1** |
 | **P3** | 双时态失效 + op 层 + 触发器（去抖/阈值/空闲）+ Agent 工具面 | 矛盾写入后旧事实 `as_of` 仍可查；去抖使 N 轮对话只触发 1 次 |
-| **P4** | **Graph View 优先** + 五跳式交互 + `gmem serve` | 万级节点库下首屏 < 1s（聚簇折叠生效）；双击展开与待审裁决可用 |
+| **P4** | **Graph View 优先** + 五跳式交互 + 内嵌前端（`//go:embed`）+ `gmem serve` | 万级节点库下首屏 < 1s（聚簇折叠生效）；双击展开与待审裁决可用；**未装 Node 的机器上 `go build` 仍成功** |
 | **P5** | CLI + MCP（配置优先/sampling 兜底 + 兼容别名）+ `doctor` | MCP 官方 memory client 零改动可连；两路径产出形状一致；均不可用时显式降级 |
 | **P6** | PG+pgvector 后端 + `migrate` + parity 测试 + 评测管线 | 一个测试体跑两库答案一致；LongMemEval/LoCoMo 出基线分 |
 
@@ -1014,7 +1018,8 @@ flowchart LR
 | **两条 LLM 路径行为漂移** | 同一片段走配置与走 sampling 结果不同 | 共用同一个 `ExtractResult` 校验器；parity 测试以 `FakeLLM` 跑两路径同一断言 |
 | **sampling 弹窗过多** | 写入体验崩 | 配置优先；sampling 只在未配置时启用；批量合为一次弹窗，单条直接降级 |
 | **大量节点图渲染卡顿** | 可视化不可用 | 不渲染全图：聚簇折叠 + 节点预算 + SVG/Canvas 分档 |
-| **可视化引入前端构建** | 违背零依赖 | 单文件 HTML + 原生 JS，禁止 npm |
+| **前端产物与源码不同步** | `go build` 拿到旧前端 | `make web-check` 校验 `web/dist` 与 `web/src` 一致性；构建产物必须提交 |
+| **未装 Node 导致构建失败** | 违背“运行时零依赖” | `web/dist/` 提交进仓库，Go 构建只读 embed 产物；只有改前端才需 Node |
 
 ### 证据边界
 
