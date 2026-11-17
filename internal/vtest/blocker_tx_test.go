@@ -3,7 +3,6 @@ package vtest
 import (
 	"context"
 	"errors"
-	"os"
 	"testing"
 	"time"
 
@@ -35,23 +34,15 @@ import (
 // txDeadlockProbeTimeout 是探针等待上限：死锁表现为"超时也未返回"。
 const txDeadlockProbeTimeout = 1500 * time.Millisecond
 
-// TestBlockerTxWithLexicalDeadlocks 复现：Tx 回调内调用 Lexical.Index 会永久阻塞。
+// TestBlockerTxWithLexicalDeadlocks 回归：Tx 回调内调用 Lexical.Index 不得阻塞。
 //
-// 这是一个**已知缺陷的复现用例**，因此默认跳过：若默认运行，`go test ./...`
-// 会因为这条已知问题而永久变红，反而掩盖新出现的真实回归。
-// 需要复现时显式打开：
+// 历史：P0 首版在这条路径上**永久挂死**（SetMaxOpenConns(1) + Tx 独占连接），
+// 用例当时挂在 GMEM_VERIFY_BLOCKER 门禁后。修复后门禁已移除：
+// 这是永久回归用例，缺陷一旦重现就会让 `go test ./...` 直接变红。
 //
-//	export PATH=/usr/local/go/bin:$PATH
-//	cd /Users/taiwu.wang/Documents/leader_agent/gmem
-//	CGO_ENABLED=0 GMEM_VERIFY_BLOCKER=1 go test ./internal/vtest/ \
-//	    -run TestBlockerTxWithLexicalDeadlocks -v -timeout 60s
-//
-// 期望（修复后）：Tx 返回错误或成功提交（用例会转为 PASS 并打日志提醒删掉本门禁）。
-// 现状（P0 交付物）：Tx 永不返回 —— 用例在 1.5s 后以 FAIL 报出根因。
+// 断言：Tx 在超时内返回（成功则已提交，失败则必须给出明确错误），
+// 绝不接受"永不返回"。
 func TestBlockerTxWithLexicalDeadlocks(t *testing.T) {
-	if os.Getenv("GMEM_VERIFY_BLOCKER") == "" {
-		t.Skip("已知阻塞项：设 GMEM_VERIFY_BLOCKER=1 复现（Tx 内跨 Port 调用死锁）")
-	}
 	d := openMemory(t)
 	base := context.Background()
 
@@ -82,20 +73,14 @@ func TestBlockerTxWithLexicalDeadlocks(t *testing.T) {
 		}
 		t.Logf("Tx 内跨 Port 调用已成功提交：跨 Port 原子性可用")
 	case <-time.After(txDeadlockProbeTimeout):
-		t.Fatalf(`【阻塞合并】Store.Tx 回调内调用 Lexical.Index 死锁：%v 内未返回。
+		t.Fatalf(`【阻塞回归】Store.Tx 回调内调用 Lexical.Index 死锁：%v 内未返回。
 
-根因：sqlite.Open 里 SetMaxOpenConns(1)。Store.Tx 在回调期间独占唯一连接；
-Lexical/Vector/Graph 各自持有同一个 *sql.DB 并去抢连接 ⇒ 互等。
+根因（若重现）：连接池上差点为 1，Tx 独占唯一连接，
+而 Lexical/Vector/Graph 又各自走 *sql.DB 去抢连接 ⇒ 互等。
 
-影响面：§11 要求"图与记忆在同一事务边界内"，当前无法实现；
-在 Tx 内写 memory+FTS 或 memory+graph 会 hang 死进程（不是报错）。
-
-最小修复方向（不由本测试实施）：
-  a) 让四个 Port 共享同一个事务句柄：Tx 把 *sql.Tx 注入到 lex/vector/graph 的副本上，
-     使回调内调用直接落到当前事务；或
-  b) 明确禁止跨 Port 事务，Port 文档写死"Tx 内只允许用 tx 参数"，
-     并让跨 Port 调用快速返回 ErrTxConflict 而不是挂死。`,
-			txDeadlockProbeTimeout)
+正确形态（当前实现）：Tx 把 *sql.Tx 注入到 ctx，各 Port 从 ctx 解析执行句柄，
+回调内用**回调收到的 ctx** 调用即落到同一事务；
+拿不到事务句柄时立刻返回 store.ErrTxConflict，绝不排队等连接。`, txDeadlockProbeTimeout)
 	}
 }
 

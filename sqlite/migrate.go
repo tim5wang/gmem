@@ -14,11 +14,15 @@ import (
 //   - 已应用的版本记录在 schema_migrations，重复执行 Migrate 不会再跑；
 //   - 每条 DDL 都写 IF NOT EXISTS，因此即使 schema_migrations 丢失也不会炸库；
 //   - 单个迁移在一个事务里完成，失败整版回滚（不会留下半截 schema）。
+//
+// Apply 用于无法用纯 DDL 表达的变更（例如"重建表以改主键"）：它必须自己判断
+// 目标 schema 是否已经是新形态，因为 schema_migrations 丢失后整个清单会被重跑。
 
 type migration struct {
 	Version    int
 	Name       string
 	Statements []string
+	Apply      func(ctx context.Context, q querier) error
 }
 
 const migrationsTableDDL = `CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -146,7 +150,146 @@ func migrations() []migration {
 				`CREATE INDEX IF NOT EXISTS idx_vec_blob_scope ON vec_blob(scope)`,
 			},
 		},
+		{
+			// D12（B-4/B-5）：memories / edges 主键改为 (id, version)，系统时间轴才真正可用；
+			// 同时补上 nodes.source_episode（§2 第 1 条：nodes 也必须能溯源回 episode）。
+			Version: 4,
+			Name:    "p0_versioned_bitemporal",
+			Apply:   applyVersionedBitemporal,
+		},
 	}
+}
+
+// applyVersionedBitemporal 重建 memories / edges 为 (id, version) 主键，并补 nodes.source_episode。
+//
+// 为什么必须重建表：SQLite 不支持改主键。用"建新表 → 拷数据 → 换名"三步，
+// 既有数据全部落成 version=1（此前每个 id 只有一行）。
+//
+// 幂等性：整个清单在 schema_migrations 丢失后会被重跑，因此每步都先判断列是否存在，
+// 已是新形态就跳过，绝不做第二次拷贝。
+func applyVersionedBitemporal(ctx context.Context, q querier) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS memories_v4 (
+			id             TEXT    NOT NULL,
+			version        INTEGER NOT NULL DEFAULT 1,
+			scope          TEXT    NOT NULL CHECK (scope IN ('user','agent','project','global')),
+			concept_id     TEXT REFERENCES concepts(id),
+			kind           TEXT    NOT NULL
+			               CHECK (kind IN ('semantic','episodic','procedural','decision')),
+			content        TEXT    NOT NULL,
+			t_valid        INTEGER NOT NULL DEFAULT 0,
+			t_invalid      INTEGER,
+			t_created      INTEGER NOT NULL DEFAULT 0,
+			t_expired      INTEGER,
+			source_episode TEXT REFERENCES episodes(id),
+			importance     REAL    NOT NULL DEFAULT 0.5,
+			recall_count   INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (id, version)
+		)`,
+		`INSERT INTO memories_v4 (id, version, scope, concept_id, kind, content, t_valid, t_invalid,
+			t_created, t_expired, source_episode, importance, recall_count)
+		 SELECT id, 1, scope, concept_id, kind, content, t_valid, t_invalid,
+			t_created, t_expired, source_episode, importance, recall_count
+		 FROM memories WHERE true
+		 ON CONFLICT(id, version) DO NOTHING`,
+		`DROP TABLE IF EXISTS memories`,
+		`ALTER TABLE memories_v4 RENAME TO memories`,
+		`CREATE INDEX IF NOT EXISTS idx_memories_scope_bi ON memories(scope, t_invalid, t_valid)`,
+		`CREATE INDEX IF NOT EXISTS idx_memories_concept_id ON memories(concept_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_memories_source_episode ON memories(source_episode)`,
+		`CREATE INDEX IF NOT EXISTS idx_memories_current ON memories(id, t_expired)`,
+
+		`CREATE TABLE IF NOT EXISTS edges_v4 (
+			id         TEXT    NOT NULL,
+			version    INTEGER NOT NULL DEFAULT 1,
+			from_id    TEXT    NOT NULL REFERENCES nodes(id),
+			to_id      TEXT    NOT NULL REFERENCES nodes(id),
+			relation   TEXT    NOT NULL,
+			weight     REAL    NOT NULL DEFAULT 1.0,
+			t_valid    INTEGER NOT NULL DEFAULT 0,
+			t_invalid  INTEGER,
+			t_created  INTEGER NOT NULL DEFAULT 0,
+			t_expired  INTEGER,
+			PRIMARY KEY (id, version)
+		)`,
+		`INSERT INTO edges_v4 (id, version, from_id, to_id, relation, weight, t_valid, t_invalid,
+			t_created, t_expired)
+		 SELECT id, 1, from_id, to_id, relation, weight, t_valid, t_invalid,
+			t_created, t_expired
+		 FROM edges WHERE true
+		 ON CONFLICT(id, version) DO NOTHING`,
+		`DROP TABLE IF EXISTS edges`,
+		`ALTER TABLE edges_v4 RENAME TO edges`,
+		`CREATE INDEX IF NOT EXISTS idx_edges_from_rel ON edges(from_id, relation)`,
+		`CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_edges_rel_bi ON edges(relation, t_invalid)`,
+		`CREATE INDEX IF NOT EXISTS idx_edges_current ON edges(id, t_expired)`,
+	}
+
+	// 已是新形态（memories/edges 都已有 version 列）时只做索引补齐，不重跑拷贝。
+	memoriesDone, err := tableHasColumn(ctx, q, "memories", "version")
+	if err != nil {
+		return err
+	}
+	edgesDone, err := tableHasColumn(ctx, q, "edges", "version")
+	if err != nil {
+		return err
+	}
+	switch {
+	case memoriesDone && edgesDone:
+		// 只需保证索引存在（重复 CREATE INDEX IF NOT EXISTS 无害）。
+		for _, stmt := range []string{
+			`CREATE INDEX IF NOT EXISTS idx_memories_current ON memories(id, t_expired)`,
+			`CREATE INDEX IF NOT EXISTS idx_edges_current ON edges(id, t_expired)`,
+		} {
+			if _, err := q.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("sqlite: migration 4 index: %w", err)
+			}
+		}
+	case memoriesDone:
+		// 半完成状态：只补 edges 部分。
+		for _, stmt := range stmts[7:] {
+			if _, err := q.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("sqlite: migration 4 (edges): %w", err)
+			}
+		}
+	default:
+		for _, stmt := range stmts {
+			if _, err := q.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("sqlite: migration 4: %w", err)
+			}
+		}
+	}
+
+	// I-4：nodes 必须能溯源回 episode。ALTER TABLE ADD COLUMN 幂等由列判断保证。
+	hasSourceEpisode, err := tableHasColumn(ctx, q, "nodes", "source_episode")
+	if err != nil {
+		return err
+	}
+	if !hasSourceEpisode {
+		if _, err := q.ExecContext(ctx,
+			`ALTER TABLE nodes ADD COLUMN source_episode TEXT REFERENCES episodes(id)`); err != nil {
+			return fmt.Errorf("sqlite: migration 4 (nodes.source_episode): %w", err)
+		}
+	}
+	return nil
+}
+
+// tableHasColumn 报告 table 是否有 column。表不存在时返回 false。
+func tableHasColumn(ctx context.Context, q querier, table, column string) (bool, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT COUNT(1) FROM pragma_table_info(?) WHERE name = ?`, table, column)
+	if err != nil {
+		return false, fmt.Errorf("sqlite: table_info %s: %w", table, err)
+	}
+	defer rows.Close()
+	var n int
+	if rows.Next() {
+		if err := rows.Scan(&n); err != nil {
+			return false, fmt.Errorf("sqlite: scan table_info %s: %w", table, err)
+		}
+	}
+	return n > 0, rows.Err()
 }
 
 // Migrate 应用所有未应用的迁移。重复执行安全（幂等）。
@@ -194,6 +337,11 @@ func (d *DB) applyMigration(ctx context.Context, m migration) error {
 
 	for _, stmt := range m.Statements {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("sqlite: migration %d (%s): %w", m.Version, m.Name, err)
+		}
+	}
+	if m.Apply != nil {
+		if err := m.Apply(ctx, tx); err != nil {
 			return fmt.Errorf("sqlite: migration %d (%s): %w", m.Version, m.Name, err)
 		}
 	}

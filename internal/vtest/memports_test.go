@@ -547,6 +547,10 @@ func (g *memGraph) Neighbors(_ context.Context, q store.NeighborQuery) ([]store.
 	if q.NodeID == "" {
 		return nil, errEmptyNodeID
 	}
+	// 与 SQLite 后端一致：Scope 是必填的隔离边界，不是"不限"。
+	if q.Scope == "" || !q.Scope.Valid() {
+		return nil, errEmptyScope
+	}
 	hops := q.Hops
 	if hops <= 0 {
 		hops = 1
@@ -560,6 +564,15 @@ func (g *memGraph) Neighbors(_ context.Context, q store.NeighborQuery) ([]store.
 	g.db.init()
 
 	allowed := func(e store.Edge) bool {
+		// 范围隔离：起点与终点节点都必须属于该 scope。
+		fn, ok := g.db.nodes[e.FromID]
+		if !ok || fn.Scope != q.Scope {
+			return false
+		}
+		tn, ok := g.db.nodes[e.ToID]
+		if !ok || tn.Scope != q.Scope {
+			return false
+		}
 		if len(q.Relations) > 0 {
 			ok := false
 			for _, r := range q.Relations {
@@ -580,9 +593,16 @@ func (g *memGraph) Neighbors(_ context.Context, q store.NeighborQuery) ([]store.
 			if !(e.TInvalid == 0 || e.TInvalid > t) {
 				return false
 			}
+			// 系统时间轴：t_created <= asOf < t_expired。
+			if !(e.TCreated <= t) {
+				return false
+			}
+			if !(e.TExpired == 0 || e.TExpired > t) {
+				return false
+			}
 			return true
 		}
-		return e.TInvalid == 0
+		return e.TInvalid == 0 && e.TExpired == 0
 	}
 
 	best := map[string]store.EdgeHop{}
@@ -632,4 +652,5 @@ const (
 	errEmptyVectorID = memErr("mem: empty vector id")
 	errMissingNode   = memErr("mem: missing node (foreign key)")
 	errEmptyNodeID   = memErr("mem: empty node id")
+	errEmptyScope    = memErr("mem: empty scope")
 )

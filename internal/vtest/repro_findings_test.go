@@ -3,7 +3,6 @@ package vtest
 import (
 	"context"
 	"database/sql"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -13,25 +12,18 @@ import (
 )
 
 // ===========================================================================
-// 【阻塞合并 / 可后续】问题的**确定性最小复现**
+// 阻塞项 / 重要项的**确定性回归用例**
 //
-// 本文件只放"已知缺陷"的复现用例，全部默认跳过（需要显式门禁），
-// 避免已知问题让 `go test ./...` 永久变红、掩盖新回归。
-//
-//	export PATH=/usr/local/go/bin:$PATH
-//	cd /Users/taiwu.wang/Documents/leader_agent/gmem
-//	CGO_ENABLED=0 GMEM_VERIFY_BLOCKER=1 go test ./internal/vtest/ -v -timeout 120s
+// 历史：这些用例最初是"已知缺陷复现"，挂在 GMEM_VERIFY_BLOCKER 门禁后，
+// 以免已知问题让 `go test ./...` 永久变红、掩盖新回归。
+// 缺陷已修复，因此**门禁已移除**：它们是永久回归用例，
+// 缺陷一旦重现，`go test ./...` 就会直接变红。
 // ===========================================================================
 
-// requireBlockerGate 统一门禁：只有显式设置才跑缺陷复现。
-func requireBlockerGate(t *testing.T) {
-	t.Helper()
-	if os.Getenv("GMEM_VERIFY_BLOCKER") == "" {
-		t.Skip("已知缺陷复现用例：设 GMEM_VERIFY_BLOCKER=1 运行")
-	}
-}
-
-// TestReproOpenBusyTimeoutOrdering 是【可后续 #1】的确定性最小复现。
+// TestReproOpenBusyTimeoutOrdering 是 §可后续 #1（PRAGMA 未对每条新连接生效）的回归。
+//
+// 断言口径：Open 要么成功，要么**真的等过 BusyTimeout** 再失败；
+// 不接受"几乎立即返回 SQLITE_BUSY"（那是 busy_timeout 未生效的症状）。
 //
 // 缺陷：sqlite.Open 的执行顺序是 PingContext → PRAGMA busy_timeout。
 // database/sql 新建连接的 busy_timeout 默认是 0（完全不等待），
@@ -50,8 +42,6 @@ func requireBlockerGate(t *testing.T) {
 //  3. 判据同时看**结果**与**耗时**：正确行为应等待锁（耗时接近 5s）后报错，
 //     现状是若干微秒内立即报 SQLITE_BUSY，证明配置未参与。
 func TestReproOpenBusyTimeoutOrdering(t *testing.T) {
-	requireBlockerGate(t)
-
 	path := filepath.Join(t.TempDir(), "busy-order.db")
 	ctx := context.Background()
 
@@ -127,8 +117,6 @@ database/sql 每条新连接的 busy_timeout 默认 0，ping 遇到 SQLITE_BUSY
 // 期望：要么成功（跨 Port 事务可用），要么快速返回明确错误。
 // 现状：阻塞到 ctx 超时，返回 context deadline exceeded（错误信息完全看不出真因）。
 func TestReproGraphAndMemoryNotInSameTx(t *testing.T) {
-	requireBlockerGate(t)
-
 	d := openMemory(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
 	defer cancel()

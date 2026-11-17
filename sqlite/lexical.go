@@ -2,7 +2,6 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 
 	"github.com/tim5wang/gmem/bigram"
@@ -17,9 +16,10 @@ import (
 //
 // 任何一侧单独改分词规则都会让"认证"这种 2 字查询失效，专项测试
 // TestBigramBothSidesSymmetric 与 TestLexicalSearchChineseTwoChar 会立刻报错。
-type lexicalIndex struct {
-	db *sql.DB
-}
+//
+// 事务：执行句柄来自 ctx（见 conn.querier）。在 Store.Tx 回调内调用时，
+// 索引写入落到同一事务；不在事务内时自建一个，保证"按 id 先删后插"的原子性。
+type lexicalIndex struct{ c *conn }
 
 var _ store.LexicalIndex = (*lexicalIndex)(nil)
 
@@ -28,51 +28,44 @@ func (l *lexicalIndex) Index(ctx context.Context, docs []store.Document) error {
 	if len(docs) == 0 {
 		return nil
 	}
-	tx, err := l.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("sqlite: lexical index begin: %w", err)
+	if _, err := l.c.querier(ctx); err != nil {
+		return err
 	}
-	defer func() { _ = tx.Rollback() }()
-
-	del, err := tx.PrepareContext(ctx, `DELETE FROM memories_fts WHERE id = ?`)
-	if err != nil {
-		return fmt.Errorf("sqlite: lexical index prepare delete: %w", err)
-	}
-	defer del.Close()
-
-	ins, err := tx.PrepareContext(ctx,
-		`INSERT INTO memories_fts (id, scope, body, bigrams) VALUES (?, ?, ?, ?)`)
-	if err != nil {
-		return fmt.Errorf("sqlite: lexical index prepare insert: %w", err)
-	}
-	defer ins.Close()
-
-	for _, d := range docs {
-		if d.ID == "" {
-			return fmt.Errorf("sqlite: lexical index: empty document id")
+	return l.c.runInTx(ctx, func(tctx context.Context, q querier) error {
+		for _, d := range docs {
+			if d.ID == "" {
+				return fmt.Errorf("sqlite: lexical index: empty document id")
+			}
+			if _, err := q.ExecContext(tctx, `DELETE FROM memories_fts WHERE id = ?`, d.ID); err != nil {
+				return fmt.Errorf("sqlite: lexical index delete %q: %w", d.ID, err)
+			}
+			// 索引侧 bigram 预转换：与查询侧共用 bigram.IndexText。
+			if _, err := q.ExecContext(tctx,
+				`INSERT INTO memories_fts (id, scope, body, bigrams) VALUES (?, ?, ?, ?)`,
+				d.ID, string(d.Scope), d.Text, bigram.IndexText(d.Text)); err != nil {
+				return fmt.Errorf("sqlite: lexical index insert %q: %w", d.ID, err)
+			}
 		}
-		if _, err := del.ExecContext(ctx, d.ID); err != nil {
-			return fmt.Errorf("sqlite: lexical index delete %q: %w", d.ID, err)
-		}
-		// 索引侧 bigram 预转换：与查询侧共用 bigram.IndexText。
-		if _, err := ins.ExecContext(ctx, d.ID, string(d.Scope), d.Text, bigram.IndexText(d.Text)); err != nil {
-			return fmt.Errorf("sqlite: lexical index insert %q: %w", d.ID, err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlite: lexical index commit: %w", err)
-	}
-	return nil
+		return nil
+	})
 }
 
 // Delete 按 ID 删除文档。
 func (l *lexicalIndex) Delete(ctx context.Context, ids []string) error {
-	for _, id := range ids {
-		if _, err := l.db.ExecContext(ctx, `DELETE FROM memories_fts WHERE id = ?`, id); err != nil {
-			return fmt.Errorf("sqlite: lexical delete %q: %w", id, err)
-		}
+	if len(ids) == 0 {
+		return nil
 	}
-	return nil
+	if _, err := l.c.querier(ctx); err != nil {
+		return err
+	}
+	return l.c.runInTx(ctx, func(tctx context.Context, q querier) error {
+		for _, id := range ids {
+			if _, err := q.ExecContext(tctx, `DELETE FROM memories_fts WHERE id = ?`, id); err != nil {
+				return fmt.Errorf("sqlite: lexical delete %q: %w", id, err)
+			}
+		}
+		return nil
+	})
 }
 
 // Search 用 bm25 排序返回命中。
@@ -89,6 +82,10 @@ func (l *lexicalIndex) Search(ctx context.Context, query string, scope store.Sco
 	if limit <= 0 {
 		limit = 10
 	}
+	q, err := l.c.querier(ctx)
+	if err != nil {
+		return nil, err
+	}
 	sqlText := `SELECT id, bm25(memories_fts) AS s FROM memories_fts WHERE memories_fts MATCH ?`
 	args := []any{expr}
 	if scope != "" {
@@ -98,7 +95,7 @@ func (l *lexicalIndex) Search(ctx context.Context, query string, scope store.Sco
 	sqlText += ` ORDER BY s ASC, id ASC LIMIT ?`
 	args = append(args, limit)
 
-	rows, err := l.db.QueryContext(ctx, sqlText, args...)
+	rows, err := q.QueryContext(ctx, sqlText, args...)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: lexical search %q: %w", query, err)
 	}

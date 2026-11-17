@@ -552,7 +552,7 @@ func runGraphNeighbors(t *testing.T, p store.Ports) {
 	}
 
 	// 1 跳：只出直接相邻的边。
-	hops, err := p.Graph.Neighbors(ctx, store.NeighborQuery{NodeID: "n-a", Hops: 1})
+	hops, err := p.Graph.Neighbors(ctx, store.NeighborQuery{NodeID: "n-a", Scope: store.ScopeUser, Hops: 1})
 	if err != nil {
 		t.Fatalf("Neighbors(1 hop): %v", err)
 	}
@@ -561,7 +561,7 @@ func runGraphNeighbors(t *testing.T, p store.Ports) {
 	}
 
 	// 2 跳：多出 e-bc，且 depth 正确。
-	hops, err = p.Graph.Neighbors(ctx, store.NeighborQuery{NodeID: "n-a", Hops: 2})
+	hops, err = p.Graph.Neighbors(ctx, store.NeighborQuery{NodeID: "n-a", Scope: store.ScopeUser, Hops: 2})
 	if err != nil {
 		t.Fatalf("Neighbors(2 hops): %v", err)
 	}
@@ -580,7 +580,7 @@ func runGraphNeighbors(t *testing.T, p store.Ports) {
 
 	// 关系白名单：只看 depends_on。
 	hops, err = p.Graph.Neighbors(ctx, store.NeighborQuery{
-		NodeID: "n-a", Hops: 2, Relations: []store.Relation{"depends_on"},
+		NodeID: "n-a", Scope: store.ScopeUser, Hops: 2, Relations: []store.Relation{"depends_on"},
 	})
 	if err != nil {
 		t.Fatalf("Neighbors(relation filter): %v", err)
@@ -590,7 +590,7 @@ func runGraphNeighbors(t *testing.T, p store.Ports) {
 	}
 
 	// 定向：从 n-c 出发没有出边（图是 from→to 单向的）。
-	hops, err = p.Graph.Neighbors(ctx, store.NeighborQuery{NodeID: "n-c", Hops: 3})
+	hops, err = p.Graph.Neighbors(ctx, store.NeighborQuery{NodeID: "n-c", Scope: store.ScopeUser, Hops: 3})
 	if err != nil {
 		t.Fatalf("Neighbors(n-c): %v", err)
 	}
@@ -599,8 +599,12 @@ func runGraphNeighbors(t *testing.T, p store.Ports) {
 	}
 
 	// 空 NodeID 报错。
-	if _, err := p.Graph.Neighbors(ctx, store.NeighborQuery{}); err == nil {
+	if _, err := p.Graph.Neighbors(ctx, store.NeighborQuery{Scope: store.ScopeUser}); err == nil {
 		t.Errorf("空 NodeID 未报错")
+	}
+	// 空 Scope 必须报错：它是隔离边界，不是"不限"（I-2）。
+	if _, err := p.Graph.Neighbors(ctx, store.NeighborQuery{NodeID: "n-a"}); err == nil {
+		t.Errorf("空 Scope 未报错，跨 scope 隔离失去强制力")
 	}
 }
 

@@ -11,13 +11,22 @@ import "context"
 // Store 是事务性 CRUD 端口。
 //
 // 事务语义：Tx 内的回调拿到一个绑定到同一事务的 Store，回调返回错误即整体回滚。
+//
+// 跨 Port 原子性（docs/TD.md §11）：回调收到的 ctx **携带事务句柄**，
+// 在回调内用该 ctx 调其它 Port（Lexical / Vector / Graph）即落到同一事务边界。
+// 反过来，用外层 ctx 调其它 Port：后端无法注入事务时必须**立即**返回
+// ErrTxConflict，绝不允许阻塞等连接（静默挂死比报错难查得多）。
 type Store interface {
 	// episodes：不可变事实来源
 	PutEpisode(ctx context.Context, e Episode) error
 	GetEpisode(ctx context.Context, id string) (Episode, error)
 
 	// memories：双时态事实
+	// PutMemory 写入一条记忆。同一 ID 的再次写入按 D12 产生**新版本**：
+	// 旧版置 TExpired，默认读当前版本；完全等价的重写是幂等的空操作。
+	// 已失效（TInvalid 非零）的事实不得因再次写入而复活。
 	PutMemory(ctx context.Context, m Memory) error
+	// GetMemory 取该 ID 的**当前版本**（TExpired 为空）；不存在返回 ErrNotFound。
 	GetMemory(ctx context.Context, id string) (Memory, error)
 	ListMemories(ctx context.Context, q MemoryQuery) ([]Memory, error)
 	// InvalidateMemory 只置 t_invalid（世界时间）,不做物理删除。
@@ -56,6 +65,9 @@ type VectorIndex interface {
 }
 
 // GraphStore 是图端口：节点/边两表 + 邻接查询，不外包给图数据库。
+//
+// Neighbors 的 Scope 是**必填**隔离边界（不是"不限"）：后端必须强制过滤，
+// 只返回起点与终点都在该 scope 内的边。
 type GraphStore interface {
 	PutNode(ctx context.Context, n Node) error
 	GetNode(ctx context.Context, id string) (Node, error)

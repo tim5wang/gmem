@@ -2,8 +2,10 @@ package sqlite
 
 import (
 	"context"
+	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 )
 
 // openTest 用内存库打开一个准备好 schema 的实例。
@@ -59,18 +61,75 @@ func TestMigrateIdempotent(t *testing.T) {
 	}
 }
 
-// TestMigrateConcurrentSafe：并发调 Migrate 不出错（DDL 皆 IF NOT EXISTS + INSERT OR IGNORE）。
+// TestMigrateConcurrentSafe：**多个独立 handle** 并发对同一文件库迁移，必须全部成功且版本收敛。
+//
+// 旧版用同一个 handle `d` 起 4 个 goroutine —— 那不是真并发：
+// SetMaxOpenConns(1) 会让它们排队在同一连接上，而且 Migrate 读 schema_migrations
+// 时早已是已应用状态，等于什么都没测。
+// 现在每个 goroutine 各开一个独立 sqlite.Open（各自的连接池、各自的事务），
+// 真正会撞 SQLITE_BUSY / 重复 DDL / 重复迁移记录。
 func TestMigrateConcurrentSafe(t *testing.T) {
-	d := openTest(t)
+	path := filepath.Join(t.TempDir(), "concurrent-migrate.db")
 	ctx := context.Background()
-	errs := make(chan error, 4)
-	for i := 0; i < 4; i++ {
-		go func() { errs <- d.Migrate(ctx) }()
+
+	const workers = 4
+	type result struct {
+		d   *DB
+		err error
 	}
-	for i := 0; i < 4; i++ {
-		if err := <-errs; err != nil {
-			t.Fatalf("concurrent Migrate: %v", err)
+	results := make(chan result, workers)
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start // 尽量让它们同时开跑，制造真实竞争
+			d, err := Open(ctx, Config{Path: path, BusyTimeout: 10 * time.Second})
+			results <- result{d: d, err: err}
+		}()
+	}
+	close(start)
+
+	var handles []*DB
+	defer func() {
+		for _, h := range handles {
+			_ = h.Close()
 		}
+	}()
+	for i := 0; i < workers; i++ {
+		r := <-results
+		if r.d != nil {
+			handles = append(handles, r.d)
+		}
+		if r.err != nil {
+			t.Fatalf("第 %d 个独立 handle 并发 Open/Migrate 失败: %v", len(handles), r.err)
+		}
+	}
+	if len(handles) != workers {
+		t.Fatalf("成功 handle 数 = %d, want %d", len(handles), workers)
+	}
+
+	want := migrations()[len(migrations())-1].Version
+	for i, h := range handles {
+		v, err := h.SchemaVersion(ctx)
+		if err != nil {
+			t.Fatalf("handle %d SchemaVersion: %v", i, err)
+		}
+		if v != want {
+			t.Errorf("handle %d schema version = %d, want %d", i, v, want)
+		}
+		// 再跑一次：已应用状态下重跑必须幂等（DDL 全 IF NOT EXISTS + INSERT OR IGNORE）。
+		if err := h.Migrate(ctx); err != nil {
+			t.Fatalf("handle %d 重复 Migrate: %v", i, err)
+		}
+	}
+
+	// 迁移记录不得因多 handle 竞争而双写。
+	var rows int
+	if err := handles[0].db.QueryRowContext(ctx, `SELECT COUNT(1) FROM schema_migrations`).
+		Scan(&rows); err != nil {
+		t.Fatalf("count schema_migrations: %v", err)
+	}
+	if rows != len(migrations()) {
+		t.Errorf("schema_migrations 行数 = %d, want %d（多 handle 并发双写）", rows, len(migrations()))
 	}
 }
 

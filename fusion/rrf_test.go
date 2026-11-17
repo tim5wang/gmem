@@ -113,11 +113,49 @@ func TestRRFStable(t *testing.T) {
 	}
 }
 
-// TestRRFDefaultK：k<=0 时等价于 DefaultK。
+// TestRRFDefaultK：k<=0 时**分值与** DefaultK 完全等价（而不是"名次相同"）。
+//
+// 旧版只比 IDs(a)[0] == IDs(b)[0]。单通道单候选时两边都只有一个元素且 ID 相同，
+// 即使 k=0 走了与 DefaultK 完全不同的常数（比如 k=1）也照样 PASS——这个断言没有判别力。
+// 现在直接断言 Score 的数值：
+//   score = w / (k + rank) = 1 / (60 + 1)
+// 因此 k=0 必须得到 1/61；若实现把 k=0 当成 0（或任何其它值），分母会变、断言必红。
 func TestRRFDefaultK(t *testing.T) {
-	a := IDs(RRF(0, Channel{Name: "l", Items: []Item{{ID: "a"}}}))
-	b := IDs(RRF(DefaultK, Channel{Name: "l", Items: []Item{{ID: "a"}}}))
-	if a[0] != b[0] {
-		t.Fatalf("k=0 should equal DefaultK")
+	items := []Item{{ID: "a"}, {ID: "b"}}
+	ch := func(k int) []Fused {
+		return RRF(k, Channel{Name: "l", Items: items})
+	}
+
+	zero := ch(0)
+	deflt := ch(DefaultK)
+
+	if len(zero) != len(deflt) {
+		t.Fatalf("len(k=0) = %d, len(k=DefaultK) = %d", len(zero), len(deflt))
+	}
+	for i := range deflt {
+		if zero[i].ID != deflt[i].ID {
+			t.Fatalf("第 %d 名 ID: k=0 得到 %q, want %q", i, zero[i].ID, deflt[i].ID)
+		}
+		if !approx(zero[i].Score, deflt[i].Score) {
+			t.Errorf("第 %d 名 Score: k=0 得到 %v, want %v（必须与 DefaultK 等价）",
+				i, zero[i].Score, deflt[i].Score)
+		}
+	}
+
+	// 硬编码的绝对值：锁住"k=0 确实用了 60"这个事实，而非两路同错同过。
+	const wantFirst = 1.0 / (DefaultK + 1) // 1/61
+	if !approx(deflt[0].Score, wantFirst) {
+		t.Fatalf("DefaultK 首个候选 Score = %v, want %v", deflt[0].Score, wantFirst)
+	}
+	if !approx(zero[0].Score, wantFirst) {
+		t.Errorf("k=0 首个候选 Score = %v, want %v", zero[0].Score, wantFirst)
+	}
+	if !approx(deflt[1].Score, 1.0/(DefaultK+2)) {
+		t.Errorf("第二个候选 Score = %v, want %v", deflt[1].Score, 1.0/(DefaultK+2))
+	}
+
+	// 反例：k=1 必须得到与 k=0 不同的分值，证明上面的断言真能区分 k 的取值。
+	if approx(ch(1)[0].Score, wantFirst) {
+		t.Fatalf("k=1 与 k=60 分值相同（%v），断言对 k 无判别力", ch(1)[0].Score)
 	}
 }

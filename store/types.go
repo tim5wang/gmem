@@ -12,6 +12,12 @@ import (
 // ErrNotFound 表示请求的记录不存在。
 var ErrNotFound = errors.New("gmem: not found")
 
+// ErrTxConflict 表示当前上下文既没有绑定事务、又有别的事务正占用唯一写连接。
+//
+// 后端在无法把调用注入到事务时必须**立即**返回它，绝不允许阻塞（docs/TD.md §11）：
+// 静默挂死比明确报错难查得多。调用方应改用 Tx 回调收到的 ctx（其中已注入事务）。
+var ErrTxConflict = errors.New("gmem: transaction conflict")
+
 // ---------------------------------------------------------------------------
 // 枚举
 // ---------------------------------------------------------------------------
@@ -106,8 +112,12 @@ type Episode struct {
 //
 // 零值的 TInvalid / TExpired 表示"尚未失效"，落库为 NULL。
 // 矛盾只置 TInvalid，**永不物理删除**。
+//
+// Version 是系统时间版本号（D12）：主键是 (ID, Version)，从 1 递增。
+// 读取时 0 表示"当前版本"；写入时 0 表示由后端分配下一个版本。
 type Memory struct {
 	ID            string
+	Version       int
 	Scope         Scope
 	ConceptID     string // 可空
 	Kind          MemoryKind
@@ -122,19 +132,24 @@ type Memory struct {
 }
 
 // Node 是图中的一个实体节点。
+//
+// SourceEpisode 是溯源字段（§2 第 1 条）：nodes 与 memories 一样必须能回到 episode。
 type Node struct {
 	ID            string
 	Scope         Scope
 	ConceptID     string // 可空
 	CanonicalName string
+	SourceEpisode string // 可空
 	PropsJSON     string // 默认 "{}"
 }
 
 // Edge 是节点之间的有向关系。
 //
-// 与 Memory 一样带四个时间戳（§2 "memories 和 edges 都带四个时间戳"）。
+// 与 Memory 一样带四个时间戳（§2 "memories 和 edges 都带四个时间戳"），
+// 也采用 (ID, Version) 版本化主键（D12）。
 type Edge struct {
 	ID       string
+	Version  int
 	FromID   string
 	ToID     string
 	Relation Relation
@@ -217,8 +232,13 @@ type Vector struct {
 }
 
 // NeighborQuery 是 GraphStore 的邻域查询条件。
+//
+// Scope 是**必填**的隔离边界（§2 "范围隔离是 Port 契约的一部分"）：
+// 后端必须强制过滤，只返回起点节点属于该 scope 的边，杜绝跨 scope 泄漏。
+// 空 Scope 不是"不限"，而是调用方的缺陷，后端应尽快返回错误。
 type NeighborQuery struct {
 	NodeID    string
+	Scope     Scope      // 必填：只在该 scope 内遍历
 	Relations []Relation // 空 = 不限；非空 = 只看白名单内的关系
 	Hops      int        // <=0 视为 1；上限由实现裁剪
 	AsOf      *int64     // 非空 = 该时刻有效的边
