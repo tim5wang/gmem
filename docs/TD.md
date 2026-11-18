@@ -26,6 +26,7 @@
 | **D12** | 双时态采用**系统时间版本化**（B-4/B-5 裁决） | `memories`/`edges` 主键改为 `(id, version)`；`Update` 插新版并把旧版置 `t_expired`；默认读当前版本，`as_of` 按版本区间选；FTS 索引所有版本 | §2 |
 | **D13** | 只有**内容承载字段**变更才产生新版本 | `recall_count` / `last_recalled_at` 等运营计数**就地更新**，不得版本化（否则召回即版本爆炸）；FTS 也必须按 `(id, version)` 索引并携带版本，否则 `as_of` 词法召回静默漏旧版 | §2 |
 | **D14** | R4 不得把「本体没这个维度」与「正文里可能有这个词」混为一谈 | 未对齐残槽**默认不构成硬缺口**；只有在词法/向量通道**也没有证据**时才允许判 `insufficient`。否则会出现“词法能查到却拒绝回答” | §5 |
+| **D15** | 写入时 `concept_id` 不存在 → **隐式落为 `draft` 概念**（B 方案） | 移除 `memories.concept_id` / `nodes.concept_id` 的强制外键；写入遇未知 concept 自动建 `status=draft` 并记出处。本体从使用中生长，但**草稿必须可清理**（P3 的 Promote/Prune 负责） | §2 §5 |
 
 **三条核心取舍，都必须先认下来：**
 
@@ -175,6 +176,10 @@ erDiagram
 3. **版本化主键 `(id, version)`**：`id` 是用户可见的逻辑身份，`version` 从 1 递增。**默认读取 = 当前版本（`t_expired IS NULL`）**；`as_of` 选 `t_created ≤ as_of < t_expired` 的版本。这一条是 B-4 的裁决 —— 若不版本化，`t_created`/`t_expired` 就是两列死字段，双时态退化成单时态。
    - **什么才算新版本（D13）**：只有**内容承载字段**变化才生成新版本（`content`、`kind`、`concept_id`、`t_valid`、`t_invalid`、`source_episode`、`importance`）。**运营计数类字段（`recall_count`、`last_recalled_at`）一律不得产生版本**，它们应就地更新或被移出主表。否则每被召回一次就多一个版本，叠加 per-version FTS 会直接把库撑爆。
 4. **`concepts.status` 是 D1 的关键**：`draft` / `certified` / `deprecated`。只有 `certified` 参与硬契约。这是让"本体不拒绝写入"能成立的机制——概念先以草稿累积，认证后才约束召回。
+   - **D15 裁决：`concept_id` 不是准入门禁**。原实现给 `memories.concept_id` / `nodes.concept_id` 加了外键，导致写入一个未声明的 concept 会 `FOREIGN KEY constraint failed` 并把整笔写入（含 FTS）一起回滚。这直接违背 D1/R1「本体不拒绝写入」。
+   - **正确行为**：写入时若 `concept_id` 不存在，**隐式建一条 `status=draft` 的概念**（名称取该 id 或内容里的首个可命名片段），并记 `origin=implicit`；然后正常写入。草稿**永不参与硬契约**，只在召回里以 `StatusFactor` 打折。
+   - 代价（自觉接受）：草稿表会被 agent 的随意输入填满。因此 **P3 必须提供清理路径**（`Promote` 人工/Agent 认证、`Prune` 删除长期未用的 draft），否则本体漂移会失控。
+   - 外键的另一半仍需保留：`source_episode` 指向 `episodes` 是有意义的血缘约束，**不得一并移除**；只有 `concept_id` 这类"观察性引用"需要放开。
 
 **派生索引**：`memories_fts`（FTS5 + bigram 列）、`vec_blob`（int8 量化快照）。二者都可从主表重建。
 
