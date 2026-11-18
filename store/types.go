@@ -89,6 +89,21 @@ type Relation string
 
 func (r Relation) String() string { return string(r) }
 
+// 关系类型常量（docs/TD.md §5「R3 的落地」的关系白名单）。
+//
+// 注意：**传递性与允许跳数不在这里**。它们属于召回侧的声明式表
+// （recall.RelationRule），因为同一套存储后端可能服务不同校准结果，
+// 而 Port 契约不应携带召回策略。
+const (
+	RelationSubtypeOf Relation = "subtype_of" // 传递：抽象层级天然可传
+	RelationPartOf    Relation = "part_of"    // 传递：同上
+	RelationDependsOn Relation = "depends_on" // 传递：依赖链有意义
+	RelationCausedBy  Relation = "caused_by"  // 传递但仅 2 跳：因果链过深会跑题
+	RelationWorksAt   Relation = "works_at"   // 非传递：两跳就到别人公司
+	RelationOwns      Relation = "owns"       // 非传递：三跳全是无关资产
+	RelationUses      Relation = "uses"       // 非传递：关系型问句（“用什么”）的主通道
+)
+
 // ---------------------------------------------------------------------------
 // 实体（与 §2 的六张主表一一对应）
 // ---------------------------------------------------------------------------

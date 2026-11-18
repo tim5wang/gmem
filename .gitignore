@@ -1,0 +1,7 @@
+# Agent scratch: worker 临时文件、探针、报告草稿。
+# 这些不是产物，绝不能进仓库（曾出现 .godex/tmp/*.bak 被列为未跟踪文件）。
+.godex/
+
+# 构建与测试产物
+*.test
+*.out

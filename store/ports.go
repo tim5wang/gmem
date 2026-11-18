@@ -86,6 +86,23 @@ type GraphStore interface {
 	Neighbors(ctx context.Context, q NeighborQuery) ([]EdgeHop, error)
 }
 
+// OntologyReader 是**可选**的本体枚举端口（P1 Concept Aligner 的候选来源）。
+//
+// 为什么用独立的可选接口，而不是往 Store 里加方法：Store 是 P0 已发布的公开契约，
+// 加方法会破坏所有既有实现（含 internal/vtest 的内存后端）。Aligner 只需要
+// “把词典与概念全量列出来做对齐”这一件事，因此用可选扩展表达：
+// 后端实现了就用；没实现则降级，并且**必须在 Degraded 里显式上报**（不得静默）。
+//
+// 枚举结果是全量快照（非分页）：P1 的规模假设是单体、单机、概念量级 1e3，
+// 分页会引入一致性窗口，得不偿失。若将来量级变大，这里换成分页 + 增量同步，
+// Aligner 的调用点不变。
+type OntologyReader interface {
+	// ListConcepts 返回全部概念（含 draft/deprecated，状态由对齐侧自己判定）。
+	ListConcepts(ctx context.Context) ([]Concept, error)
+	// ListAliases 返回全部 surface → node 词典项。
+	ListAliases(ctx context.Context) ([]Alias, error)
+}
+
 // Ports 把四个端口打包，便于上层一次注入。
 type Ports struct {
 	Store   Store
