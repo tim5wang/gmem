@@ -255,6 +255,15 @@ func TestDebounceStillFiresWhenSubmitterCtxCanceled(t *testing.T) {
 	e := newEnv(t)
 	key := string(store.ScopeUser)
 
+	// 前置：库里必须有一条“值得整理”的记忆。
+	//
+	// 原用例的空库前置有一个自身缺陷：Consolidate 在无数据时必然返回 noop，
+	// 于是 `applied == 1` 在任何实现下都不可能成立（无论 ctx 修没修）。
+	// 补一条真实数据（不是放宽断言）后，这条用例才能分辨“ctx 被捕获/没被捕获”两​​种实现。
+	m := mem("m-deb-ctx", store.ScopeUser, "")
+	m.TValid, m.TCreated = e.clk.Now().Unix(), e.clk.Now().Unix()
+	e.put(m)
+
 	reqCtx, cancel := context.WithCancel(context.Background())
 	e.trig.AfterWrite(reqCtx, store.ScopeUser, ops.OpConsolidate, ops.Input{})
 	// 请求结束（响应已返回）：提交者的 ctx 被取消。

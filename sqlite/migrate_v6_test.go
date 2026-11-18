@@ -191,9 +191,20 @@ func TestMigrateV5ToV6PreservesData(t *testing.T) {
 	if err := old.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate v5→v6: %v", err)
 	}
-	// v5→v6 升级后版本必须**至少**是 6（可能已顺带应用后续迁移，例如 P3 的 v7）。
-	if v, err := old.SchemaVersion(ctx); err != nil || v < 6 {
-		t.Fatalf("升级后 SchemaVersion=%d err=%v, want >= 6", v, err)
+	// 【T-8 修复】原断言 `v < 6` 在 v6→v7→v8 之后恒真（升到 7/99 都过）。
+	// 改成钉死“迁移清单里的最大版本”：v5→v6 升级后必须恰好跑到当前最新版本。
+	ms := migrations()
+	latest := 0
+	for _, m := range ms {
+		if m.Version > latest {
+			latest = m.Version
+		}
+	}
+	if latest < 6 {
+		t.Fatalf("迁移清单最大版本=%d, want >= 6", latest)
+	}
+	if v, err := old.SchemaVersion(ctx); err != nil || v != latest {
+		t.Fatalf("升级后 SchemaVersion=%d err=%v, want == %d（必须恰好升到当前最新版本）", v, err, latest)
 	}
 
 	// 数据全部存活，且外键列的值原样保留。
@@ -265,8 +276,20 @@ func TestMigrateV6IdempotentAfterMetadataLoss(t *testing.T) {
 	if err := d.Migrate(ctx); err != nil {
 		t.Fatalf("重跑 Migrate: %v", err)
 	}
-	if v, err := d.SchemaVersion(ctx); err != nil || v < 6 {
-		t.Fatalf("SchemaVersion=%d err=%v, want >= 6", v, err)
+	// 【T-8 修复】原断言 `v < 6` 永真：元数据丢失重跑后版本升到哪里都过。
+	// 固定为“恰好等于当前清单最大版本”，才能发现“某个迁移没被重跑”。
+	ms := migrations()
+	latest := 0
+	for _, m := range ms {
+		if m.Version > latest {
+			latest = m.Version
+		}
+	}
+	if latest < 6 {
+		t.Fatalf("迁移清单最大版本=%d, want >= 6", latest)
+	}
+	if v, err := d.SchemaVersion(ctx); err != nil || v != latest {
+		t.Fatalf("SchemaVersion=%d err=%v, want == %d", v, err, latest)
 	}
 	if after := countRows(t, d.db, `SELECT COUNT(1) FROM concepts`); after != before {
 		t.Errorf("重跑后 concepts 行数 %d → %d（重复拷贝）", before, after)

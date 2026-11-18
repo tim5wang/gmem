@@ -144,7 +144,7 @@ func marshalJSON(v any) string {
 
 type mergeOp struct{}
 
-func (mergeOp) Name() OpName  { return OpMerge }
+func (mergeOp) Name() OpName { return OpMerge }
 func (mergeOp) Budget() Budget {
 	// ⚠️ 待校准：20s 是设计起点（合并要迁移边与 alias，比单条写入重）。
 	return Budget{Duration: 20 * time.Second, Steps: 500, IO: 2000}
@@ -236,7 +236,7 @@ func mergeNodes(txc TxContext, from, to, reason string) (Diff, error) {
 		}
 		if newFrom == newTo {
 			// 自环：合并后没有语义，直接失效旧边（保留历史）。
-			if err := invalidateEdge(txc, e.ID, now.Unix()); err != nil {
+			if _, err := invalidateEdge(txc, e.ID, now.Unix()); err != nil {
 				return Diff{}, err
 			}
 			beforeEdges = append(beforeEdges, e.ID)
@@ -251,7 +251,7 @@ func mergeNodes(txc TxContext, from, to, reason string) (Diff, error) {
 			return Diff{}, fmt.Errorf("ops: merge: 迁移边 %q → %q: %w", e.ID, nid, err)
 		}
 		// 旧边失效（世界时间），但它**留在库里**：as_of 回溯仍能看见它。
-		if err := invalidateEdge(txc, e.ID, now.Unix()); err != nil {
+		if _, err := invalidateEdge(txc, e.ID, now.Unix()); err != nil {
 			return Diff{}, err
 		}
 		moved = append(moved, nid)
@@ -280,6 +280,24 @@ func mergeNodes(txc TxContext, from, to, reason string) (Diff, error) {
 		}
 	}
 
+	// F-8：旧节点本身必须被处理，不能只迁边与 alias。
+	//
+	// 旧实现迁移了边、迁移了 alias、写了 redirect，但 src 节点**什么都没变**：
+	// 它仍以自己的 CanonicalName 参与召回对齐（Aligner 按 concept/alias 匹配，
+	// 不看 redirect），于是“合并”在召回侧看起来根本没发生过。
+	//
+	// 这里把旧名登记为指向新节点的 alias——旧名继续可被识别（不丢信息），
+	// 但解析结果已经是新实体，不会再以旧身份返回候选。
+	oldNameCovered := false
+	if src.CanonicalName != "" && src.CanonicalName != dst.CanonicalName {
+		if err := txc.Store().PutAlias(ctx, store.Alias{
+			Surface: src.CanonicalName, NodeID: to, Source: "merge", Confidence: 1,
+		}); err != nil {
+			return Diff{}, fmt.Errorf("ops: merge: 登记旧名 %q → %q: %w", src.CanonicalName, to, err)
+		}
+		oldNameCovered = true
+	}
+
 	// 旧 ID 保留为重定向（TD §4：Merge 保留旧 ID 为重定向）。
 	if err := be.PutRedirect(ctx, Redirect{
 		OldID: from, NewID: to, Scope: txc.Scope(), Reason: reason, At: now.UnixMilli(),
@@ -289,11 +307,14 @@ func mergeNodes(txc TxContext, from, to, reason string) (Diff, error) {
 
 	before["edges"] = beforeEdges
 	after["edges"] = afterEdges
+	after["old_name_alias"] = map[string]any{
+		"surface": src.CanonicalName, "node_id": to, "covered": oldNameCovered,
+	}
 
 	return Diff{
 		Changed: true,
-		Summary: fmt.Sprintf("merge %s → %s：迁移 %d 条边、%d 个 alias，旧 ID 保留为重定向",
-			from, to, len(moved), aliasesMigrated),
+		Summary: fmt.Sprintf("merge %s → %s：迁移 %d 条边、%d 个 alias，旧名 %q 已指向新节点，旧 ID 保留为重定向",
+			from, to, len(moved), aliasesMigrated, src.CanonicalName),
 		Before:   marshalJSON(before),
 		After:    marshalJSON(after),
 		Subjects: []string{from, to},
@@ -302,29 +323,40 @@ func mergeNodes(txc TxContext, from, to, reason string) (Diff, error) {
 }
 
 // invalidateEdge 只置 t_invalid（世界时间），不产生新内容版本也不删除。
-func invalidateEdge(txc TxContext, id string, tInvalid int64) error {
+//
+// 返回 changed=false 的两种情况：边不存在、边已失效。
+//
+// # 为什么要返回它（F-9）
+//
+// 旧实现两个幂等分支都 return nil，调用方无从区分，于是 unlink 一条**不存在**的边
+// 也会产生一条 Changed:true 的审计行——audit_log 出现假变更，
+// 直接削弱“只凭审计重建因果链”的可信度。
+func invalidateEdge(txc TxContext, id string, tInvalid int64) (bool, error) {
 	ctx := txc.Context()
 	g := txc.Ports().Graph
 	// 读当前版本再写回：GraphStore 没有 InvalidateEdge（P0 契约），
 	// 而"只置 t_invalid"必须走 PutEdge 的新版本——旧版本保留，as_of 仍可回溯。
 	edges, err := txc.Backend().ListEdges(ctx, txc.Scope(), 0)
 	if err != nil {
-		return err
+		return false, err
 	}
 	for _, e := range edges {
 		if e.ID != id {
 			continue
 		}
 		if e.TInvalid != 0 {
-			return nil // 已失效：幂等
+			return false, nil // 已失效：幂等空转
 		}
 		next := e
 		next.Version = 0 // 由后端分配新版本
 		next.TInvalid = tInvalid
 		next.TExpired = 0
-		return g.PutEdge(ctx, next)
+		if err := g.PutEdge(ctx, next); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
-	return nil
+	return false, nil // 不存在：无变更可报
 }
 
 // ---------------------------------------------------------------------------
@@ -333,7 +365,7 @@ func invalidateEdge(txc TxContext, id string, tInvalid int64) error {
 
 type linkOp struct{}
 
-func (linkOp) Name() OpName  { return OpLinkUpdate }
+func (linkOp) Name() OpName   { return OpLinkUpdate }
 func (linkOp) Budget() Budget { return Budget{Steps: 10, IO: 100} }
 
 func (linkOp) Plan(txc TxContext) ([]Step, error) {
@@ -371,13 +403,26 @@ func (linkOp) Apply(txc TxContext, s Step) (Diff, error) {
 	id := edgeID(l.Relation, l.FromNode, l.ToNode)
 
 	if l.Remove {
-		if err := invalidateEdge(txc, id, now.Unix()); err != nil {
+		// F-9：Changed 必须来自**真实变更**。
+		//
+		// 旧实现无条件 Changed:true：unlink 一条不存在/已失效的边也会留下一条
+		// “变更”审计行，audit_log 因此出现假 diff。现在只在实际置了 t_invalid 时才报变更。
+		changed, err := invalidateEdge(txc, id, now.Unix())
+		if err != nil {
 			return Diff{}, err
+		}
+		if !changed {
+			return Diff{
+				Changed: false, Summary: "边 " + id + " 不存在或已失效（unlink 幂等空转）",
+				Before:   marshalJSON(map[string]any{"edge": id}),
+				After:    marshalJSON(map[string]any{"edge": id, "changed": false}),
+				Subjects: []string{id},
+			}, nil
 		}
 		return Diff{
 			Changed: true, Summary: "失效边 " + id,
-			Before: marshalJSON(map[string]any{"edge": id, "t_invalid": 0}),
-			After:  marshalJSON(map[string]any{"edge": id, "t_invalid": now.Unix()}),
+			Before:   marshalJSON(map[string]any{"edge": id, "t_invalid": 0}),
+			After:    marshalJSON(map[string]any{"edge": id, "t_invalid": now.Unix()}),
 			Subjects: []string{id},
 		}, nil
 	}
@@ -407,10 +452,13 @@ func (linkOp) Apply(txc TxContext, s Step) (Diff, error) {
 			if old.TInvalid != 0 {
 				continue
 			}
-			if err := invalidateEdge(txc, old.ID, now.Unix()); err != nil {
+			changed, err := invalidateEdge(txc, old.ID, now.Unix())
+			if err != nil {
 				return Diff{}, err
 			}
-			invalidated = append(invalidated, old.ID)
+			if changed {
+				invalidated = append(invalidated, old.ID)
+			}
 		}
 	}
 	return Diff{
@@ -443,8 +491,8 @@ func singleValued(r store.Relation) bool {
 
 type invalidateOp struct{}
 
-func (invalidateOp) Name() OpName    { return OpInvalidate }
-func (invalidateOp) Budget() Budget  { return Budget{Steps: 50, IO: 500} }
+func (invalidateOp) Name() OpName   { return OpInvalidate }
+func (invalidateOp) Budget() Budget { return Budget{Steps: 50, IO: 500} }
 
 func (invalidateOp) Plan(txc TxContext) ([]Step, error) {
 	in := txc.Input()
@@ -495,14 +543,18 @@ func (invalidateOp) Apply(txc TxContext, s Step) (Diff, error) {
 		return Diff{}, err
 	}
 	sm := stateManager{txc: txc}
-	if _, err := sm.move(m, StatusInvalidated, "supersede"); err != nil {
+	moved, err := sm.move(m, StatusInvalidated, "supersede")
+	if err != nil {
 		return Diff{}, err
 	}
 	return Diff{
 		Changed: true, Summary: fmt.Sprintf("记忆 %s 置 t_invalid=%d（状态 → invalidated，仍可 as_of 回溯）", m.ID, tInvalid),
-		Before: before,
-		After:  marshalJSON(map[string]any{"id": m.ID, "t_invalid": tInvalid, "status": string(StatusInvalidated)}),
+		Before:   before,
+		After:    marshalJSON(map[string]any{"id": m.ID, "t_invalid": tInvalid, "status": string(StatusInvalidated)}),
 		Subjects: []string{m.ID},
+		// F-10a：中间迁移（例如 Candidate → Active）是真实落库，
+		// 它的 diff 必须交给 Runner 写成独立的审计行，否则因果链缺一环。
+		Trail: moved.Trail,
 	}, nil
 }
 
@@ -548,6 +600,24 @@ func (promoteOp) Plan(txc TxContext) ([]Step, error) {
 				return nil, err
 			}
 			if ok && stat.UseCount >= minUse {
+				ids = append(ids, c.ID)
+				continue
+			}
+			// 对称兜底：概念“在用”不能只看 concept_usage。
+			//
+			// concept_usage 只有**一个**填充点——extractOp.Apply 里的 TouchConceptUsage。
+			// 于是任何不经 Extract 的写入路径（TD §10 的结构化写入 / WriteBundle）
+			// 隐式长出来的 draft 永远拿不到 UseCount，`if ok && stat.UseCount >= minUse`
+			// 恒假——这些草稿永远不会被 All 认证，而 RunNoop 还是个“成功”返回值。
+			//
+			// 用与 pruneDraft 同口径的“引用数”判定（CountConceptRefs）：只要还有
+			// memories/nodes 指着它，它就是“在用”，与它怎么被写进来无关。
+			// 这样 Promote 与 Prune 两侧的“在用”语义对称，不会一侧兜底、一侧空转。
+			refs, err := txc.Backend().CountConceptRefs(ctx, c.ID)
+			if err != nil {
+				return nil, err
+			}
+			if refs > 0 {
 				ids = append(ids, c.ID)
 			}
 		}
@@ -600,8 +670,8 @@ func (promoteOp) Apply(txc TxContext, s Step) (Diff, error) {
 	}
 	return Diff{
 		Changed: true, Summary: fmt.Sprintf("概念 %s：draft → certified（origin=%s 保留）", id, c.Origin),
-		Before: before,
-		After:  marshalJSON(map[string]any{"id": next.ID, "status": string(next.Status), "origin": string(next.Origin)}),
+		Before:   before,
+		After:    marshalJSON(map[string]any{"id": next.ID, "status": string(next.Status), "origin": string(next.Origin)}),
 		Subjects: []string{id},
 	}, nil
 }

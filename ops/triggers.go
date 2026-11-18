@@ -64,6 +64,16 @@ type Debouncer struct {
 	timers map[string]func() // key → 取消函数
 	// pending 记录每个 key 最近一次 payload（合并语义：只看最后一次）。
 	pending map[string]debounceEntry
+	// generation 是每个 key 的登记序号（**跨登记**的正确性靠它，见 fire）。
+	//
+	// 为什么必须有它：定时器回调没有"我是哪一次登记"的概念，于是
+	//
+	//	#1 Submit → timerA；#2 Submit 取消 timerA 但 timerA 已到期并在排队
+	//	→ timerA 的回调执行时读到的是 #2 的 payload（提前执行 + 顺手删掉 #2 的定时器）
+	//
+	// 旧实现的 cancel 句柄同样只认 key：调用 #1 拿到的 cancel 会把 #2 的定时器一起杀掉，
+	// 去抖就退化成"永不执行"。加一个单调序号后，回调与 cancel 都能判断自己是否还"当值"。
+	generation map[string]uint64
 	// fired 是每个 key 的实际触发次数（测试与 /doctor 用）。
 	fired map[string]int
 	// canceled 是被后续事件取消的次数（证明"取消并重排"真的发生，而不是没安排）。
@@ -78,17 +88,18 @@ type debounceEntry struct {
 // NewDebouncer 构造去抖器。
 func NewDebouncer(r *Runner) *Debouncer {
 	return &Debouncer{
-		runner:   r,
-		timers:   map[string]func(){},
-		pending:  map[string]debounceEntry{},
-		fired:    map[string]int{},
-		canceled: map[string]int{},
+		runner:     r,
+		timers:     map[string]func(){},
+		pending:    map[string]debounceEntry{},
+		generation: map[string]uint64{},
+		fired:      map[string]int{},
+		canceled:   map[string]int{},
 	}
 }
 
 // Submit 登记一次写入后触发。key 相同则取消前一次并重排（不执行前一次）。
 //
-// 返回的 cancel 可撤销本次登记（Agent 打断时不留半截状态：定时器也不会再触发）。
+// 返回的 cancel 只撤销**本次**登记：后续登记产生的定时器不受影响（F-2）。
 func (d *Debouncer) Submit(ctx context.Context, req Request, after time.Duration, key string) func() {
 	if key == "" {
 		key = string(req.Scope)
@@ -105,22 +116,42 @@ func (d *Debouncer) Submit(ctx context.Context, req Request, after time.Duration
 		cancel()
 		d.canceled[key]++
 	}
+	gen := d.generation[key] + 1
+	d.generation[key] = gen
 	d.pending[key] = debounceEntry{req: req, at: d.runner.cfg.Now()}
 	sched := d.runner.cfg.Scheduler
-	cancel := sched.After(after, func() { d.fire(ctx, key) })
+	// 提交者的 ctx 只用于**值传递**，不参与取消：写入路径的 ctx 通常是请求/对话级的，
+	// 请求结束时它必然已取消，而整理必须在 after 之后照常执行（F-T）。
+	// 与 recordCancelled 同一手法：WithoutCancel 保留值、剥掉取消。
+	var submitCtx context.Context
+	if ctx != nil {
+		submitCtx = context.WithoutCancel(ctx)
+	}
+	cancel := sched.After(after, func() { d.fire(gen, submitCtx, key) })
 	d.timers[key] = cancel
 	d.mu.Unlock()
-	return func() { d.cancel(key) }
+	return func() { d.cancelGen(key, gen) }
 }
 
 // fire 执行一次（**在锁外**调用 runner：op 会跑很久，持锁会把整条写入路径卡住）。
-func (d *Debouncer) fire(ctx context.Context, key string) {
+//
+// gen 是这条回调所属的登记序号：与当前登记不符时说明它是**迟到的旧定时器**，
+// 必须直接返回——既不消费新 payload（F-3），也不删除新定时器。
+// 注意 -race 抓不到这个问题：d.mu 保护的是数据竞争，而这里错的是语义。
+func (d *Debouncer) fire(gen uint64, ctx context.Context, key string) {
 	d.mu.Lock()
+	if d.generation[key] != gen {
+		// 迟到的旧回调：这次的登记已被后续 Submit 取代（或已被 cancel）。
+		d.mu.Unlock()
+		return
+	}
 	entry, ok := d.pending[key]
 	if ok {
 		delete(d.pending, key)
 	}
 	delete(d.timers, key)
+	// 让这一代失效：fire 之后任何续到期的旧回调都不再当值。
+	d.generation[key] = gen + 1
 	d.mu.Unlock()
 	if !ok {
 		return
@@ -136,14 +167,28 @@ func (d *Debouncer) fire(ctx context.Context, key string) {
 	_, _ = d.runner.Run(runCtx, entry.req)
 }
 
-func (d *Debouncer) cancel(key string) {
+// cancelGen 只撤销 gen 这一次登记（F-2：不得误杀后续登记的定时器）。
+func (d *Debouncer) cancelGen(key string, gen uint64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.generation[key] != gen {
+		// 本次登记已被后续 Submit 取代：cancel 句柄已失效，不动别人的定时器。
+		return
+	}
 	if cancel, ok := d.timers[key]; ok {
 		cancel()
 		delete(d.timers, key)
 	}
 	delete(d.pending, key)
+	// 同样让这一代失效，避免已排队但尚未执行的回调继续生效。
+	d.generation[key] = gen + 1
+}
+
+func (d *Debouncer) cancel(key string) {
+	d.mu.Lock()
+	gen := d.generation[key]
+	d.mu.Unlock()
+	d.cancelGen(key, gen)
 }
 
 // Pending 返回尚未触发的 key 数。

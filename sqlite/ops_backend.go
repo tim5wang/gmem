@@ -593,36 +593,45 @@ func (b *OpsBackend) CountConceptRefs(ctx context.Context, conceptID string) (in
 	return n, nil
 }
 
-// ListStaleDrafts 返回"长期未用"的 draft 概念。
+// ListStaleDrafts 返回 scope 内笔“活得太久”且无引用的 draft 概念。
 //
-// # 首次见到即登记（为什么必须有这一步）
+// # 时间基准必须是 MAX(最后使用, 创建时间)（F-1）
 //
-// draft 是 P2 写入路径隐式创建的；P3 之前没有 concept_usage 行。这里把缺失的统计行
-// 补成 (use_count=0, last_used_at=0)——"未知即视为很久以前"。
+// 旧实现把缺失的统计行登记成 last_used_at=0，而 cutoff=now-TTL 恒为正，
+// 于是 0 <= cutoff 恒真：**刚创建的稿子第一次 Prune 就被删**。
+// 那不是“清过期草稿”，而是“清所有无引用的新稿子”——D15 的反面，且不可恢复。
 //
-// 真正保护"仍在用的草稿"的不是这个时间戳，而是 CountConceptRefs：
-// 只要还有 memories/nodes 引用它，pruneDraft 就跳过。因此把未知记成 0 不会误删，
-// 反而让"记忆被物理删除后留下的孤儿概念"能被清掉（这才是本体收敛的关键路径）。
+// 现在两路取大：有过使用记录就按使用时间，没有就按创建时间（v8 的 concepts.created_at）。
+// 因此“刚建且从未使用”的稿子至少能活一个完整 TTL。
 //
-// 该写入是幂等的（INSERT OR IGNORE），且在调用方的事务里，与后续物理删除同生共死。
-func (b *OpsBackend) ListStaleDrafts(ctx context.Context, cutoff int64, limit int) ([]store.Concept, error) {
+// 为什么不再“首次见到即登记”（旧实现的副作用）：
+// 那条 INSERT 正是缺陷的源头，而且让一个**读路径**在生产事务里写行。
+// 判定不再需要它（LEFT JOIN 已能表达“从未使用”）；使用统计仍由
+// TouchConceptUsage（Extract 路径）负责。
+//
+// # 为什么必须带 scope（F-4）
+//
+// Runner 把 Scope 当必填隔离边界，而 concepts 历史上没有 scope 列，于是
+// agent scope 的 Prune 会删掉 user scope 的草稿。归属性由 v8 的 concepts.scope 携带，
+// 创建时钉死（见 ensureConcept）。
+//
+// scope=” 的历史稿子（v8 迁移无法从引用回溯出边界的）不做归属过滤：它们没有任何引用，
+// 也就没有任何 scope 能“拥有”它们；调用方（Prune）会把这种情况记进 Degraded，不静默。
+func (b *OpsBackend) ListStaleDrafts(ctx context.Context, scope store.Scope, cutoff int64, limit int) ([]store.Concept, error) {
 	q, err := b.c.querier(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := q.ExecContext(ctx, `
-		INSERT OR IGNORE INTO concept_usage (concept_id, use_count, last_used_at)
-		SELECT c.id, 0, 0
-		FROM concepts c LEFT JOIN concept_usage u ON u.concept_id = c.id
-		WHERE c.status = ? AND u.concept_id IS NULL`,
-		string(store.ConceptDraft)); err != nil {
-		return nil, fmt.Errorf("sqlite: register draft usage: %w", err)
-	}
 	sqlText := `SELECT ` + conceptCols + `
-		FROM concepts c JOIN concept_usage u ON u.concept_id = c.id
-		WHERE c.status = ? AND u.last_used_at <= ?
-		ORDER BY u.last_used_at ASC, c.id ASC`
-	args := []any{string(store.ConceptDraft), cutoff}
+		FROM concepts c LEFT JOIN concept_usage u ON u.concept_id = c.id
+		WHERE c.status = ?
+		  AND (c.scope = ? OR c.scope = '')
+		  AND CASE WHEN COALESCE(u.last_used_at, 0) > COALESCE(c.created_at, 0)
+		           THEN COALESCE(u.last_used_at, 0) ELSE COALESCE(c.created_at, 0) END <= ?
+		ORDER BY CASE WHEN COALESCE(u.last_used_at, 0) > COALESCE(c.created_at, 0)
+		              THEN COALESCE(u.last_used_at, 0) ELSE COALESCE(c.created_at, 0) END ASC,
+		         c.id ASC`
+	args := []any{string(store.ConceptDraft), string(scope), cutoff}
 	if limit > 0 {
 		sqlText += ` LIMIT ?`
 		args = append(args, limit)

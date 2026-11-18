@@ -27,6 +27,11 @@ type pruneMemoryStep struct {
 	MemoryID string
 	Status   MemoryStatus
 	Versions []int
+	// OptIn 记录“本次运行是否显式 opt-in 了 IncludeInvalidated”（F-5）。
+	//
+	// 为什么要把它带进 Step：Apply 必须能独立复核“删 Invalidated 是不是被允许的”，
+	// 而不是默信任 Plan（Step 可能被持久化后重放）。
+	OptIn bool
 }
 
 type pruneDraftStep struct{ Concept store.Concept }
@@ -62,7 +67,8 @@ func (pruneOp) Plan(txc TxContext) ([]Step, error) {
 		}
 		steps = append(steps, Step{
 			ID: "prune:" + st.MemoryID, Kind: "prune_memory", Subject: st.MemoryID,
-			Data: pruneMemoryStep{MemoryID: st.MemoryID, Status: st.Status, Versions: versions},
+			Data: pruneMemoryStep{MemoryID: st.MemoryID, Status: st.Status, Versions: versions,
+				OptIn: in.IncludeInvalidated},
 			Note: "物理删除（唯一删除路径）：全部版本 + 状态行 + FTS/向量索引",
 		})
 	}
@@ -74,7 +80,8 @@ func (pruneOp) Plan(txc TxContext) ([]Step, error) {
 			ttl = time.Duration(in.DraftTTLSeconds) * time.Second
 		}
 		before := now.Add(-ttl).UnixMilli()
-		drafts, err := txc.Backend().ListStaleDrafts(ctx, before, limit)
+		// scope 是必填的隔离边界（F-4）：没有它，agent scope 的清理会删掉 user scope 的草稿。
+		drafts, err := txc.Backend().ListStaleDrafts(ctx, txc.Scope(), before, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -109,13 +116,26 @@ func (pruneOp) Apply(txc TxContext, s Step) (Diff, error) {
 // 没人会发现。
 func pruneMemory(txc TxContext, v pruneMemoryStep) (Diff, error) {
 	ctx := txc.Context()
-	// Prune 只对 Archived（或显式 opt-in 的 Invalidated）生效；这里再挡一次，
+	// Prune 只对 Archived（或**显式 opt-in** 的 Invalidated）生效；这里再挡一次，
 	// 因为 Step 可能被持久化后重放，不能只信 Plan。
-	if v.Status != StatusArchived && v.Status != StatusInvalidated {
-		return Diff{Changed: false,
-			Summary:  fmt.Sprintf("跳过 %s：状态 %s 不是 Archived（Prune 默认只作用于 Archived）", v.MemoryID, v.Status),
-			Warnings: []string{fmt.Sprintf("拒绝物理删除 %s（状态 %s）", v.MemoryID, v.Status)},
-		}, nil
+	//
+	// F-5：旧实现只判断"状态属于 {Archived, Invalidated}"，于是 Invalidated
+	// **无条件放行**——这条"二次防线"到底没挡任何东西。现在 Invalidated 必须
+	// 同时带上本次运行的 opt-in 标记，否则跳过并记 Warnings（不得静默）。
+	if v.Status != StatusArchived {
+		if v.Status != StatusInvalidated {
+			return Diff{Changed: false,
+				Summary:  fmt.Sprintf("跳过 %s：状态 %s 不是 Archived（Prune 默认只作用于 Archived）", v.MemoryID, v.Status),
+				Warnings: []string{fmt.Sprintf("拒绝物理删除 %s（状态 %s）", v.MemoryID, v.Status)},
+			}, nil
+		}
+		if !v.OptIn {
+			return Diff{Changed: false,
+				Summary: fmt.Sprintf("跳过 %s：状态为 Invalidated 但本次未 IncludeInvalidated（opt-in）", v.MemoryID),
+				Warnings: []string{fmt.Sprintf(
+					"拒绝物理删除 %s：Invalidated 默认保留（TD §7 纪律 1，as_of 仍可回溯）；需要显式 IncludeInvalidated", v.MemoryID)},
+			}, nil
+		}
 	}
 
 	before := marshalJSON(map[string]any{"memory": v.MemoryID, "status": string(v.Status), "versions": v.Versions})
@@ -146,10 +166,10 @@ func pruneMemory(txc TxContext, v pruneMemoryStep) (Diff, error) {
 		return Diff{}, err
 	}
 	return Diff{
-		Changed: n > 0,
-		Summary: fmt.Sprintf("物理删除记忆 %s（%d 行，状态 %s，索引已同步清理）", v.MemoryID, n, v.Status),
-		Before:  before,
-		After:   marshalJSON(map[string]any{"memory": v.MemoryID, "deleted_rows": n}),
+		Changed:  n > 0,
+		Summary:  fmt.Sprintf("物理删除记忆 %s（%d 行，状态 %s，索引已同步清理）", v.MemoryID, n, v.Status),
+		Before:   before,
+		After:    marshalJSON(map[string]any{"memory": v.MemoryID, "deleted_rows": n}),
 		Subjects: []string{v.MemoryID},
 	}, nil
 }
@@ -188,10 +208,10 @@ func pruneDraft(txc TxContext, v pruneDraftStep) (Diff, error) {
 		return Diff{}, err
 	}
 	return Diff{
-		Changed: true,
-		Summary: fmt.Sprintf("删除长期未用 draft 概念 %s（origin=%s，无引用）", c.ID, c.Origin),
-		Before:  before,
-		After:   marshalJSON(map[string]any{"concept": c.ID, "deleted": true}),
+		Changed:  true,
+		Summary:  fmt.Sprintf("删除长期未用 draft 概念 %s（origin=%s，无引用）", c.ID, c.Origin),
+		Before:   before,
+		After:    marshalJSON(map[string]any{"concept": c.ID, "deleted": true}),
 		Subjects: []string{c.ID},
 	}, nil
 }

@@ -21,8 +21,10 @@ import (
 
 type extractOp struct{}
 
-func (extractOp) Name() OpName   { return OpExtract }
-func (extractOp) Budget() Budget { return Budget{Tokens: 20000, Duration: 30 * time.Second, Steps: 50, IO: 500} }
+func (extractOp) Name() OpName { return OpExtract }
+func (extractOp) Budget() Budget {
+	return Budget{Tokens: 20000, Duration: 30 * time.Second, Steps: 50, IO: 500}
+}
 
 func (extractOp) Plan(txc TxContext) ([]Step, error) {
 	ctx := txc.Context()
@@ -55,6 +57,13 @@ func (extractOp) Plan(txc TxContext) ([]Step, error) {
 	}
 	out := make([]Step, 0, len(eps))
 	for _, ep := range sortEpisodes(eps) {
+		// F-6：预算必须真的扣减。旧实现 Spend 零调用点，IO/Tokens 预算只存在于结构体里，
+		// “IO=1 仍 applied 30 步”——调用方以为有上限，实际无界。
+		// 每处理一条输入花 1 单位 IO；耗尽就停手并显式说明（不得静默截断）。
+		if err := txc.Spend(1); err != nil {
+			txc.Note(fmt.Sprintf("IO 预算耗尽：Extract 仅计划了 %d/%d 个 episode", len(out), len(eps)))
+			break
+		}
 		out = append(out, Step{
 			ID: "extract:" + ep.ID, Kind: "extract_episode", Subject: ep.ID, Data: ep,
 			Note: "L0/L1/L2 提取并落库（写入必经 recall.Writer）",
@@ -89,6 +98,18 @@ func (extractOp) Apply(txc TxContext, s Step) (Diff, error) {
 				"extract op 未执行：未注入 Extractor（L0/L1/L2 全部缺席）；" +
 					"这是显式降级而不是成功",
 			},
+		}, nil
+	}
+	// F-6：Tokens 预算必须真的被消费。
+	//
+	// 旧实现里 Budget.Tokens 从未被读取（extractOp 报了 20000，无人消费），
+	// 于是“token 预算”只是一行注释。以 episode 正文长度为估算基准（一个字符 ≈
+	// 一个 token 是粗糙但**保守**的下界），超过上限就在调用 Extractor **之前**停手：
+	// 已经花掉的调用不可撤回，因此检查点必须在前面。
+	if err := txc.SpendTokens(len([]rune(ep.Content))); err != nil {
+		return Diff{Changed: false,
+			Summary:  "Tokens 预算耗尽：跳过 episode " + ep.ID,
+			Degraded: []string{"Tokens 预算耗尽（episode " + ep.ID + " 未提取），已停手"},
 		}, nil
 	}
 	res, err := ex.ExtractEpisode(txc.Context(), EpisodeInput{
@@ -146,9 +167,9 @@ func (extractOp) Apply(txc TxContext, s Step) (Diff, error) {
 		}
 	}
 	return Diff{
-		Changed: len(memIDs) > 0,
-		Summary: fmt.Sprintf("提取 episode %s：写入 %d 条记忆、%d 个节点", ep.ID, len(memIDs), len(res.Writes)),
-		After:   marshalJSON(map[string]any{"episode": ep.ID, "memories": memIDs}),
+		Changed:  len(memIDs) > 0,
+		Summary:  fmt.Sprintf("提取 episode %s：写入 %d 条记忆、%d 个节点", ep.ID, len(memIDs), len(res.Writes)),
+		After:    marshalJSON(map[string]any{"episode": ep.ID, "memories": memIDs}),
 		Subjects: append([]string{ep.ID}, memIDs...),
 		Degraded: deg,
 		Warnings: res.Warnings,
@@ -216,12 +237,17 @@ func (disambiguateOp) Plan(txc TxContext) ([]Step, error) {
 			nodePairKey(sorted[j].LeftNode, sorted[j].RightNode)
 	})
 	for _, p := range sorted {
+		// F-6：预算扣减（每对灰区/裁决花 1 单位 IO）。
+		if err := txc.Spend(1); err != nil {
+			txc.Note(fmt.Sprintf("IO 预算耗尽：Disambiguate 仅计划了 %d/%d 对", len(out), len(sorted)))
+			break
+		}
 		key := nodePairKey(p.LeftNode, p.RightNode)
 		if v, ok := verdicts[key]; ok {
 			out = append(out, Step{
 				ID: "verdict:" + shortHash(key), Kind: "pair_verdict",
 				Subject: key, Data: v,
-				Note:    "裁决为 " + v.Verdict + "（same → Merge，different → negative_SameAs）",
+				Note: "裁决为 " + v.Verdict + "（same → Merge，different → negative_SameAs）",
 			})
 			continue
 		}
@@ -331,10 +357,13 @@ func applyVerdict(txc TxContext, v PairVerdict) (Diff, error) {
 				if nodePairKey(h.Edge.FromID, h.Edge.ToID) != nodePairKey(v.LeftNode, v.RightNode) {
 					continue
 				}
-				if err := invalidateEdge(txc, h.Edge.ID, now.Unix()); err != nil {
+				changed, err := invalidateEdge(txc, h.Edge.ID, now.Unix())
+				if err != nil {
 					return Diff{}, err
 				}
-				cleared = append(cleared, h.Edge.ID)
+				if changed {
+					cleared = append(cleared, h.Edge.ID)
+				}
 			}
 		}
 		return Diff{
@@ -385,6 +414,11 @@ func (consolidateOp) Plan(txc TxContext) ([]Step, error) {
 	for _, m := range mems {
 		if err := txc.Check(); err != nil {
 			return nil, err
+		}
+		// F-6：预算扣减（每条记忆 1 单位 IO）；耗尽即停手并说明。
+		if err := txc.Spend(1); err != nil {
+			txc.Note(fmt.Sprintf("IO 预算耗尽：Consolidate 仅扫描了 %d/%d 条记忆", len(steps), len(mems)))
+			break
 		}
 		st, _ := sm.load(m)
 		target, why := sm.nextStatus(st, m, now, cfg)
@@ -483,9 +517,9 @@ func (consolidateOp) Apply(txc TxContext, s Step) (Diff, error) {
 		return stateManager{txc: txc}.move(v.Memory, v.To, s.Note)
 	case orphanReport:
 		return Diff{
-			Changed: false,
-			Summary: fmt.Sprintf("孤立节点 %d 个（只报告，不删除）", len(v.IDs)),
-			After:   marshalJSON(map[string]any{"orphans": v.IDs}),
+			Changed:  false,
+			Summary:  fmt.Sprintf("孤立节点 %d 个（只报告，不删除）", len(v.IDs)),
+			After:    marshalJSON(map[string]any{"orphans": v.IDs}),
 			Warnings: []string{fmt.Sprintf("孤立节点 %d 个：%s", len(v.IDs), joinLimited(v.IDs, 10))},
 			Subjects: v.IDs,
 		}, nil
@@ -523,6 +557,11 @@ func (decayOp) Plan(txc TxContext) ([]Step, error) {
 	for _, m := range mems {
 		if err := txc.Check(); err != nil {
 			return nil, err
+		}
+		// F-6：预算扣减（每条记忆 1 单位 IO）；耗尽即停手并说明。
+		if err := txc.Spend(1); err != nil {
+			txc.Note(fmt.Sprintf("IO 预算耗尽：Decay 仅重算了 %d/%d 条记忆", len(steps), len(mems)))
+			break
 		}
 		cur, _ := sm.load(m)
 		next := sm.recalc(m, cur)

@@ -118,7 +118,9 @@ func TestRRFStable(t *testing.T) {
 // 旧版只比 IDs(a)[0] == IDs(b)[0]。单通道单候选时两边都只有一个元素且 ID 相同，
 // 即使 k=0 走了与 DefaultK 完全不同的常数（比如 k=1）也照样 PASS——这个断言没有判别力。
 // 现在直接断言 Score 的数值：
-//   score = w / (k + rank) = 1 / (60 + 1)
+//
+//	score = w / (k + rank) = 1 / (60 + 1)
+//
 // 因此 k=0 必须得到 1/61；若实现把 k=0 当成 0（或任何其它值），分母会变、断言必红。
 func TestRRFDefaultK(t *testing.T) {
 	items := []Item{{ID: "a"}, {ID: "b"}}

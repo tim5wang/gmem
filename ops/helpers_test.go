@@ -206,8 +206,8 @@ func (e *env) putMemory(m store.Memory) recall.PutResult {
 func memory(id string, scope store.Scope, concept string) store.Memory {
 	return store.Memory{
 		ID: id, Scope: scope, ConceptID: concept, Kind: store.KindSemantic,
-		Content:  "这是一条用于 P3 生命周期测试的完整记忆正文（超过十个字符）",
-		TValid:   1000,
+		Content:    "这是一条用于 P3 生命周期测试的完整记忆正文（超过十个字符）",
+		TValid:     1000,
 		Importance: 0.5,
 	}
 }
@@ -265,7 +265,7 @@ func (f *fakeExtractor) ExtractEpisode(ctx context.Context, ep ops.EpisodeInput)
 	res, err := recall.NewWriter(f.ports).PutMemory(ctx, store.Memory{
 		ID: id, Scope: ep.Scope, Kind: store.KindSemantic,
 		Content: "从 episode " + ep.ID + " 提取出来的记忆正文（足够长）",
-		TValid: ep.At, TCreated: ep.At,
+		TValid:  ep.At, TCreated: ep.At,
 	})
 	if err != nil {
 		return ops.ExtractOutcome{}, err

@@ -12,6 +12,16 @@ import (
 // ErrBudgetExceeded 表示本次运行触到预算上限（正常停手点，不是缺陷）。
 var ErrBudgetExceeded = errors.New("ops: budget exceeded")
 
+// ErrRunCancelled 表示本次运行被取消（status=cancelled 时**一定**返回它）。
+//
+// # 为什么不能沿用 ctx.Err()（T 可后续）
+//
+// 旧实现 return res, ctx.Err()。当 op **自己**放弃（返回 context.DeadlineExceeded 或
+// 内部超时）时，外层 ctx 根本没取消，于是 ctx.Err()==nil：调用方看到
+// `status=cancelled, err=nil`，按 `if err != nil` 判断就会当成“跑完了”，
+// 但实际上整个事务已回滚、什么都没做。取消必须是**可判定的错误**。
+var ErrRunCancelled = errors.New("ops: run cancelled")
+
 // NewRunner 构造 op 执行器。它是**自动触发与 Agent 调用的唯一出口**（D3）。
 //
 // 必填：ports.Store（事务与 CRUD）、backend（生命周期/审计/幂等台账）。
@@ -53,16 +63,32 @@ func (r *Runner) Ops() []OpName { return AllOps() }
 
 // scanOps 是"按时间窗口扫描"的 op：它们的幂等 key 必须含窗口。
 //
-// 只看输入参数就足够的 op（Merge/LinkUpdate/Invalidate/Promote）**不在此列**：
+// 只看输入参数就足够的 op（Merge/LinkUpdate/Invalidate）**不在此列**：
 // 对它们而言"同输入 = 同一件事"，重跑必须安全跳过（这才是幂等的本意）。
 var scanOps = map[OpName]bool{
 	OpExtract: true, OpDisambiguate: true, OpConsolidate: true,
 	OpDecay: true, OpPrune: true,
 }
 
+// needsWindow 报告本次输入是否必须带扫描窗口。
+//
+// # 为什么 Promote(All) 必须例外
+//
+// Promote 默认只看输入：`{concept_ids: [...]}` 同输入 = 同一件事，重跑安全跳过。
+// 但 `All: true` 的输入是**常量**，它的作用域却是"当下所有草稿集合"——
+// 集合会随时间增长。若 key 也恒定，第二次调用就被判 duplicate，
+// 之后新长出来的草稿**永远不会被认证**（D15 的自动清理静默空转）。
+// 窗口把"这一次看到的是什么时候的集合"写进 key，语义才对得上。
+func needsWindow(op OpName, in Input) bool {
+	if scanOps[op] {
+		return true
+	}
+	return op == OpPromote && in.Promote != nil && in.Promote.All
+}
+
 // withWindow 给扫描型 op 补上扫描窗口（默认 = 本次运行的当前时刻）。
 func (r *Runner) withWindow(op Op, in Input) Input {
-	if !scanOps[op.Name()] || in.Window != 0 {
+	if !needsWindow(op.Name(), in) || in.Window != 0 {
 		return in
 	}
 	in.Window = r.cfg.Now().UnixMilli()
@@ -121,6 +147,8 @@ func (r *Runner) Run(ctx context.Context, req Request) (Result, error) {
 		steps    []StepResult
 		dup      bool
 		canceled bool
+		// planErr 记录 Plan 阶段返回的函数性错误（F-7：它也要落审计行）。
+		planErr error
 	)
 	rec := RunRecord{
 		Key: key, Op: req.Op, Scope: req.Scope, Trigger: trig.Kind,
@@ -161,8 +189,13 @@ func (r *Runner) Run(ctx context.Context, req Request) (Result, error) {
 				canceled = true
 				return err
 			}
+			// F-7：Plan 失败也要留审计。它不在业务事务里（这个事务马上回滚），
+			// 因此由 recordFailed 在独立事务里补一行，否则“为什么这一次什么都没发生”无从回答。
+			planErr = err
 			return err
 		}
+		// Plan 阶段记录的降级/停手原因（预算触顶必须说出来，不得静默截断）。
+		res.Degraded = append(res.Degraded, txc.takeNotes()...)
 		applied := 0
 		for _, s := range planned {
 			if err := txc.Check(); err != nil {
@@ -170,6 +203,9 @@ func (r *Runner) Run(ctx context.Context, req Request) (Result, error) {
 				return err
 			}
 			if budget.Steps > 0 && len(steps) >= budget.Steps {
+				// 触顶是正常停手点，但必须可见：否则“计划 30 步只跑了 1 步”看起来像没工作。
+				res.Degraded = append(res.Degraded, fmt.Sprintf(
+					"Steps 预算触顶（%d）：计划 %d 步，仅应用 %d 步", budget.Steps, len(planned), len(steps)))
 				break
 			}
 			d, err := op.Apply(txc, s)
@@ -178,6 +214,8 @@ func (r *Runner) Run(ctx context.Context, req Request) (Result, error) {
 					canceled = isCancel(err)
 					if !canceled {
 						// 预算触顶不是取消：已应用的步骤照常提交，未做的留空。
+						res.Degraded = append(res.Degraded, fmt.Sprintf(
+							"IO/Tokens 预算耗尽，停手于步骤 %s：已应用 %d 步", s.ID, len(steps)))
 						break
 					}
 					return err
@@ -197,7 +235,22 @@ func (r *Runner) Run(ctx context.Context, req Request) (Result, error) {
 			}); err != nil {
 				return err
 			}
+			// F-10a：步骤内部真实落库的中间迁移也要各留一条审计——
+			// 否则 Candidate → Active → Invalidated 只留下一行，因果链断了一环。
+			for i, t := range d.Trail {
+				if _, err := r.backend.AppendAudit(tctx, AuditEntry{
+					OpID: key, Op: req.Op, Scope: req.Scope,
+					Trigger: trig.Kind, Actor: trig.Actor, Reason: trig.Reason,
+					StepID:   fmt.Sprintf("%s/via%d", s.ID, i+1),
+					StepKind: s.Kind + "_via", Subject: s.Subject,
+					BeforeJSON: t.Before, AfterJSON: t.After,
+					Changed: t.Changed, At: r.cfg.Now().UnixMilli(),
+				}); err != nil {
+					return err
+				}
+			}
 			res.Degraded = append(res.Degraded, d.Degraded...)
+			res.Degraded = append(res.Degraded, txc.takeNotes()...)
 			res.Warnings = append(res.Warnings, d.Warnings...)
 		}
 
@@ -220,16 +273,31 @@ func (r *Runner) Run(ctx context.Context, req Request) (Result, error) {
 	case dup:
 		res.Status = RunDuplicate
 		res.Steps = nil
+		// 这里**不写 audit_log**：受保护用例 ops/ops_test.go:197 与
+		// internal/p3verify/idempotent_test.go:76 都断言 duplicate 后审计行数不得增长。
+		// F-7 要求 duplicate 也落审计行，两者不可兼得——已作为待裁决项上报。
 		return res, nil
 	case canceled || isCancel(txErr):
 		// 事务已回滚（没有半截状态）。用独立事务记一条 cancelled，
 		// 让"这次为什么没有变化"在审计里可回答。
-		r.recordCancelled(ctx, rec, txErr)
+		cause := txErr
+		if cause == nil {
+			cause = ctx.Err()
+		}
+		r.recordCancelled(ctx, rec, cause)
 		res.Status = RunCancelled
 		res.Steps = nil
-		return res, ctx.Err()
+		// T 可后续：cancelled 必须返回**非 nil** 错误。
+		//
+		// 旧实现 return res, ctx.Err()：op 自己放弃时外层 ctx 未取消，err 就是 nil，
+		// 调用方按 `if err != nil` 判断会当成“跑完了”，实际事务已回滚。
+		// 用 errors.Join 同时保留 ErrRunCancelled（可判定）与真实原因（可诊断）。
+		if cause != nil {
+			return res, errors.Join(ErrRunCancelled, cause)
+		}
+		return res, ErrRunCancelled
 	case txErr != nil:
-		r.recordFailed(ctx, rec, txErr)
+		r.recordFailed(ctx, rec, txErr, planErr)
 		res.Status = RunFailed
 		return res, txErr
 	}
@@ -283,15 +351,56 @@ func (r *Runner) recordCancelled(ctx context.Context, rec RunRecord, cause error
 		note += ": " + cause.Error()
 	}
 	r.markRun(base, rec, RunCancelled, note)
+	// 这里**不**追加 audit 行：受保护用例 internal/p3verify/cancel_d15scale_test.go:68
+	// 断言取消后 audit_log 必须为 0（审计与业务变更同生共死）。
+	// 取消原因已在 op_runs.note 里可读（见 runner.Run 的 cancelled 分支注释）。
 }
 
-func (r *Runner) recordFailed(ctx context.Context, rec RunRecord, cause error) {
+func (r *Runner) recordFailed(ctx context.Context, rec RunRecord, cause error, planErr error) {
 	base := context.WithoutCancel(ctx)
 	note := "failed"
 	if cause != nil {
 		note += ": " + cause.Error()
 	}
 	r.markRun(base, rec, RunFailed, note)
+
+	// F-7：Plan 失败必须落审计行。
+	//
+	// # 为什么只做这一条分支
+	//
+	// duplicate / cancelled 两条路径写入 audit_log 会直接违反受保护用例的现有断言：
+	//
+	//	internal/p3verify/cancel_d15scale_test.go:68  cancelled 后 audit_log 行数必须 == 0
+	//	internal/p3verify/idempotent_test.go:76      duplicate 后 audit_log 行数不得增长
+	//
+	// 而 F-7 要求“三条路径都要落审计行”，两者不可同时成立。
+	// 按“不得删除或弱化受保护用例”的硬约束，这里只补无冲突的 Plan 失败分支，
+	// duplicate/cancelled 仍只能从 op_runs 看到（已在任务卡上作为待裁决项上报）。
+	if planErr != nil {
+		r.appendOutcomeAudit(base, rec, RunFailed, "plan_failed", planErr.Error())
+	}
+}
+
+// appendOutcomeAudit 在**独立事务**里补一行 changed=false 的运行级审计。
+//
+// 为什么必须独立事务：cancelled / failed 的业务事务已经回滚（连同其中的审计），
+// 而“这次被取消了”本身必须留下来。
+func (r *Runner) appendOutcomeAudit(ctx context.Context, rec RunRecord, status RunStatus, kind, note string) {
+	tctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	_ = r.ports.Store.Tx(tctx, func(inctx context.Context, _ store.Store) error {
+		_, err := r.backend.AppendAudit(inctx, AuditEntry{
+			OpID: rec.Key, Op: rec.Op, Scope: rec.Scope,
+			Trigger: rec.Trigger, Actor: rec.Actor, Reason: rec.Reason,
+			// StepID 用运行级占位：它不与任何业务步骤竞争，且能看出是哪个阶段。
+			StepID: "run", StepKind: "run_" + kind, Subject: "",
+			BeforeJSON: "", AfterJSON: marshalJSON(map[string]any{
+				"status": string(status), "note": note,
+			}),
+			Changed: false, At: r.cfg.Now().UnixMilli(),
+		})
+		return err
+	})
 }
 
 func (r *Runner) markRun(ctx context.Context, rec RunRecord, status RunStatus, note string) {
@@ -332,6 +441,13 @@ type txContext struct {
 	now    time.Time
 	budget Budget
 	spent  int
+
+	// spentTokens 是 Tokens 维度的已用预算（与 IO 分开计）。
+	spentTokens int
+	// notes 是本次运行里的显式降级/停手原因（预算触顶必须说出来，不得静默截断）。
+	notes []string
+	// trail 是本步骤里发生的中间迁移（由 Runner 写成审计行）。
+	trail []Diff
 }
 
 func (t *txContext) Context() context.Context { return t.ctx }
@@ -354,4 +470,31 @@ func (t *txContext) Spend(io int) error {
 		return ErrBudgetExceeded
 	}
 	return nil
+}
+
+// SpendTokens 记一次 token 消耗；语义同 Spend。
+func (t *txContext) SpendTokens(n int) error {
+	t.spentTokens += n
+	if t.budget.Tokens > 0 && t.spentTokens > t.budget.Tokens {
+		return ErrBudgetExceeded
+	}
+	return nil
+}
+
+// Note 记录一条显式降级/停手原因。
+func (t *txContext) Note(msg string) {
+	if msg == "" {
+		return
+	}
+	t.notes = append(t.notes, msg)
+}
+
+// takeNotes 取走已记录的说明（Runner 汇总后清空，避免重复）。
+func (t *txContext) takeNotes() []string {
+	if len(t.notes) == 0 {
+		return nil
+	}
+	out := t.notes
+	t.notes = nil
+	return out
 }

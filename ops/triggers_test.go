@@ -200,6 +200,25 @@ func TestFourTriggerSourcesProduceSameBehavior(t *testing.T) {
 		}
 	}
 
+	// 【T-6 修复】上面是各自断言具体值，但没有**交叉比较**：
+	// 四条路径各自“恰好都对”才算 D3，只要有一条跑偏就应该红。
+	// 这里逐字段比较：状态集合必须完全相等（trigger_kind 允许不同，那是审计口径）。
+	baseline := agent.statuses
+	for name, got := range map[string]outcome{
+		"after_write": afterWrite, "threshold": threshold, "idle": idle,
+	} {
+		if len(got.statuses) != len(baseline) {
+			t.Errorf("%s 与 agent 的状态行数不同：%d vs %d（D3：同一套代码必须给出同一结果）",
+				name, len(got.statuses), len(baseline))
+		}
+		for id, wantSt := range baseline {
+			if gotSt, ok := got.statuses[id]; !ok || gotSt != wantSt {
+				t.Errorf("%s 与 agent 在 %s 上分歧：%q vs %q（自动与 Agent 路径不得分叉）",
+					name, id, gotSt, wantSt)
+			}
+		}
+	}
+
 	// 四种触发源在审计里的 trigger_kind 各自可辨（"谁触发的"必须可回答）。
 	for name, want := range map[string]string{
 		"after_write": string(ops.TriggerAfterWrite), "threshold": string(ops.TriggerThreshold),
@@ -277,10 +296,29 @@ func TestAuditLogReconstructsWhoWhenWhy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Audit: %v", err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("审计条数=%d, want 1", len(entries))
+	// F-10a：中间迁移（Candidate → Active）是真实落库，必须各自留审计行。
+	// 因此这里不再断言“恰好 1 条”，而是要求主步骤与中间迁移都能按 op_id 取到，
+	// 且主步骤的 before/after/changed 仍然完整。
+	if len(entries) < 1 {
+		t.Fatalf("审计条数=%d, want >= 1", len(entries))
 	}
-	a := entries[0]
+	var mainEntry *ops.AuditEntry
+	var sawVia bool
+	for i := range entries {
+		switch entries[i].StepKind {
+		case "invalidate_memory_via":
+			sawVia = true
+		case "invalidate_memory":
+			mainEntry = &entries[i]
+		}
+	}
+	if mainEntry == nil {
+		t.Fatalf("没有 invalidate_memory 的主审计行：%+v", entries)
+	}
+	if !sawVia {
+		t.Errorf("缺少中间迁移审计行：Candidate → Active 是真实落库，因果链缺一环（%+v）", entries)
+	}
+	a := *mainEntry
 	if a.Actor != "agent-42" || a.Reason != "用户说这条已作废" || a.Trigger != ops.TriggerAgent {
 		t.Errorf("审计元数据不完整：%+v", a)
 	}
@@ -300,13 +338,13 @@ func TestAuditLogReconstructsWhoWhenWhy(t *testing.T) {
 		t.Errorf("审计 subject=%q, want m-1（改了什么）", a.Subject)
 	}
 
-	// 按 subject 检索同样能重建这条记忆的完整变更史。
+	// 按 subject 检索同样能重建这条记忆的完整变更史（含中间迁移）。
 	bySubject, err := e.maint.Audit(ctx, ops.AuditQuery{Subject: "m-1"})
 	if err != nil {
 		t.Fatalf("Audit(subject): %v", err)
 	}
-	if len(bySubject) != 1 {
-		t.Errorf("按 subject 检索到 %d 条, want 1", len(bySubject))
+	if len(bySubject) < 1 {
+		t.Errorf("按 subject 检索到 %d 条, want >= 1", len(bySubject))
 	}
 
 	// op 台账也能按 scope/op 查（P4 的 History API 会用到）。

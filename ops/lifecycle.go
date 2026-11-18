@@ -139,7 +139,7 @@ func (sm stateManager) load(m store.Memory) (State, bool) {
 	now := sm.txc.Now().UnixMilli()
 	status := StatusCandidate
 	base := baseImportance(m)
-	rec := recencyDecay(now, m.TValid, cfg.DecayHalfLife, cfg.DecayFloor)
+	rec := recencyDecay(now, m.TValid*1000, cfg.DecayHalfLife, cfg.DecayFloor)
 	acc := accessBoost(m.RecallCount, cfg.AccessBoostK)
 	grade := 1.0
 	hasConcept := m.ConceptID != ""
@@ -216,6 +216,19 @@ func (sm stateManager) move(m store.Memory, to MemoryStatus, note string) (Diff,
 		if via == "" {
 			return Diff{}, err
 		}
+		// F-10：Candidate **不得**绕过质量门变成 Invalidated。
+		//
+		// 旧实现无条件补一跳 Active，于是一条内容过短、本该 Rejected 的记忆，
+		// 只要被 supersede 一次就会留下“曾经 Active 过”的记录——把状态机的
+		// 非法迁移改写成“两跳合法迁移”，等于放宽了状态机而不是报错。
+		// 现在先过质量门：过不了就显式拒绝，让调用方先跑 Consolidate。
+		if cur.Status == StatusCandidate {
+			if n := len([]rune(m.Content)); n < sm.txc.Cfg().MinContentLength {
+				return Diff{}, fmt.Errorf(
+					"ops: 拒绝 %s: %s → %s：Candidate 未通过质量门（内容 %d < %d），须先 Consolidate（TD §7）",
+					m.ID, cur.Status, to, n, sm.txc.Cfg().MinContentLength)
+			}
+		}
 		mid, mErr := sm.move(m, via, note+"（先进入 "+string(via)+"）")
 		if mErr != nil {
 			return Diff{}, mErr
@@ -223,15 +236,38 @@ func (sm stateManager) move(m store.Memory, to MemoryStatus, note string) (Diff,
 		if !mid.Changed && via != to {
 			return Diff{}, fmt.Errorf("ops: 无法从 %s 推进到 %s", cur.Status, to)
 		}
+		// F-10a：中间迁移是**真实落库**（PutState），必须交出可审计的 diff。
+		// 否则 Candidate → Active → Invalidated 两次写入只留 1 行审计，
+		// before_json 里看不到曾经有过 Active 这一步，因果链断环。
+		trail := mid.Trail
+		if mid.Changed {
+			trail = append(trail, Diff{
+				Changed: true, Before: mid.Before, After: mid.After,
+				Summary: mid.Summary, Subjects: mid.Subjects,
+			})
+		}
 		cur, _ = sm.load(m)
 		before = snapshotOf(cur, true)
 		if cur.Status == to {
+			mid.Trail = trail
 			return mid, nil
 		}
 		if err := ValidateTransition(cur.Status, to); err != nil {
 			return Diff{}, err
 		}
+		res, err := sm.applyTransition(m, cur, to)
+		if err != nil {
+			return Diff{}, err
+		}
+		res.Trail = append(trail, res.Trail...)
+		return res, nil
 	}
+	return sm.applyTransition(m, cur, to)
+}
+
+// applyTransition 写一步状态变更（不含中间跳逻辑）。
+func (sm stateManager) applyTransition(m store.Memory, cur State, to MemoryStatus) (Diff, error) {
+	before := snapshotOf(cur, true)
 	next := sm.recalc(m, cur)
 	next.Status = to
 	next.StatusChangedAt = sm.txc.Now().UnixMilli()
@@ -273,7 +309,13 @@ func (sm stateManager) ensure(m store.Memory) error {
 	if existed {
 		return nil
 	}
-	return sm.txc.Backend().EnsureState(sm.txc.Context(), cur)
+	// F-11：落库前必须走 recalc（与 move/Decay 同一口径）。
+	//
+	// 旧实现直接持久化 load() 的返回值，而 load() 的 recency 曾把秒当毫秒（已修），
+	// 结果是每条 Extract 写入都往 memory_state 落一行 importance≈0.025 的错误状态，
+	// 而 Consolidate 的 nextStatus 读的正是 st.Importance——刚写入的记忆会被判成 Stale。
+	// recalc 重算四个分项，使“首次落库”与“后续重算”不可能出现两个口径。
+	return sm.txc.Backend().EnsureState(sm.txc.Context(), sm.recalc(m, cur))
 }
 
 // importanceOf 返回当前 importance（不存在时按默认推导）。

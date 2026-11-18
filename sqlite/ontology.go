@@ -19,13 +19,14 @@ var _ store.OntologyReader = (*storeImpl)(nil)
 func scanConcept(sc interface{ Scan(...any) error }) (store.Concept, error) {
 	var c store.Concept
 	var parentID sql.NullString
-	var status, origin string
-	if err := sc.Scan(&c.ID, &c.Name, &parentID, &status, &c.Definition, &origin); err != nil {
+	var status, origin, scope string
+	if err := sc.Scan(&c.ID, &c.Name, &parentID, &status, &c.Definition, &origin, &c.CreatedAt, &scope); err != nil {
 		return store.Concept{}, err
 	}
 	c.ParentID = fromNullableText(parentID)
 	c.Status = store.ConceptStatus(status)
 	c.Origin = store.ConceptOrigin(origin)
+	c.Scope = store.Scope(scope)
 	return c, nil
 }
 
@@ -48,15 +49,10 @@ func (s *storeImpl) ListConcepts(ctx context.Context) ([]store.Concept, error) {
 
 	out := make([]store.Concept, 0, 16)
 	for rows.Next() {
-		var c store.Concept
-		var parentID sql.NullString
-		var status, origin string
-		if err := rows.Scan(&c.ID, &c.Name, &parentID, &status, &c.Definition, &origin); err != nil {
+		c, err := scanConcept(rows)
+		if err != nil {
 			return nil, fmt.Errorf("sqlite: list concepts scan: %w", err)
 		}
-		c.ParentID = fromNullableText(parentID)
-		c.Status = store.ConceptStatus(status)
-		c.Origin = store.ConceptOrigin(origin)
 		out = append(out, c)
 	}
 	if err := rows.Err(); err != nil {

@@ -121,20 +121,20 @@ type State struct {
 // 它足以回答"谁在何时因何触发了什么变更"：Actor/Trigger/Reason 是前两问，
 // At 是何时，BeforeJSON/AfterJSON + Subject/StepKind 是最后两问。
 type AuditEntry struct {
-	Seq       int64
-	OpID      string // = 运行的幂等 key（同一次运行的全部步骤共用）
-	Op        OpName
-	Scope     store.Scope
-	Trigger   TriggerKind
-	Actor     string
-	Reason    string
-	StepID    string
-	StepKind  string
-	Subject   string
+	Seq        int64
+	OpID       string // = 运行的幂等 key（同一次运行的全部步骤共用）
+	Op         OpName
+	Scope      store.Scope
+	Trigger    TriggerKind
+	Actor      string
+	Reason     string
+	StepID     string
+	StepKind   string
+	Subject    string
 	BeforeJSON string
 	AfterJSON  string
-	Changed   bool
-	At        int64
+	Changed    bool
+	At         int64
 }
 
 // AuditQuery 是审计检索条件。
@@ -223,12 +223,15 @@ type Backend interface {
 	TouchConceptUsage(ctx context.Context, conceptID string, at int64) error
 	GetConceptStat(ctx context.Context, conceptID string) (ConceptStat, bool, error)
 	CountConceptRefs(ctx context.Context, conceptID string) (int, error)
-	// ListStaleDrafts 返回"最后使用早于 cutoff"的 draft 概念。
+	// ListStaleDrafts 返回 scope 内“活得太久”且无引用的 draft 概念。
 	//
-	// 没有使用记录的草稿按 **last_used_at=0（未知即视为很久以前）** 登记：
-	// 真正保护"仍在用的草稿"的是 CountConceptRefs（有引用就绝不删除），
-	// 而不是一个凭空猜出来的时间戳。
-	ListStaleDrafts(ctx context.Context, cutoff int64, limit int) ([]store.Concept, error)
+	// 时间基准是 **MAX(last_used_at, created_at)**（F-1）：只看 last_used_at 时，
+	// 从未登记使用统计的结构化写入稿子（last_used_at 缺失）会被当成“很久以前”，
+	// 刚建出来就进删除计划——那是数据丢失级的。
+	//
+	// scope 是必填的隔离边界（F-4）：无归属（scope=''）的历史稿子也会被返回，
+	// 因为没有任何 scope 能“拥有”它们；调用方必须把这一点上报，不得静默。
+	ListStaleDrafts(ctx context.Context, scope store.Scope, cutoff int64, limit int) ([]store.Concept, error)
 	// DeleteConcept 物理删除概念；调用方必须先用 CountConceptRefs 保证无引用。
 	DeleteConcept(ctx context.Context, conceptID string) error
 

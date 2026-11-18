@@ -188,6 +188,21 @@ type Concept struct {
 	// 为什么要单独一列而不是靠 status=draft 推断：certified 的概念也可能是
 	// 隐式长出来后被人认证的，那时仍需保留"它最初是隐式的"这条审计线索。
 	Origin ConceptOrigin
+	// CreatedAt 是概念被创建的时刻（unix 毫秒，v8 追加）。
+	//
+	// # 为什么必须单独记它（F-1）
+	//
+	// DraftTTL 判的是"这个草稿活了多久"。历史实现只有 concept_usage.last_used_at，
+	// 而结构化写入根本不会登记 usage，于是"缺失统计行"被当成 last_used_at=0，
+	// 与 cutoff=now-TTL 相比恒真——刚创建的稿子第一次 Prune 就被删（D15 的反面）。
+	// 有了创建时刻，判定才能是 MAX(last_used_at, created_at) <= cutoff。
+	CreatedAt int64
+	// Scope 是该概念从属的隔离边界（v8 追加；空 = 历史遗留/无归属）。
+	//
+	// 为什么要它（F-4）：concepts 历史上没有 scope 列，Prune 的 draft 分支因此
+	// **跨 scope 删除**（agent scope 的清理会删掉 user scope 的草稿）。
+	// 归属在创建时钉死（隐式创建取那条记忆的 scope），Prune 才能按边界过滤。
+	Scope Scope
 }
 
 // ConceptOrigin 是概念的来源标记。
@@ -372,6 +387,10 @@ func (c Concept) Validate() error {
 	}
 	if !c.Status.Valid() {
 		return fmt.Errorf("concept: invalid status %q", c.Status)
+	}
+	// Scope 允许为空（历史遗留概念），但非空时必须是合法边界。
+	if c.Scope != "" && !c.Scope.Valid() {
+		return fmt.Errorf("concept: invalid scope %q", c.Scope)
 	}
 	return nil
 }

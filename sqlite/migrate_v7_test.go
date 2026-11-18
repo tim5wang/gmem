@@ -77,8 +77,14 @@ func TestMigrateV7AppendsAfterV6WithoutRewriting(t *testing.T) {
 	if len(v7.Statements) == 0 {
 		t.Error("v7 没有任何 DDL 语句")
 	}
-	if last := ms[len(ms)-1].Version; last != 7 {
-		t.Errorf("最新迁移版本=%d, want 7（新变更必须追加在末尾）", last)
+	if last := ms[len(ms)-1].Version; last < 7 {
+		t.Errorf("最新迁移版本=%d, want >= 7（新变更必须追加在末尾，不得就地改历史版本）", last)
+	}
+	// 版本号必须严格递增：追加型迁移的唯一合法形状。
+	for i := 1; i < len(ms); i++ {
+		if ms[i].Version <= ms[i-1].Version {
+			t.Errorf("迁移版本未严格递增：v%d 出现在 v%d 之后", ms[i].Version, ms[i-1].Version)
+		}
 	}
 
 	// 每条 DDL 都必须 IF NOT EXISTS：schema_migrations 丢失后整个清单会被重跑。

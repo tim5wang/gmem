@@ -219,9 +219,9 @@ func (in Input) IncludeDraftsDefault() bool {
 // 因此不同 op 的 key 不可能碰撞成同一个。
 func IdempotencyKey(scope store.Scope, op OpName, in Input) (string, error) {
 	payload := struct {
-		Scope string  `json:"scope"`
-		Op    string  `json:"op"`
-		Input Input   `json:"input"`
+		Scope string `json:"scope"`
+		Op    string `json:"op"`
+		Input Input  `json:"input"`
 	}{Scope: scope.String(), Op: string(op), Input: in}
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -267,6 +267,15 @@ type Diff struct {
 	Degraded []string
 	// Warnings 是护栏命中（例如"概念仍被引用，跳过删除"）。
 	Warnings []string
+	// Trail 是本步骤内部**额外落库**的中间状态迁移（F-10a）。
+	//
+	// # 为什么需要它
+	//
+	// 有些步骤会跑两次 PutState（例如 Candidate → Active → Invalidated）。
+	// audit_log 是按 Step 追加的，于是一次步骤只留一行，中间那一步在审计里彻底消失——
+	// "这条记录怎么从 candidate 走到 invalidated 的"就无法重建。
+	// Trail 让 op 把中间迁移交给 Runner，由 Runner 逐条写成 StepKind=<kind>_via 的审计行。
+	Trail []Diff
 }
 
 // ---------------------------------------------------------------------------
@@ -366,8 +375,17 @@ type TxContext interface {
 	Now() time.Time
 	// Check 返回 ctx 的取消原因（op 的循环里必须定期调用）。
 	Check() error
-	// Spend 记一次 IO/步骤消耗并检查预算；超预算返回错误（进程内可见的停手点）。
+	// Spend 记一次 IO 消耗并检查预算；超预算返回 ErrBudgetExceeded（正常停手点）。
 	Spend(io int) error
+	// SpendTokens 记一次 token 消耗并检查预算；语义同 Spend。
+	//
+	// 为什么单独一个方法：Tokens 与 IO 是两个独立维度（抽取按 token 估、扫描按条数估），
+	// 合成一个“消耗量”会让两者互相污染，预算也就不可解释了。
+	SpendTokens(n int) error
+	// Note 记录一条“本次运行里的显式降级/停手原因”，由 Runner 汇总进 Degraded。
+	//
+	// 预算触顶时必须能说出来：“预算耗尽，只计划了 N 步”不得是静默截断（F-6）。
+	Note(msg string)
 }
 
 // ---------------------------------------------------------------------------

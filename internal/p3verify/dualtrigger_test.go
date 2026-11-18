@@ -29,10 +29,10 @@ import (
 
 // auditShape 是审计行的"形状"（去掉时间与触发源这类**应当**不同的字段）。
 type auditShape struct {
-	Op       string
-	StepKind string
-	Subject  string
-	Changed  bool
+	Op        string
+	StepKind  string
+	Subject   string
+	Changed   bool
 	HasBefore bool
 	HasAfter  bool
 }

@@ -23,10 +23,15 @@ func TestAllOpsShareOneInterface(t *testing.T) {
 		ops.OpExtract: true, ops.OpDisambiguate: true, ops.OpMerge: true,
 		ops.OpLinkUpdate: true, ops.OpInvalidate: true, ops.OpConsolidate: true,
 		ops.OpDecay: true, ops.OpPrune: true,
+		// Promote 也必须是同一个 Runner 里的 op（D15 的两条清理路径之一）。
+		ops.OpPromote: true,
 	}
 	got := e.runner.Ops()
-	if len(got) < len(want) {
-		t.Fatalf("注册的 op 数=%d, want >= %d（%v）", len(got), len(want), got)
+	// 【T-3 修复】原来是 `len(got) < len(want)`：多注册一个 op 也能通过。
+	// 注册表是 §8 的契约，多一个少一个都是漂移，必须相等。
+	if len(got) != len(want) {
+		t.Fatalf("注册的 op 数=%d, want %d（%v）：§8 的 op 表多一个少一个都是漂移",
+			len(got), len(want), got)
 	}
 	have := map[ops.OpName]bool{}
 	for _, n := range got {
@@ -34,20 +39,42 @@ func TestAllOpsShareOneInterface(t *testing.T) {
 	}
 	for n := range want {
 		if !have[n] {
-			t.Errorf("缺少 op %q（§8 的 8 个原子操作必须齐全）", n)
+			t.Errorf("缺少 op %q（§8 的 8 个原子操作 + Promote 必须齐全）", n)
+		}
+	}
+	for _, n := range got {
+		if !want[n] {
+			t.Errorf("多出未在契约里的 op %q（新增 op 必须同时更新 §8 契约与守卫）", n)
 		}
 	}
 
 	// 每个 op 都必须能 Name/Budget/Plan/Apply，否则它不可能被同一套编排调用。
+	//
+	// 【T-4 修复】原实现把“错误里包含‘需要输入’就算通过”——op 全部坏掉
+	// （Plan 永远报“需要输入 X”）也能全绿。现在只允许**声明的**下列 op
+	// 在缺输入时报错，其余任何错误都是缺陷。
+	//
+	// requiresInput 是“必须显式给输入才能跑”的 op 白名单（与各自 Plan 的校验对应）。
+	requiresInput := map[ops.OpName]bool{
+		ops.OpMerge:      true, // 需要 Merge{FromNode,ToNode}
+		ops.OpLinkUpdate: true, // 需要 Link{FromNode,ToNode,Relation}
+		ops.OpInvalidate: true, // 需要 Invalidate{MemoryID}
+	}
 	for _, name := range got {
 		res, err := e.runner.Run(context.Background(), ops.Request{
 			Op: name, Scope: store.ScopeUser,
 			Trigger: ops.Trigger{Kind: ops.TriggerAgent, Actor: "test"},
 		})
 		if err != nil {
-			var missingInput = strings.Contains(err.Error(), "需要输入")
-			if !missingInput {
-				t.Errorf("op %q 无法被统一编排调用: %v", name, err)
+			if !requiresInput[name] {
+				t.Errorf("op %q 在无输入时不应报错（实际: %v）", name, err)
+				continue
+			}
+			// 白名单 op 也必须报**具体**的缺输入错误，而不是任意错误。
+			if !strings.Contains(err.Error(), "需要输入") &&
+				!strings.Contains(err.Error(), "必填") &&
+				!strings.Contains(err.Error(), "都必填") {
+				t.Errorf("op %q 的错误应是“缺输入”，实际: %v", name, err)
 			}
 			continue
 		}

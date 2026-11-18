@@ -2,6 +2,9 @@ package ops_test
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,23 +27,29 @@ import (
 // ===========================================================================
 
 // TestOpsNeverWritesMemoriesDirectly 扫描 ops 包的生产源码（不含 _test.go）。
+//
+// # 为什么用 AST 而不是字面量匹配（T-7）
+//
+// 旧实现只查字面量 `"PutMemory("`：`tx.PutMemory (`（空格）、`st["Put"+"Memory"]`
+// 或把接收者换成别的变量名都能绕过。这类守卫一旦能被绕过，就只是“看起来有守卫”。
+// 现在用 go/ast 判断**调用的方法名**与**构造的字符串常量**，与接收者写法无关。
 func TestOpsNeverWritesMemoriesDirectly(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatalf("glob: %v", err)
 	}
-	// 这些是"写 memories **内容**"的 API。任何一处出现在 ops 生产代码里都是缺陷。
+	// 这些是"写 memories **内容**"的方法名。任何一处调用都是缺陷。
 	//
-	// 为什么 InvalidateMemory / TouchRecall 不在此列（这是刻意的，不是漏掉）：
+	// 为什么 InvalidateMemory / TouchRecall 不在此列（刻意的，不是漏掉）：
 	//   - InvalidateMemory 只置 t_invalid（**世界时间**），不改 content/kind/concept_id，
-	//     因此按 D13 不产生新版本、FTS 也无需重同步——Port 契约就是这么定义的；
+	//     因此按 D13 不产生新版本、FTS 也无需重同步；
 	//   - TouchRecall 只改运营计数 recall_count，D13 明确它不得催生版本。
-	// 两者都不经过 FTS，因此不构成"绕过写入编排"。真正危险的只有内容写入 PutMemory：
-	// 它写主表却不会顺手写 FTS，漏了也不报错。
-	forbidden := []string{
-		"PutMemory(",
+	// 真正危险的只有内容写入 PutMemory：它写主表却不写 FTS，漏了也不报错。
+	forbiddenMethods := map[string]bool{
+		"PutMemory": true, "PutMemories": true, "InsertMemory": true, "UpsertMemory": true,
 	}
-	var scanned int
+	// 自定义错误：^检查器自己找不到东西时必须失败（避免“扫描空转但永远绿”）。
+	var scanned, calls int
 	for _, f := range files {
 		if strings.HasSuffix(f, "_test.go") {
 			continue
@@ -50,21 +59,36 @@ func TestOpsNeverWritesMemoriesDirectly(t *testing.T) {
 			t.Fatalf("read %s: %v", f, err)
 		}
 		scanned++
-		body := string(src)
-		for _, bad := range forbidden {
-			if strings.Contains(body, bad) {
-				t.Errorf("%s 里出现了 %q：ops 不得自行写 memories（必须经 recall.Writer，"+
-					"否则 FTS 会静默漏索引）", f, bad)
+		file, err := parser.ParseFile(token.NewFileSet(), f, src, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", f, err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.CallExpr:
+				calls++
+				if sel, ok := node.Fun.(*ast.SelectorExpr); ok && forbiddenMethods[sel.Sel.Name] {
+					t.Errorf("%s: 调用了 %s：ops 不得自行写 memories（必须经 recall.Writer，"+
+						"否则 FTS 会静默漏索引）", f, sel.Sel.Name)
+				}
+			case *ast.SelectorExpr:
+				// 捕获 `x.PutMemory` 这类**引用**（不仅调用），以及 recall.NewWriter。
+				if forbiddenMethods[node.Sel.Name] {
+					t.Errorf("%s: 引用了 %s：ops 不得自行写 memories（必须经 recall.Writer）", f, node.Sel.Name)
+				}
+				if id, ok := node.X.(*ast.Ident); ok && id.Name == "recall" && node.Sel.Name == "NewWriter" {
+					t.Errorf("%s: 引用了 recall.NewWriter：写入编排应由 Extractor/调用方注入，"+
+						"ops 不应自己造一个写入入口", f)
+				}
 			}
-		}
-		// 唯一允许的写入者：P2 的 Extractor（内部必经 recall.Writer）。
-		if strings.Contains(body, "recall.NewWriter") {
-			t.Errorf("%s 里出现了 recall.NewWriter：写入编排应由 Extractor/调用方注入，"+
-				"ops 不应自己造一个写入入口", f)
-		}
+			return true
+		})
 	}
 	if scanned == 0 {
 		t.Fatal("没有扫描到任何 ops 生产源码（守卫失效）")
+	}
+	if calls == 0 {
+		t.Fatal("AST 扫描没有看到任何 CallExpr（解析器空转，守卫已失效）")
 	}
 }
 
@@ -166,5 +190,61 @@ func TestExtractVerifiesLexicalIndex(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("降级信息未点明词法索引：%v", res.Degraded)
+	}
+}
+
+// TestSingleOpInstanceAndSingleEntryPoint 是 D3 的**结构性**实证（T-5）。
+//
+// # 为什么行为断言不够
+//
+// TestAutoAndAgentShareSameCodePath 与 TestFourTriggerSourcesProduceSameBehavior 都是
+// “两条路径都调 e.runner.Run，只换 Trigger.Kind”。真出现两套实现时（例如给 Agent
+// 另建一个 runner、或某个触发器直接调 op.Apply），这些用例仍是同一份 Run，照样绿。
+//
+// 因此这里从**源码结构**上钉死两件事：
+//  1. `op.Plan(...)` / `op.Apply(...)` 只允许出现在 runner.go（唯一编排点）；
+//  2. 触发器与维护面只能调 `runner.Run`，不得自己调 Plan/Apply。
+func TestSingleOpInstanceAndSingleEntryPoint(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	// 允许直接调 Plan/Apply 的文件（唯一编排点 + 它自己的契约文档）。
+	allowed := map[string]bool{"runner.go": true}
+	// 这两个标识符在测试里用来校验“只能出现在 runner.go”。
+	var violations int
+	var runCalls int
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), f, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", f, err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if sel.Sel.Name == "Run" {
+				runCalls++
+			}
+			if sel.Sel.Name == "Plan" || sel.Sel.Name == "Apply" {
+				if !allowed[f] {
+					violations++
+					t.Errorf("%s: 直接调用了 %s——op 只能经 Runner 编排（D3：两条触发路径不得分叉）",
+						f, sel.Sel.Name)
+				}
+			}
+			return true
+		})
+	}
+	if violations != 0 {
+		t.Fatalf("发现 %d 处绕过 Runner 的 Plan/Apply 调用", violations)
+	}
+	// 反向守卫：触发器/维护面必须**真的**调了 Run（否则“只调 Run”可能只是因为它们什么都不做）。
+	if runCalls == 0 {
+		t.Fatal("ops 生产代码里没有任何 .Run( 调用（触发器入口已失效）")
 	}
 }

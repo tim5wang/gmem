@@ -359,7 +359,7 @@ func TestWriterPassesRealVersionToFTS(t *testing.T) {
 
 // TestWriterNeverIndexesVersionZero 是 D13 的守门断言：
 // 任何走 Writer 的写入都不得在 FTS 里留下 version=0 的行
-//（0 在 DocumentKey 里被解释为 1，但在 FTS 行里是"版本未知"，会让 as_of 对不上）。
+// （0 在 DocumentKey 里被解释为 1，但在 FTS 行里是"版本未知"，会让 as_of 对不上）。
 func TestWriterNeverIndexesVersionZero(t *testing.T) {
 	d, raw := openFile(t)
 	ctx := context.Background()

@@ -130,8 +130,8 @@ func TestD15HundredDraftsStayBounded(t *testing.T) {
 	ctx := context.Background()
 
 	const (
-		total    = 100
-		promoted = 15 // 显式认证
+		total      = 100
+		promoted   = 15 // 显式认证
 		referenced = 15 // 仍是 draft，但被活跃记忆引用 → 不可删
 		// 其余 70 个：记忆被物理删除后的孤儿 draft → 可清理
 	)

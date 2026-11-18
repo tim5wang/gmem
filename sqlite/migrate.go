@@ -273,7 +273,81 @@ func migrations() []migration {
 				)`,
 			},
 		},
+		{
+			// P3 修复（F-1 / F-4）：concepts 补 created_at 与 scope。
+			//
+			// # 为什么必须是新迁移
+			//
+			// v1 的 concepts DDL 已发布、逐字节不得改（publishedMigrations 的指纹钉死了它）。
+			// 而这次新增的两列是 **Prune 判定的正确性前提**：
+			//
+			//	created_at  DraftTTL 判的是「活多久」。旧实现只有 concept_usage.last_used_at，
+			//	            结构化写入根本不登记 usage → 缺失被当成 0 → 与 cutoff 相比恒真，
+			//	            刚建的草稿首次 Prune 就被删（数据丢失级）。
+			//	scope       Prune 的 draft 分支历史上没有 scope 隔离，agent scope 的清理会
+			//	            删掉 user scope 的草稿（跨边界删除）。
+			//
+			// 用 Apply 型（ALTER TABLE ADD COLUMN）而不是重建：concepts 被 memories/nodes 的
+			// concept_id 软引用，重建表的收益为零、风险不为零。列存在性判断保证重跑幂等。
+			Version: 8,
+			Name:    "p3_concept_created_at_scope",
+			Apply:   applyConceptCreatedAtScope,
+		},
 	}
+}
+
+// applyConceptCreatedAtScope 给 concepts 补 created_at / scope 两列并回填。
+//
+// 幂等性：schema_migrations 丢失后整个清单会被重跑，因此每一步都先判列是否存在；
+// 回填只动「还是默认值」的行，不会把已归属的概念搬来搬去。
+//
+// 回填口径（刻意保守）：
+//   - created_at = 迁移时刻（不是 0）。0 会被 TTL 判为「很久以前」，迁移边界上
+//     存在未登记的旧草稿会被立刻清掉——那正是 F-1 要防的数据丢失；给它一个完整
+//     TTL 宽限期，代价只是清理晚一个窗口。
+//   - scope 取引用该概念的最近一条记忆的 scope；真正无人引用的旧概念保持 ”（无归属），
+//     只由 global scope 的 Prune 处理（见 ops/prune_op.go 的隔离说明）。
+func applyConceptCreatedAtScope(ctx context.Context, q querier) error {
+	hasCreatedAt, err := tableHasColumn(ctx, q, "concepts", "created_at")
+	if err != nil {
+		return err
+	}
+	if !hasCreatedAt {
+		if _, err := q.ExecContext(ctx,
+			`ALTER TABLE concepts ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("sqlite: migration 8 (concepts.created_at): %w", err)
+		}
+		if _, err := q.ExecContext(ctx,
+			`UPDATE concepts SET created_at = ? WHERE created_at = 0`,
+			time.Now().UnixMilli()); err != nil {
+			return fmt.Errorf("sqlite: migration 8 (backfill created_at): %w", err)
+		}
+	}
+
+	hasScope, err := tableHasColumn(ctx, q, "concepts", "scope")
+	if err != nil {
+		return err
+	}
+	if !hasScope {
+		if _, err := q.ExecContext(ctx,
+			`ALTER TABLE concepts ADD COLUMN scope TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("sqlite: migration 8 (concepts.scope): %w", err)
+		}
+		// 无归属概念从引用它的记忆继承边界（同一概念被多 scope 引用时取最近写入者）。
+		if _, err := q.ExecContext(ctx, `
+			UPDATE concepts SET scope = COALESCE((
+				SELECT m.scope FROM memories m
+				WHERE m.concept_id = concepts.id
+				ORDER BY m.t_created DESC LIMIT 1
+			), '') WHERE scope = ''`); err != nil {
+			return fmt.Errorf("sqlite: migration 8 (backfill scope): %w", err)
+		}
+	}
+	if _, err := q.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_concepts_scope_status ON concepts(scope, status)`); err != nil {
+		return fmt.Errorf("sqlite: migration 8 (index): %w", err)
+	}
+	return nil
 }
 
 // ftsDDLWithVersion 生成带 version 列的 FTS5 虚表 DDL。

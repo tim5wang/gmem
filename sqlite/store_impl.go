@@ -181,7 +181,7 @@ func (s *storeImpl) PutMemory(ctx context.Context, m store.Memory) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureConcept(ctx, q, m.ConceptID); err != nil {
+	if err := ensureConcept(ctx, q, m.ConceptID, m.Scope, m.TCreated*1000); err != nil {
 		return err
 	}
 
@@ -420,7 +420,7 @@ func (s *storeImpl) TouchRecall(ctx context.Context, id string) error {
 // concepts
 // ---------------------------------------------------------------------------
 
-const conceptCols = `id, name, parent_id, status, definition, origin`
+const conceptCols = `id, name, parent_id, status, definition, origin, created_at, scope`
 
 // ensureConcept 落实 D15：concept_id 指向的概念若不存在，就**隐式落成 draft**。
 //
@@ -430,7 +430,10 @@ const conceptCols = `id, name, parent_id, status, definition, origin`
 //
 // draft 干干永不参与硬契约（召回侧按 StatusFactor 打折），因此隐式创建不会让噪声
 // 概念污染召回；代价是草稿表会增长，P3 的 Promote/Prune 负责清理。
-func ensureConcept(ctx context.Context, q querier, conceptID string) error {
+//
+// scope / createdAt 是 Prune 判定的两个前提（F-1 / F-4）：没有创建时刻就没有 TTL 的
+// 基准（缺失被当成 0 → 恒过期），没有 scope 就会跨边界删草稿。两者都在隐式创建时钉死。
+func ensureConcept(ctx context.Context, q querier, conceptID string, scope store.Scope, createdAt int64) error {
 	if conceptID == "" {
 		return nil
 	}
@@ -444,9 +447,10 @@ func ensureConcept(ctx context.Context, q querier, conceptID string) error {
 	}
 	// 名称取 id（确定性、可追溯）；正文片段取首个可命名片段属于 P2 的抽取质量，不在此处猜。
 	if _, err := q.ExecContext(ctx,
-		`INSERT OR IGNORE INTO concepts (id, name, parent_id, status, definition, origin)
-		 VALUES (?, ?, NULL, ?, '', ?)`,
+		`INSERT OR IGNORE INTO concepts (id, name, parent_id, status, definition, origin, created_at, scope)
+		 VALUES (?, ?, NULL, ?, '', ?, ?, ?)`,
 		conceptID, conceptID, string(store.ConceptDraft), string(store.ConceptOriginImplicit),
+		createdAt, string(scope),
 	); err != nil {
 		return fmt.Errorf("sqlite: implicit concept %q: %w", conceptID, err)
 	}
@@ -462,12 +466,17 @@ func (s *storeImpl) PutConcept(ctx context.Context, c store.Concept) error {
 		return err
 	}
 	_, err = q.ExecContext(ctx, `
-		INSERT INTO concepts (`+conceptCols+`) VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO concepts (`+conceptCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, parent_id=excluded.parent_id,
 			status=excluded.status, definition=excluded.definition,
-			origin=excluded.origin`,
-		c.ID, c.Name, nullableText(c.ParentID), string(c.Status), c.Definition, string(c.Origin))
+			origin=excluded.origin,
+			-- created_at 只补空值：重建不会被一次 PutConcept 改写为“创建于现在”。
+			created_at=CASE WHEN concepts.created_at = 0 THEN excluded.created_at ELSE concepts.created_at END,
+			-- scope 同理：已归属的概念不会被重写改边界（边界一旦乱就可以跨 scope 误删）。
+			scope=CASE WHEN concepts.scope = '' THEN excluded.scope ELSE concepts.scope END`,
+		c.ID, c.Name, nullableText(c.ParentID), string(c.Status), c.Definition, string(c.Origin),
+		c.CreatedAt, string(c.Scope))
 	if err != nil {
 		return fmt.Errorf("sqlite: put concept %q: %w", c.ID, err)
 	}
@@ -479,20 +488,13 @@ func (s *storeImpl) GetConcept(ctx context.Context, id string) (store.Concept, e
 	if err != nil {
 		return store.Concept{}, err
 	}
-	var c store.Concept
-	var parentID sql.NullString
-	var status, origin string
-	err = q.QueryRowContext(ctx, `SELECT `+conceptCols+` FROM concepts WHERE id = ?`, id).
-		Scan(&c.ID, &c.Name, &parentID, &status, &c.Definition, &origin)
+	c, err := scanConcept(q.QueryRowContext(ctx, `SELECT `+conceptCols+` FROM concepts WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return store.Concept{}, store.ErrNotFound
 	}
 	if err != nil {
 		return store.Concept{}, fmt.Errorf("sqlite: get concept %q: %w", id, err)
 	}
-	c.ParentID = fromNullableText(parentID)
-	c.Status = store.ConceptStatus(status)
-	c.Origin = store.ConceptOrigin(origin)
 	return c, nil
 }
 

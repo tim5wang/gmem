@@ -3,6 +3,7 @@ package ops_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,8 +27,8 @@ func TestD15DraftCleanupKeepsOntologyBounded(t *testing.T) {
 
 	const (
 		total      = 100
-		promoted   = 10              // 显式认证（仍被记忆引用）
-		stillDraft = 10              // 被引用但仍是 draft：必须拒绝删除
+		promoted   = 10                            // 显式认证（仍被记忆引用）
+		stillDraft = 10                            // 被引用但仍是 draft：必须拒绝删除
 		pruned     = total - promoted - stillDraft // 无人引用：可清理
 	)
 	if pruned != 80 {
@@ -70,12 +71,10 @@ func TestD15DraftCleanupKeepsOntologyBounded(t *testing.T) {
 
 	// 让后 80 个 draft 变成孤儿：它们的记忆走完整生命周期被物理清掉。
 	// （这不是为了"造数据"，而是唯一允许的删除路径——Prune 只作用于 Archived。）
-	for i := promoted + stillDraft; i < total; i++ {
-		m := memory(fmt.Sprintf("m-%03d", i), store.ScopeUser, "")
-		m.TValid, m.TCreated = e.clk.Now().Unix(), e.clk.Now().Unix()
-		// 记忆本身无需重建：上面已经写过；这里只把它们推进状态机并物理删除。
-		_ = m
-	}
+	//
+	// 【T-1 修复】原处有一个空转的 for 循环（`m := memory(...)` 后 `_ = m`），
+	// 它什么都不做却让读者以为"这里把状态机推进了"。真正推进状态机的是下面的
+	// Invalidate + Consolidate + Prune 链路，因此这里直接删除死代码。
 	// 用真实 op 推进：Consolidate（Active）→ Invalidate → 时钟推进 → Consolidate（Archived）→ Prune。
 	// 为了不让用例跑 80 次状态机往返，这里只对 80 条记忆的**状态行**直接用 op 的 Invalidate
 	// 循环一次；op 的语义与上面用例一致（已单独覆盖），这里验证的是"记忆消失后 draft 可清理"。
@@ -121,17 +120,21 @@ func TestD15DraftCleanupKeepsOntologyBounded(t *testing.T) {
 	if got := e.countRows(`SELECT COUNT(1) FROM concepts`); got != promoted+stillDraft {
 		t.Errorf("概念总数=%d, want %d", got, promoted+stillDraft)
 	}
-	// 被引用的 draft 必须留下来，并且删不掉的原因可见（Warnings）。
+	// 被引用的 draft 必须留下来，并且删不掉的原因必须**具体可读**。
+	//
+	// 【T-2 修复】原断言只检查 `len(w) > 0`：任何无关 warning 都能让它变绿，
+	// 甚至"删掉了但顺手报个别的不相干警告"也能通过。现在要求 warning 点名
+	// 那个被引用的 draft ID，且说明原因是"引用"——变异成"删了"就必红。
 	var sawRefWarning bool
 	for _, s := range dres.Steps {
 		for _, w := range s.Diff.Warnings {
-			if len(w) > 0 {
+			if strings.Contains(w, "引用") && strings.Contains(w, "c-010") {
 				sawRefWarning = true
 			}
 		}
 	}
 	if !sawRefWarning {
-		t.Error("被引用的 draft 被跳过时应上报 Warnings（不得静默）")
+		t.Error("被引用的 draft 被跳过时必须上报**点名该 draft**且说明原因（引用）的 Warnings（不得静默）")
 	}
 
 	// 由于有 80 个 draft 被清理，下一次 Prune 不应再有任何 draft 可删（收敛）。
