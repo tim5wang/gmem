@@ -15,6 +15,20 @@ import (
 // 但"看得见未提交写入"对写入后的即时召回是必要的）。
 var _ store.OntologyReader = (*storeImpl)(nil)
 
+// scanConcept 把一行 concepts 扫进领域结构（concepts 的列顺序见 conceptCols）。
+func scanConcept(sc interface{ Scan(...any) error }) (store.Concept, error) {
+	var c store.Concept
+	var parentID sql.NullString
+	var status, origin string
+	if err := sc.Scan(&c.ID, &c.Name, &parentID, &status, &c.Definition, &origin); err != nil {
+		return store.Concept{}, err
+	}
+	c.ParentID = fromNullableText(parentID)
+	c.Status = store.ConceptStatus(status)
+	c.Origin = store.ConceptOrigin(origin)
+	return c, nil
+}
+
 // ListConcepts 返回全部概念。
 //
 // 不做状态过滤：R2 要求"只有 certified 参与硬契约"，但 draft 与 deprecated

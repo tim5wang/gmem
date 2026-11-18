@@ -178,6 +178,101 @@ func migrations() []migration {
 			Name:    "p1_concept_id_soft_ref",
 			Apply:   applyConceptIDSoftRef,
 		},
+		{
+			// P3（TD §7 §8）：生命周期状态 + op 台账 + 审计 + 重定向 + 概念使用统计。
+			//
+			// 为什么把这些放在独立表而不是往 memories 加列：
+			//   - 运营态（status / 四个 importance 分项）**不是内容**，按 D13 不得催生版本；
+			//   - audit_log 与 op_runs 是 Append-only 的审计事实，属于 §8 的独立产物；
+			//   - memories 是 P0 已发布的表，加列会让 v1~v6 的既有行为与迁移指纹面临风险。
+			//
+			// 纯 DDL、全部 IF NOT EXISTS：schema_migrations 丢失后重跑不会炸库。
+			Version: 7,
+			Name:    "p3_lifecycle_ops_audit",
+			Statements: []string{
+				// memory_state：生命周期状态 + importance 四个分项各一列（TD §7 纪律 2）。
+				// 存分项而不是只存总分：系数可以靠 REPLAY 重算，不必回扫全库（§6 同款理由）。
+				`CREATE TABLE IF NOT EXISTS memory_state (
+					memory_id               TEXT PRIMARY KEY,
+					scope                   TEXT NOT NULL CHECK (scope IN ('user','agent','project','global')),
+					status                  TEXT NOT NULL CHECK (status IN ('candidate','rejected','active','invalidated','stale','archived')),
+					importance_base         REAL NOT NULL DEFAULT 0,
+					importance_recency      REAL NOT NULL DEFAULT 1,
+					importance_access_boost REAL NOT NULL DEFAULT 1,
+					importance_grade        REAL NOT NULL DEFAULT 1,
+					importance              REAL NOT NULL DEFAULT 0,
+					status_changed_at       INTEGER NOT NULL DEFAULT 0,
+					last_recalled_at        INTEGER NOT NULL DEFAULT 0,
+					created_at              INTEGER NOT NULL DEFAULT 0,
+					updated_at              INTEGER NOT NULL DEFAULT 0
+				)`,
+				`CREATE INDEX IF NOT EXISTS idx_memory_state_scope_status ON memory_state(scope, status)`,
+				`CREATE INDEX IF NOT EXISTS idx_memory_state_status ON memory_state(status)`,
+
+				// op_runs：幂等台账。主键就是幂等 key，**先插后跑**——并发的第二次提交
+				// 在主键上直接失败，而不是靠「先查再插」的竞态窗口（TD §8 幂等要求）。
+				`CREATE TABLE IF NOT EXISTS op_runs (
+					key          TEXT PRIMARY KEY,
+					op           TEXT NOT NULL,
+					scope        TEXT NOT NULL CHECK (scope IN ('user','agent','project','global')),
+					trigger_kind TEXT NOT NULL,
+					actor        TEXT NOT NULL DEFAULT '',
+					reason       TEXT NOT NULL DEFAULT '',
+					status       TEXT NOT NULL CHECK (status IN ('running','applied','noop','duplicate','cancelled','failed')),
+					started_at   INTEGER NOT NULL DEFAULT 0,
+					finished_at  INTEGER NOT NULL DEFAULT 0,
+					note         TEXT NOT NULL DEFAULT ''
+				)`,
+				`CREATE INDEX IF NOT EXISTS idx_op_runs_scope_op ON op_runs(scope, op, started_at)`,
+
+				// audit_log：op_id · 触发源 · 时间 · before/after diff（TD §8）。
+				// seq 自增而不是 (op_id, step_id) 做主键：同一步骤重跑要各留一条痕迹。
+				`CREATE TABLE IF NOT EXISTS audit_log (
+					seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+					op_id        TEXT NOT NULL,
+					op           TEXT NOT NULL,
+					scope        TEXT NOT NULL,
+					trigger_kind TEXT NOT NULL,
+					actor        TEXT NOT NULL DEFAULT '',
+					reason       TEXT NOT NULL DEFAULT '',
+					step_id      TEXT NOT NULL DEFAULT '',
+					step_kind    TEXT NOT NULL DEFAULT '',
+					subject      TEXT NOT NULL DEFAULT '',
+					before_json  TEXT NOT NULL DEFAULT '',
+					after_json   TEXT NOT NULL DEFAULT '',
+					changed      INTEGER NOT NULL DEFAULT 0,
+					at           INTEGER NOT NULL DEFAULT 0
+				)`,
+				`CREATE INDEX IF NOT EXISTS idx_audit_log_op_id ON audit_log(op_id, seq)`,
+				`CREATE INDEX IF NOT EXISTS idx_audit_log_subject ON audit_log(subject, seq)`,
+
+				// memory_redirects：Merge 之后旧 ID → 新 ID（TD §4「保留旧 ID 为重定向」）。
+				// 旧 ID 不删除：它仍要在 as_of 回溯与审计里可解释。
+				`CREATE TABLE IF NOT EXISTS memory_redirects (
+					old_id TEXT PRIMARY KEY,
+					new_id TEXT NOT NULL,
+					scope  TEXT NOT NULL CHECK (scope IN ('user','agent','project','global')),
+					reason TEXT NOT NULL DEFAULT '',
+					at     INTEGER NOT NULL DEFAULT 0
+				)`,
+				`CREATE INDEX IF NOT EXISTS idx_memory_redirects_new ON memory_redirects(new_id)`,
+
+				// concept_usage：D15 的 Prune 判定依据（最后使用时间 + 使用次数）。
+				`CREATE TABLE IF NOT EXISTS concept_usage (
+					concept_id   TEXT PRIMARY KEY,
+					use_count    INTEGER NOT NULL DEFAULT 0,
+					last_used_at INTEGER NOT NULL DEFAULT 0
+				)`,
+
+				// op_watermarks：阈值触发与「未整理条目」的进度水位（按 scope+op）。
+				`CREATE TABLE IF NOT EXISTS op_watermarks (
+					scope TEXT NOT NULL,
+					op    TEXT NOT NULL,
+					at    INTEGER NOT NULL DEFAULT 0,
+					PRIMARY KEY (scope, op)
+				)`,
+			},
+		},
 	}
 }
 

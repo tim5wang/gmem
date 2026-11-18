@@ -49,9 +49,14 @@ func TestMigrateV6PreservesV1ToV5Identity(t *testing.T) {
 		}
 	}
 
-	// v6 必须是追加的最后一条，且是 Apply 型（表重建无法用纯 DDL 表达）。
-	if len(ms) != 6 {
-		t.Fatalf("迁移条数=%d, want 6（v6 必须追加，不得合并历史）", len(ms))
+	// v6 必须是**已发布条目**且是 Apply 型（表重建无法用纯 DDL 表达）。
+	//
+	// 断言口径的调整（P3 追加 v7 时）：原先这里写死「迁移条数 == 6」与「v6 是最后一条」，
+	// 那等价于禁止后续任何 schema 变更——而 TD §8 的 audit_log 必须落在新迁移里。
+	// 守卫的本意是「历史条目逐字节不得改」，因此改为：v1~v6 身份由指纹表钉死（上面的循环），
+	// 条数只要求 >= 6 且 v6 仍在清单里；"新变更必须追加"由 migrate_v7_test.go 单独钉死。
+	if len(ms) < 6 {
+		t.Fatalf("迁移条数=%d, want >= 6（v6 必须存在，不得合并历史）", len(ms))
 	}
 	v6 := byVersion[6]
 	if v6.Name != "p1_concept_id_soft_ref" {
@@ -186,8 +191,9 @@ func TestMigrateV5ToV6PreservesData(t *testing.T) {
 	if err := old.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate v5→v6: %v", err)
 	}
-	if v, err := old.SchemaVersion(ctx); err != nil || v != 6 {
-		t.Fatalf("升级后 SchemaVersion=%d err=%v, want 6", v, err)
+	// v5→v6 升级后版本必须**至少**是 6（可能已顺带应用后续迁移，例如 P3 的 v7）。
+	if v, err := old.SchemaVersion(ctx); err != nil || v < 6 {
+		t.Fatalf("升级后 SchemaVersion=%d err=%v, want >= 6", v, err)
 	}
 
 	// 数据全部存活，且外键列的值原样保留。
@@ -259,8 +265,8 @@ func TestMigrateV6IdempotentAfterMetadataLoss(t *testing.T) {
 	if err := d.Migrate(ctx); err != nil {
 		t.Fatalf("重跑 Migrate: %v", err)
 	}
-	if v, err := d.SchemaVersion(ctx); err != nil || v != 6 {
-		t.Fatalf("SchemaVersion=%d err=%v, want 6", v, err)
+	if v, err := d.SchemaVersion(ctx); err != nil || v < 6 {
+		t.Fatalf("SchemaVersion=%d err=%v, want >= 6", v, err)
 	}
 	if after := countRows(t, d.db, `SELECT COUNT(1) FROM concepts`); after != before {
 		t.Errorf("重跑后 concepts 行数 %d → %d（重复拷贝）", before, after)
