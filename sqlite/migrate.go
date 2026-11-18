@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -612,33 +613,91 @@ func (d *DB) Migrate(ctx context.Context) error {
 	return nil
 }
 
+// beginImmediate 在一条专用连接上开启 BEGIN IMMEDIATE 事务，返回执行句柄与结束函数。
+//
+// 为什么不能用 database/sql 的 d.db.BeginTx(ctx, nil)：它发的是 BEGIN（DEFERRED）。
+// DEFERRED 事务先只拿读锁，直到第一条写语句才尝试升级为写锁；SQLite 对"锁升级"
+// 失败**立即**返回 SQLITE_BUSY，busy_timeout 的忙等只对一开始就要写锁的情形生效
+// （否则两个 DEFERRED 事务互相等待升级会真死锁）。两个独立 handle 并发迁移时，
+// 后到者必然踩这个立即失败——这就是 TestMigrateConcurrentSafe 报
+// `migration 5 (p0_versioned_fts): database is locked (5) (SQLITE_BUSY)` 的根因。
+// migration 4/5 都是"建新表→COPY→DROP→RENAME"的整表重建（长写），争用窗口很大。
+//
+// BEGIN IMMEDIATE 一开始就取写锁（RESERVED），拿不到时由 busy_timeout 忙等，
+// 因此并发迁移变成"排队"而不是"报错"。写操作在事务内不再需要升级锁。
+func (d *DB) beginImmediate(ctx context.Context) (querier, func(commit bool) error, error) {
+	conn, err := d.db.Conn(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("sqlite: acquire conn: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("sqlite: begin immediate: %w", err)
+	}
+	done := func(commit bool) error {
+		defer func() { _ = conn.Close() }()
+		stmt := `ROLLBACK`
+		if commit {
+			stmt = `COMMIT`
+		}
+		// 收尾不受调用方 ctx 取消影响，否则回滚/提交会被跳过并泄漏事务。
+		if _, err := conn.ExecContext(context.WithoutCancel(ctx), stmt); err != nil {
+			return fmt.Errorf("sqlite: %s: %w", strings.ToLower(stmt), err)
+		}
+		return nil
+	}
+	return conn, done, nil
+}
+
 func (d *DB) applyMigration(ctx context.Context, m migration) error {
-	tx, err := d.db.BeginTx(ctx, nil)
+	q, done, err := d.beginImmediate(ctx)
 	if err != nil {
 		return fmt.Errorf("sqlite: begin migration %d: %w", m.Version, err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = done(false)
+		}
+	}()
+
+	// 拿到写锁后重新确认：等锁期间可能已有另一个 handle 应用完这一版。
+	// 这样既不做重复的长写重建，也保证 schema_migrations 每版恰好一行。
+	var already int
+	if err := q.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM schema_migrations WHERE version = ?`, m.Version,
+	).Scan(&already); err != nil {
+		return fmt.Errorf("sqlite: check migration %d: %w", m.Version, err)
+	}
+	if already > 0 {
+		if err := done(false); err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	}
 
 	for _, stmt := range m.Statements {
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+		if _, err := q.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("sqlite: migration %d (%s): %w", m.Version, m.Name, err)
 		}
 	}
 	if m.Apply != nil {
-		if err := m.Apply(ctx, tx); err != nil {
+		if err := m.Apply(ctx, q); err != nil {
 			return fmt.Errorf("sqlite: migration %d (%s): %w", m.Version, m.Name, err)
 		}
 	}
 	// INSERT OR IGNORE：两个进程并发迁移时，后到者不报错（DDL 本身也已 IF NOT EXISTS）。
-	if _, err := tx.ExecContext(ctx,
+	if _, err := q.ExecContext(ctx,
 		`INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)`,
 		m.Version, m.Name, time.Now().Unix(),
 	); err != nil {
 		return fmt.Errorf("sqlite: record migration %d: %w", m.Version, err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := done(true); err != nil {
 		return fmt.Errorf("sqlite: commit migration %d: %w", m.Version, err)
 	}
+	committed = true
 	return nil
 }
 
