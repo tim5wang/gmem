@@ -54,7 +54,7 @@ func TestBigramSymmetryIndexSide(t *testing.T) {
 	}
 
 	for _, q := range []string{"认证", "身份", "登录"} {
-		hits, err := d.Lexical().Search(ctx, q, store.ScopeUser, 10)
+		hits, err := d.Lexical().Search(ctx, store.LexicalQuery{Query: q, Scope: store.ScopeUser, Limit: 10})
 		if err != nil {
 			t.Fatalf("Search(%q): %v", q, err)
 		}
@@ -100,7 +100,7 @@ func TestBigramSymmetryQuerySide(t *testing.T) {
 	const query = "身份认证"
 
 	// 查询侧正确实现：命中。
-	hits, err := d.Lexical().Search(ctx, query, store.ScopeUser, 10)
+	hits, err := d.Lexical().Search(ctx, store.LexicalQuery{Query: query, Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search(%q): %v", query, err)
 	}
@@ -164,7 +164,7 @@ func TestBigramBothSidesSameTokens(t *testing.T) {
 						doc.ID, sub, qt, indexToks)
 				}
 			}
-			hits, err := d.Lexical().Search(ctx, sub, doc.Scope, 10)
+			hits, err := d.Lexical().Search(ctx, store.LexicalQuery{Query: sub, Scope: doc.Scope, Limit: 10})
 			if err != nil {
 				t.Fatalf("Search(%q): %v", sub, err)
 			}
@@ -187,7 +187,7 @@ func TestBigramSingleCharQueryDocumentedGap(t *testing.T) {
 		t.Fatalf("Index: %v", err)
 	}
 	for _, q := range []string{"认", "证", "数"} {
-		hits, err := d.Lexical().Search(ctx, q, store.ScopeUser, 10)
+		hits, err := d.Lexical().Search(ctx, store.LexicalQuery{Query: q, Scope: store.ScopeUser, Limit: 10})
 		if err != nil {
 			t.Fatalf("Search(%q): %v", q, err)
 		}
@@ -196,7 +196,7 @@ func TestBigramSingleCharQueryDocumentedGap(t *testing.T) {
 		}
 	}
 	// 2 字查询必须命中，作为同一语料下的对照。
-	hits, err := d.Lexical().Search(ctx, "数据库", store.ScopeUser, 10)
+	hits, err := d.Lexical().Search(ctx, store.LexicalQuery{Query: "数据库", Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search(数据库): %v", err)
 	}

@@ -25,12 +25,17 @@ type Store interface {
 	// PutMemory 写入一条记忆。同一 ID 的再次写入按 D12 产生**新版本**：
 	// 旧版置 TExpired，默认读当前版本；完全等价的重写是幂等的空操作。
 	// 已失效（TInvalid 非零）的事实不得因再次写入而复活。
+	// 按 D13，RecallCount 等运营计数**不参与**等价比较，也不会产生新版本。
 	PutMemory(ctx context.Context, m Memory) error
 	// GetMemory 取该 ID 的**当前版本**（TExpired 为空）；不存在返回 ErrNotFound。
 	GetMemory(ctx context.Context, id string) (Memory, error)
 	ListMemories(ctx context.Context, q MemoryQuery) ([]Memory, error)
 	// InvalidateMemory 只置 t_invalid（世界时间）,不做物理删除。
 	InvalidateMemory(ctx context.Context, id string, tInvalid int64) error
+	// TouchRecall 是**不产生新版本**的召回计数路径（D13）：只把当前版本的
+	// RecallCount 加一。没有当前版本时返回 ErrNotFound。
+	// 召回是热路径，绝不能因为它插一个新版本（叠加 per-version FTS 会直接炸库）。
+	TouchRecall(ctx context.Context, id string) error
 
 	// concepts：本体
 	PutConcept(ctx context.Context, c Concept) error
@@ -45,13 +50,18 @@ type Store interface {
 }
 
 // LexicalIndex 是词法索引端口（SQLite: FTS5 + bigram 列；PG: tsvector/pg_trgm）。
+//
+// 索引粒度是 **(ID, Version)**（D13）：memories 的每个版本各自成行，
+// 查询时按双时态有效性过滤，因此 as_of 与词法检索可以组合。
 type LexicalIndex interface {
-	// Index 写入或覆盖一组文档。实现必须自己完成 bigram 预转换（索引侧）。
+	// Index 写入或覆盖一组文档，覆盖粒度是 (ID, Version)——
+	// 同一 ID 的其它版本必须原样保留。实现必须自己完成 bigram 预转换（索引侧）。
 	Index(ctx context.Context, docs []Document) error
-	// Delete 按 ID 删除文档。
-	Delete(ctx context.Context, ids []string) error
-	// Search 按 BM25 相关性返回命中，Rank 从 1 开始。查询侧同样走 bigram 预转换。
-	Search(ctx context.Context, query string, scope Scope, limit int) ([]Hit, error)
+	// Delete 按 (ID, Version) 精确删除；不得隐式删除同 ID 的其它版本。
+	Delete(ctx context.Context, keys []DocumentKey) error
+	// Search 按 BM25 相关性返回命中，Rank 从 1 开始，Hit.Version 指出命中的版本。
+	// 查询侧同样走 bigram 预转换；AsOf 语义见 LexicalQuery。
+	Search(ctx context.Context, q LexicalQuery) ([]Hit, error)
 }
 
 // VectorIndex 是向量索引端口（SQLite: Go 侧暴力 KNN + int8 量化 BLOB）。

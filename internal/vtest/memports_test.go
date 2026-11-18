@@ -45,7 +45,7 @@ type memDB struct {
 	memories map[string]store.Memory
 	concepts map[string]store.Concept
 	aliases  map[string]store.Alias
-	docs     map[string]store.Document
+	docs     map[store.DocumentKey]store.Document
 	vectors  map[string]store.Vector
 	nodes    map[string]store.Node
 	edges    map[string]store.Edge
@@ -59,7 +59,7 @@ func (m *memDB) init() {
 	m.memories = map[string]store.Memory{}
 	m.concepts = map[string]store.Concept{}
 	m.aliases = map[string]store.Alias{}
-	m.docs = map[string]store.Document{}
+	m.docs = map[store.DocumentKey]store.Document{}
 	m.vectors = map[string]store.Vector{}
 	m.nodes = map[string]store.Node{}
 	m.edges = map[string]store.Edge{}
@@ -211,6 +211,20 @@ func (s *memStore) InvalidateMemory(_ context.Context, id string, tInvalid int64
 	return nil
 }
 
+// TouchRecall 复刻 D13：只改当前版本的 recall_count，不产生新版本。
+func (s *memStore) TouchRecall(_ context.Context, id string) error {
+	s.db.mu.Lock()
+	defer s.db.mu.Unlock()
+	s.db.init()
+	m, ok := s.db.memories[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	m.RecallCount++
+	s.db.memories[id] = m
+	return nil
+}
+
 func (s *memStore) PutConcept(_ context.Context, c store.Concept) error {
 	if err := c.Validate(); err != nil {
 		return err
@@ -327,44 +341,55 @@ func (l *memLexical) Index(_ context.Context, docs []store.Document) error {
 		if d.ID == "" {
 			return errEmptyDocID
 		}
-		l.db.docs[d.ID] = d
+		key := store.DocumentKey{ID: d.ID, Version: d.Key().VersionOr1()}
+		// 只覆盖同一 (id, version)：同 ID 的其它版本必须原样保留（D13）。
+		d.Version = key.Version
+		l.db.docs[key] = d
 	}
 	return nil
 }
 
-func (l *memLexical) Delete(_ context.Context, ids []string) error {
+func (l *memLexical) Delete(_ context.Context, keys []store.DocumentKey) error {
 	l.db.mu.Lock()
 	defer l.db.mu.Unlock()
 	l.db.init()
-	for _, id := range ids {
-		delete(l.db.docs, id)
+	for _, k := range keys {
+		delete(l.db.docs, store.DocumentKey{ID: k.ID, Version: k.VersionOr1()})
 	}
 	return nil
 }
 
 // Search 用 token 交集计数代替 BM25：仍然是"索引侧 bigram token vs 查询侧 bigram token"。
-func (l *memLexical) Search(_ context.Context, query string, scope store.Scope, limit int) ([]store.Hit, error) {
-	expr := bigram.QueryText(query)
+//
+// 版本语义与 SQLite 后端一致（D13）：命中带 Version；
+// AsOf 为 nil 时只返回主表 t_expired 为空的版本，非 nil 时按 t_created/t_expired 回溯。
+func (l *memLexical) Search(_ context.Context, lq store.LexicalQuery) ([]store.Hit, error) {
+	expr := bigram.QueryText(lq.Query)
 	if expr == "" {
 		return nil, nil
 	}
+	limit := lq.Limit
 	if limit <= 0 {
 		limit = 10
 	}
 	// 查询侧 token = 从 QueryText 的表达式里还原，强制走与 SQLite 侧相同的入口。
-	queryToks := bigram.Tokens(query)
+	queryToks := bigram.Tokens(lq.Query)
 
 	l.db.mu.Lock()
 	defer l.db.mu.Unlock()
 	l.db.init()
 
 	type scored struct {
-		id string
-		s  float64
+		id      string
+		version int
+		s       float64
 	}
 	var all []scored
 	for _, d := range l.db.docs {
-		if scope != "" && d.Scope != scope {
+		if lq.Scope != "" && d.Scope != lq.Scope {
+			continue
+		}
+		if !memLexVisible(l.db, d, lq.AsOf) {
 			continue
 		}
 		// 索引侧 token：同样来自 bigram，而不是原文整串。
@@ -382,22 +407,40 @@ func (l *memLexical) Search(_ context.Context, query string, scope store.Scope, 
 		if hits == 0 {
 			continue
 		}
-		all = append(all, scored{id: d.ID, s: float64(hits)})
+		all = append(all, scored{id: d.ID, version: d.Key().VersionOr1(), s: float64(hits)})
 	}
 	sort.Slice(all, func(i, j int) bool {
 		if all[i].s != all[j].s {
 			return all[i].s > all[j].s
 		}
-		return all[i].id < all[j].id
+		if all[i].id != all[j].id {
+			return all[i].id < all[j].id
+		}
+		return all[i].version < all[j].version
 	})
 	if len(all) > limit {
 		all = all[:limit]
 	}
 	out := make([]store.Hit, len(all))
 	for i, s := range all {
-		out[i] = store.Hit{ID: s.id, Score: s.s, Rank: i + 1}
+		out[i] = store.Hit{ID: s.id, Version: s.version, Score: s.s, Rank: i + 1}
 	}
 	return out, nil
+}
+
+// memLexVisible 复刻 SQLite 侧的双时态过滤（LEFT JOIN memories 的语义）：
+//   - 主表没有该 ID：默认可见（索引可独立存在），as_of 时不可见（无法断言当时存在）；
+//   - 主表有：以主表的 t_created / t_expired 为准。
+func memLexVisible(db *memDB, d store.Document, asOf *int64) bool {
+	m, ok := db.memories[d.ID]
+	if !ok {
+		return asOf == nil
+	}
+	if asOf != nil {
+		t := *asOf
+		return m.TCreated <= t && (m.TExpired == 0 || m.TExpired > t)
+	}
+	return m.TExpired == 0
 }
 
 // ---------------------------------------------------------------------------

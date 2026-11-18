@@ -130,12 +130,14 @@ func scanMemory(sc interface{ Scan(...any) error }) (store.Memory, error) {
 }
 
 // memorySame 判断一次写入与既有版本是否**完全等价**（等价即幂等重写，不产生新版本）。
+//
+// D13：只比较**内容承载字段**。RecallCount 这类运营计数不参与比较，
+// 否则“每召回一次就插一个新版本”，叠加 per-version FTS 会直接把库撑爆。
 func memorySame(a, b store.Memory) bool {
 	return a.Scope == b.Scope && a.ConceptID == b.ConceptID && a.Kind == b.Kind &&
 		a.Content == b.Content && a.TValid == b.TValid && a.TInvalid == b.TInvalid &&
 		a.TCreated == b.TCreated && a.TExpired == b.TExpired &&
-		a.SourceEpisode == b.SourceEpisode && a.Importance == b.Importance &&
-		a.RecallCount == b.RecallCount
+		a.SourceEpisode == b.SourceEpisode && a.Importance == b.Importance
 }
 
 // insertMemory 写入指定版本。
@@ -381,6 +383,29 @@ func (s *storeImpl) InvalidateMemory(ctx context.Context, id string, tInvalid in
 		if exists == 0 {
 			return store.ErrNotFound
 		}
+	}
+	return nil
+}
+
+// TouchRecall 只把**当前版本**的 recall_count 加一，不产生新版本（D13）。
+//
+// 为什么单独一个方法而不是再调一次 PutMemory：召回是热路径，
+// 走 PutMemory 会先读当前版本、比较、再决定插新版——一旦比较口径回归，
+// 就会变成“每次召回插一个新版本”。就地 UPDATE 从结构上排除这种可能，
+// 同时 per-version FTS 也不会因召回而膨胀。
+func (s *storeImpl) TouchRecall(ctx context.Context, id string) error {
+	q, err := s.c.querier(ctx)
+	if err != nil {
+		return err
+	}
+	res, err := q.ExecContext(ctx,
+		`UPDATE memories SET recall_count = recall_count + 1
+		 WHERE id = ? AND t_expired IS NULL`, id)
+	if err != nil {
+		return fmt.Errorf("sqlite: touch recall %q: %w", id, err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return store.ErrNotFound
 	}
 	return nil
 }

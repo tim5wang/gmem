@@ -76,7 +76,7 @@ func TestMigrateIdempotentNoDoubleWrite(t *testing.T) {
 	}
 
 	// 数据仍然可检索（迁移不得清表或重建丢数据）。
-	hits, err := d.Lexical().Search(ctx, "认证", store.ScopeUser, 10)
+	hits, err := d.Lexical().Search(ctx, store.LexicalQuery{Query: "认证", Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search after migrate: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestMigrateSurvivesMetadataLoss(t *testing.T) {
 	if n := countInt(t, raw, `SELECT COUNT(1) FROM memories_fts`); n != 1 {
 		t.Errorf("重跑迁移后 memories_fts 行数 = %d, want 1（数据被清）", n)
 	}
-	hits, err := d.Lexical().Search(ctx, "认证", store.ScopeUser, 10)
+	hits, err := d.Lexical().Search(ctx, store.LexicalQuery{Query: "认证", Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}

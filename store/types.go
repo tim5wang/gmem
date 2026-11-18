@@ -197,18 +197,65 @@ type MemoryQuery struct {
 	Offset         int
 }
 
+// DocumentKey 精确定位一篇词法文档：**(ID, Version)**。
+//
+// 为什么需要它（D13）：memories 的主键是 (id, version)，旧版本与其索引都必须保留，
+// 否则 as_of 回溯会在词法通道上静默返回空。任何“按 id 整体删掉”的写法都是缺陷。
+//
+// Version 的 0 值统一按 1 解释（“未版本化的文档 = 第一版”），
+// 后端不得把它当成“该 id 的所有版本”。
+type DocumentKey struct {
+	ID      string
+	Version int
+}
+
+// VersionOr1 返回规范化后的版本号：0 → 1。
+func (k DocumentKey) VersionOr1() int {
+	if k.Version <= 0 {
+		return 1
+	}
+	return k.Version
+}
+
 // Document 是交给 LexicalIndex 的一篇可检索文本。
+//
+// Version 是该文档对应的 memories.version（D13）；0 视为 1。
 type Document struct {
-	ID    string
+	ID      string
+	Version int
+	Scope   Scope
+	Text    string
+}
+
+// Key 返回该文档的 (ID, Version) 定位键。
+func (d Document) Key() DocumentKey {
+	return DocumentKey{ID: d.ID, Version: d.Version}
+}
+
+// LexicalQuery 是词法检索的全部参数。
+//
+// 用结构体而不是位置参数：参数一旦增加（AsOf 就是第一个），位置参数的
+// 调用点会变得完全不可读，也容易把 Limit 与 Scope 传反。
+type LexicalQuery struct {
+	// Query 是用户可读的原始查询串；后端自己做 bigram 预转换。
+	Query string
+	// Scope 为空表示不限 scope。
 	Scope Scope
-	Text  string
+	// AsOf 为 nil 时只返回**当前版本**（主表 t_expired IS NULL）。
+	// 非 nil 时按系统时间轴回溯：t_created <= AsOf 且（t_expired 为空或 > AsOf）。
+	AsOf *int64
+	// Limit <= 0 时由后端取默认值。
+	Limit int
 }
 
 // Hit 是一路通道返回的命中项。
 type Hit struct {
-	ID    string
-	Score float64 // 通道内分值，语义由通道决定；融合只用 Rank
-	Rank  int     // 1-based
+	ID string
+	// Version 是命中的版本（词法通道按 (id, version) 索引，D13）；
+	// 无法表达版本的通道留 0。
+	Version int
+	Score   float64 // 通道内分值，语义由通道决定；融合只用 Rank
+	Rank    int     // 1-based
 }
 
 // Ranked 把按序排列的 ID 转成带 rank 的 Hit 列表，便于直接喂给 fusion.RRF。

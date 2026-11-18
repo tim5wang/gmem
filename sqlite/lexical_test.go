@@ -42,7 +42,7 @@ func TestLexicalSearchChineseTwoChar(t *testing.T) {
 		{"令牌", "m2"},
 		{"过期", "m2"},
 	} {
-		hits, err := d.Lexical().Search(ctx, c.query, store.ScopeUser, 10)
+		hits, err := d.Lexical().Search(ctx, store.LexicalQuery{Query: c.query, Scope: store.ScopeUser, Limit: 10})
 		if err != nil {
 			t.Fatalf("Search(%q): %v", c.query, err)
 		}
@@ -119,7 +119,7 @@ func TestLexicalScopeIsolation(t *testing.T) {
 		t.Fatalf("Index: %v", err)
 	}
 
-	hits, err := d.Lexical().Search(ctx, "认证", store.ScopeUser, 10)
+	hits, err := d.Lexical().Search(ctx, store.LexicalQuery{Query: "认证", Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestLexicalScopeIsolation(t *testing.T) {
 		t.Fatalf("scope filter = %+v, want [u1]", hits)
 	}
 
-	hits, err = d.Lexical().Search(ctx, "认证", "", 10)
+	hits, err = d.Lexical().Search(ctx, store.LexicalQuery{Query: "认证", Scope: "", Limit: 10})
 	if err != nil {
 		t.Fatalf("Search all scopes: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestLexicalIndexOverwriteAndDelete(t *testing.T) {
 		t.Fatalf("rows after overwrite = %d, want 1", n)
 	}
 
-	hits, err := d.Lexical().Search(ctx, "认证", "", 10)
+	hits, err := d.Lexical().Search(ctx, store.LexicalQuery{Query: "认证", Scope: "", Limit: 10})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
@@ -160,10 +160,10 @@ func TestLexicalIndexOverwriteAndDelete(t *testing.T) {
 		t.Fatalf("stale bigram still matched: %+v", hits)
 	}
 
-	if err := d.Lexical().Delete(ctx, []string{"m1"}); err != nil {
+	if err := d.Lexical().Delete(ctx, []store.DocumentKey{{ID: "m1"}}); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	hits, err = d.Lexical().Search(ctx, "令牌", "", 10)
+	hits, err = d.Lexical().Search(ctx, store.LexicalQuery{Query: "令牌", Scope: "", Limit: 10})
 	if err != nil {
 		t.Fatalf("Search after delete: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestLexicalSearchEmptyQuery(t *testing.T) {
 	d := openTest(t)
 	indexDocs(t, d, store.ScopeUser, map[string]string{"m1": "认证"})
 
-	hits, err := d.Lexical().Search(context.Background(), "！？", store.ScopeUser, 10)
+	hits, err := d.Lexical().Search(context.Background(), store.LexicalQuery{Query: "！？", Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search punctuation: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestLexicalMultiTokenQuery(t *testing.T) {
 		"m2": "令牌已过期",
 	})
 
-	hits, err := d.Lexical().Search(ctx, "认证令牌", store.ScopeUser, 10)
+	hits, err := d.Lexical().Search(ctx, store.LexicalQuery{Query: "认证令牌", Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}

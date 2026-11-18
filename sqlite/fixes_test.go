@@ -555,7 +555,7 @@ func TestFixTxConflictInsteadOfBlocking(t *testing.T) {
 	if _, err := s.GetMemory(ctx, "m-conf"); err != nil {
 		t.Errorf("memory 未提交: %v", err)
 	}
-	hits, err := d.Lexical().Search(ctx, "事务", store.ScopeUser, 10)
+	hits, err := d.Lexical().Search(ctx, store.LexicalQuery{Query: "事务", Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}

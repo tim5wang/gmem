@@ -301,7 +301,7 @@ func runLexicalChineseTwoChar(t *testing.T, p store.Ports) {
 		{"迁移", "d-migrate"},
 		{"幂等", "d-migrate"},
 	} {
-		hits, err := p.Lexical.Search(ctx, c.query, store.ScopeUser, 10)
+		hits, err := p.Lexical.Search(ctx, store.LexicalQuery{Query: c.query, Scope: store.ScopeUser, Limit: 10})
 		if err != nil {
 			t.Fatalf("Search(%q): %v", c.query, err)
 		}
@@ -311,7 +311,7 @@ func runLexicalChineseTwoChar(t *testing.T, p store.Ports) {
 	}
 
 	// 3 字以上同样命中（查询侧必须整体切分，不能只处理 2 字）。
-	hits, err := p.Lexical.Search(ctx, "身份认证", store.ScopeUser, 10)
+	hits, err := p.Lexical.Search(ctx, store.LexicalQuery{Query: "身份认证", Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search(身份认证): %v", err)
 	}
@@ -320,7 +320,7 @@ func runLexicalChineseTwoChar(t *testing.T, p store.Ports) {
 	}
 
 	// 无关查询不得误召回。
-	hits, err = p.Lexical.Search(ctx, "量子纠缠", store.ScopeUser, 10)
+	hits, err = p.Lexical.Search(ctx, store.LexicalQuery{Query: "量子纠缠", Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search(量子纠缠): %v", err)
 	}
@@ -330,7 +330,7 @@ func runLexicalChineseTwoChar(t *testing.T, p store.Ports) {
 
 	// 空查询/纯标点返回空且不报错。
 	for _, q := range []string{"", "  ", "，。"} {
-		hits, err := p.Lexical.Search(ctx, q, store.ScopeUser, 10)
+		hits, err := p.Lexical.Search(ctx, store.LexicalQuery{Query: q, Scope: store.ScopeUser, Limit: 10})
 		if err != nil {
 			t.Errorf("Search(%q) 报错: %v", q, err)
 		}
@@ -341,7 +341,7 @@ func runLexicalChineseTwoChar(t *testing.T, p store.Ports) {
 
 	// Rank 必须严格从 1 递增且 ID 不重复（融合侧完全依赖这个契约）。
 	for _, q := range []string{"认证", "数据库", "身份认证"} {
-		hits, err := p.Lexical.Search(ctx, q, store.ScopeUser, 10)
+		hits, err := p.Lexical.Search(ctx, store.LexicalQuery{Query: q, Scope: store.ScopeUser, Limit: 10})
 		if err != nil {
 			t.Fatalf("Search(%q): %v", q, err)
 		}
@@ -369,14 +369,14 @@ func runLexicalScopeAndOverwrite(t *testing.T, p store.Ports) {
 	}
 
 	// scope 隔离：查询带 scope 时不得跨 scope 返回。
-	hits, err := p.Lexical.Search(ctx, "认证", store.ScopeUser, 10)
+	hits, err := p.Lexical.Search(ctx, store.LexicalQuery{Query: "认证", Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search(user): %v", err)
 	}
 	if ids := hitIDs(hits); !sameStrings(ids, []string{"u1"}) {
 		t.Errorf("scope=user 查询 = %v, want [u1]", ids)
 	}
-	hits, err = p.Lexical.Search(ctx, "认证", store.ScopeAgent, 10)
+	hits, err = p.Lexical.Search(ctx, store.LexicalQuery{Query: "认证", Scope: store.ScopeAgent, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search(agent): %v", err)
 	}
@@ -384,7 +384,7 @@ func runLexicalScopeAndOverwrite(t *testing.T, p store.Ports) {
 		t.Errorf("scope=agent 查询 = %v, want [a1]", ids)
 	}
 	// 空 scope = 不限，两 scope 都能出。
-	hits, err = p.Lexical.Search(ctx, "认证", "", 10)
+	hits, err = p.Lexical.Search(ctx, store.LexicalQuery{Query: "认证", Scope: "", Limit: 10})
 	if err != nil {
 		t.Fatalf("Search(all): %v", err)
 	}
@@ -398,14 +398,14 @@ func runLexicalScopeAndOverwrite(t *testing.T, p store.Ports) {
 	}); err != nil {
 		t.Fatalf("覆盖 Index: %v", err)
 	}
-	hits, err = p.Lexical.Search(ctx, "认证", store.ScopeUser, 10)
+	hits, err = p.Lexical.Search(ctx, store.LexicalQuery{Query: "认证", Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search after overwrite: %v", err)
 	}
 	if contains(hitIDs(hits), "u1") {
 		t.Errorf("覆盖写后旧文本仍可检索（旧 token 未清理）: %v", hitIDs(hits))
 	}
-	hits, err = p.Lexical.Search(ctx, "迁移", store.ScopeUser, 10)
+	hits, err = p.Lexical.Search(ctx, store.LexicalQuery{Query: "迁移", Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search(迁移): %v", err)
 	}
@@ -414,10 +414,10 @@ func runLexicalScopeAndOverwrite(t *testing.T, p store.Ports) {
 	}
 
 	// 删除后不可检索。
-	if err := p.Lexical.Delete(ctx, []string{"u1"}); err != nil {
+	if err := p.Lexical.Delete(ctx, []store.DocumentKey{{ID: "u1"}}); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	hits, err = p.Lexical.Search(ctx, "迁移", store.ScopeUser, 10)
+	hits, err = p.Lexical.Search(ctx, store.LexicalQuery{Query: "迁移", Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("Search after delete: %v", err)
 	}
@@ -444,7 +444,7 @@ func runLexicalBigramSymmetry(t *testing.T, p store.Ports) {
 	// 语料里每个 2 字中文子串都必须命中它所在的文档（对称性的最终判据）。
 	for _, doc := range bigramDocs {
 		for _, sub := range cjkBigrams(doc.Text) {
-			hits, err := p.Lexical.Search(ctx, sub, doc.Scope, 10)
+			hits, err := p.Lexical.Search(ctx, store.LexicalQuery{Query: sub, Scope: doc.Scope, Limit: 10})
 			if err != nil {
 				t.Fatalf("Search(%q): %v", sub, err)
 			}
@@ -630,7 +630,7 @@ func runRRFFusionOrder(t *testing.T, p store.Ports) {
 		t.Fatalf("Upsert: %v", err)
 	}
 
-	lexHits, err := p.Lexical.Search(ctx, "认证令牌", store.ScopeUser, 10)
+	lexHits, err := p.Lexical.Search(ctx, store.LexicalQuery{Query: "认证令牌", Scope: store.ScopeUser, Limit: 10})
 	if err != nil {
 		t.Fatalf("lexical search: %v", err)
 	}

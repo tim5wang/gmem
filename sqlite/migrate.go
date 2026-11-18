@@ -157,7 +157,75 @@ func migrations() []migration {
 			Name:    "p0_versioned_bitemporal",
 			Apply:   applyVersionedBitemporal,
 		},
+		{
+			// D13：memories_fts 的主键语义也必须是 (id, version)，否则 as_of 回溯
+			// 会在词法通道上静默返回 0 行。v2 的 DDL 已发布、逐字节不得改，
+			// 因此用 v5 重建虚表并把既有行回填为 version=1。
+			Version: 5,
+			Name:    "p0_versioned_fts",
+			Apply:   applyVersionedFTS,
+		},
 	}
+}
+
+// ftsDDLWithVersion 生成带 version 列的 FTS5 虚表 DDL。
+//
+// version 也是 UNINDEXED：它只用于 join 与过滤，绝不参与 MATCH，
+// 否则“30s”这种查询会意外命中版本号字符串。
+func ftsDDLWithVersion(name string) string {
+	return `CREATE VIRTUAL TABLE IF NOT EXISTS ` + name + ` USING fts5(
+			id UNINDEXED,
+			version UNINDEXED,
+			scope UNINDEXED,
+			body UNINDEXED,
+			bigrams,
+			tokenize = 'unicode61'
+		)`
+}
+
+// applyVersionedFTS 把 memories_fts 重建为带 version 列的形态，既有行回填 version=1。
+//
+// 为什么重建而不是 ALTER：FTS5 虚表不支持 ADD COLUMN。
+// 为什么不直接 DROP 重建空表：那会丢掉全部已发布的词法数据；
+// 这里的 INSERT ... SELECT 把 id/scope/body/bigrams 原样搬过去，只补 version=1
+// （v5 之前每个 id 在索引里只有一行）。
+//
+// 幂等性：schema_migrations 丢失后整个清单会重跑，因此先判断 version 列是否已存在，
+// 已存在就跳过。每个迁移本身在单个事务里执行，因此不会留下“已 DROP 未 RENAME”的中间态。
+func applyVersionedFTS(ctx context.Context, q querier) error {
+	exists, err := tableExists(ctx, q, "memories_fts")
+	if err != nil {
+		return err
+	}
+	hasVersion, err := tableHasColumn(ctx, q, "memories_fts", "version")
+	if err != nil {
+		return err
+	}
+	if exists && hasVersion {
+		return nil // 已是新形态
+	}
+	if !exists {
+		// v2 已建表但被外力删除（本例不应发生），直接建成新形态。
+		if _, err := q.ExecContext(ctx, ftsDDLWithVersion("memories_fts")); err != nil {
+			return fmt.Errorf("sqlite: migration 5 (create memories_fts): %w", err)
+		}
+		return nil
+	}
+
+	stmts := []string{
+		`DROP TABLE IF EXISTS memories_fts_v5`,
+		ftsDDLWithVersion("memories_fts_v5"),
+		`INSERT INTO memories_fts_v5 (id, version, scope, body, bigrams)
+		 SELECT id, 1, scope, body, bigrams FROM memories_fts`,
+		`DROP TABLE memories_fts`,
+		`ALTER TABLE memories_fts_v5 RENAME TO memories_fts`,
+	}
+	for _, stmt := range stmts {
+		if _, err := q.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("sqlite: migration 5 (versioned fts): %w", err)
+		}
+	}
+	return nil
 }
 
 // applyVersionedBitemporal 重建 memories / edges 为 (id, version) 主键，并补 nodes.source_episode。
@@ -273,6 +341,23 @@ func applyVersionedBitemporal(ctx context.Context, q querier) error {
 		}
 	}
 	return nil
+}
+
+// tableExists 报告表（含虚表）是否存在。
+func tableExists(ctx context.Context, q querier, table string) (bool, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT COUNT(1) FROM sqlite_master WHERE name = ? AND type IN ('table','view')`, table)
+	if err != nil {
+		return false, fmt.Errorf("sqlite: table_exists %s: %w", table, err)
+	}
+	defer rows.Close()
+	var n int
+	if rows.Next() {
+		if err := rows.Scan(&n); err != nil {
+			return false, fmt.Errorf("sqlite: scan table_exists %s: %w", table, err)
+		}
+	}
+	return n > 0, rows.Err()
 }
 
 // tableHasColumn 报告 table 是否有 column。表不存在时返回 false。
