@@ -42,6 +42,10 @@
 表外关系（如自定义 relation）按"非传递 1 跳"处理，**仍然写进 plan**，
 因此不会出现"用了图却没有规则可查"。
 
+`Transitive` 不是装饰字段：`relations` 会把**非传递关系**的 `MaxHops` 夹到 1
+（表里写多大都不允许连走两条）。因此把 `works_at` 配成 `{Transitive:false, MaxHops:3}`
+时，plan 里仍然是 1 跳——传递性优先于表里的数字。
+
 这是与 Graphiti `bfs_max_depth=3` 的结构性区别：同一张图里 `subtype_of` 走 3 跳、
 `works_at` 只走 1 跳，噪声源被白名单掐掉。
 
@@ -51,21 +55,26 @@
 `Plan.Lanes` 每条都带 `Weight`（表值）、`Selected`/`Executed`、`Reason`（规则表来源）、
 `SkipReason`（无 embedder / 无锚点 / 无 scope / 空 query）。权重没有任何一处写在 if/else 里。
 
-### 2.4 insufficient 的判定：为什么要 `CoverageAuthoritative`
+`Executed` 的语义是"**真的调用过**这条通道"：计划阶段只标 `SkipReason`，
+置位发生在通道返回之后。因此 insufficient 的结果里不会出现"声称跑过、实际没跑"的 plan。
+另有一条不变量：所有选中 lane 都被跳过时，会追加 lexical 兼底（不直接放弃）。
 
-R4 的两个触发条件都实现了：`coverage < θ_cov`，或存在"必需且未对齐"的槽。
+`ShapeRelational` 的行是 `graph 0.7 / vector 0.3 / lexical 0.2`——关系型问句也要算词法通道，
+否则"graph 无锚点 + vector 无 embedder"时会融合 0 路通道而弃答。
 
-但直接拿覆盖率判定会踩两个坑，都做了显式处理：
+### 2.4 insufficient 的判定：跑完且真零证据（D14）
 
-- **本体为空时覆盖率没有语义**。query 里每个词都"不在空集合里"，覆盖率恒为低，
-  会把"记忆写好了但本体还没长出来"的库变成永远 insufficient。此时置
-  `Alignment.CoverageAuthoritative=false`，走 `Degraded` 上报（"coverage 不作 R4 判据"），
-  不拿它当硬失败依据。
-- **残槽不都是必需槽**。自然语言问句里大量残槽是限定语（"最新的"、"怎么配置"）。
-  规则（`finalizeResidualRequired`）：只有"本体可对齐 且 query 的实质内容完全没对齐
-  （或残槽是唯一内容槽）"时，残槽才判 `Required=true`。否则只由 coverage 削弱权重。
-  这样"Alice 用什么 编辑器"（主体都对齐）不会被误判，而"部署环境是什么"（实体一个都
-  没对上）会被硬判 insufficient。
+`insufficient` **不是先验短路**：Recall 先把 plan 里选中的 lane 全部跑完，
+只有**所有通道真零证据**时才返回 `insufficient` + `Missing[]`。
+这样"词法通道能查到 1 条"的查询不会被误判成"库里没有这个维度"。
+
+`CoverageAuthoritative` 仍然存在，用来解释覆盖率是否可判定：
+本体为空/后端不支持枚举时置 `false`，走 `Degraded` 上报，不拿它当硬失败依据。
+
+残槽（不是别名/概念名/定义句命中的片段）在**对齐阶段一律 `Required=false`**：
+"本体里没这个概念"不等于"我没有这个维度"。只有确认零证据之后，
+才由 `missingForZeroEvidence` 把未对齐的内容槽升级为 `Required=true` ——
+此时"你问的维度我确实没记过"才是被证据支撑的结论。
 
 `Missing[]` 每条都含 `Reason`（含槽位原文，可直接回显）与 `Suggestion`（可执行补救）。
 insufficient 时 `Items` 为空——刻意的，不返回低分硬答。

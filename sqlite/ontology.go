@@ -36,12 +36,13 @@ func (s *storeImpl) ListConcepts(ctx context.Context) ([]store.Concept, error) {
 	for rows.Next() {
 		var c store.Concept
 		var parentID sql.NullString
-		var status string
-		if err := rows.Scan(&c.ID, &c.Name, &parentID, &status, &c.Definition); err != nil {
+		var status, origin string
+		if err := rows.Scan(&c.ID, &c.Name, &parentID, &status, &c.Definition, &origin); err != nil {
 			return nil, fmt.Errorf("sqlite: list concepts scan: %w", err)
 		}
 		c.ParentID = fromNullableText(parentID)
 		c.Status = store.ConceptStatus(status)
+		c.Origin = store.ConceptOrigin(origin)
 		out = append(out, c)
 	}
 	if err := rows.Err(); err != nil {

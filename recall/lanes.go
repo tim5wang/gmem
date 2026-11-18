@@ -41,14 +41,17 @@ type laneInput struct {
 	embedQuery []float32
 }
 
-// runLanes 并行执行 plan 里标记 Executed 的通道。
+// runLanes 并行执行 plan 里 "被选中且未被跳过" 的通道。
+//
+// 选择条件是 Selected && SkipReason == ""，而**不是** Executed：
+// Executed 由调用方在通道真正返回后置位（F1/F6），此时还未决定。
 func (r *Recaller) runLanes(ctx context.Context, in laneInput) ([]laneOutcome, error) {
 	type job struct {
 		lane LanePlan
 	}
 	var jobs []job
 	for _, lp := range in.plan.Lanes {
-		if lp.Executed {
+		if lp.Selected && lp.SkipReason == "" {
 			jobs = append(jobs, job{lane: lp})
 		}
 	}
@@ -184,8 +187,14 @@ func (r *Recaller) graphLane(ctx context.Context, in laneInput) ([]store.Hit, ma
 	if err := ctx.Err(); err != nil {
 		return nil, nil, nil, err
 	}
+	// F7：单个锚点/跳数组失败不再拖垮整条 graph lane。
+	//
+	// 旧实现只要有一个 Neighbors 报错就 return nil —— 成功锚点已经算出的候选
+	// 一起被丢掉，多锚点问句里一个实体查询失败整条图通道归零。现在：失败记进
+	// degraded（并在 plan 里可见），但**保留其他锚点的候选**；没有候选时才冒错。
+	var partialErr error
 	if len(degraded) > 0 {
-		return nil, nil, dropped, fmt.Errorf("%s", joinStrings(degraded, "; "))
+		partialErr = fmt.Errorf("%s", joinStrings(degraded, "; "))
 	}
 
 	cands := make([]*cand, 0, len(best))
@@ -217,7 +226,7 @@ func (r *Recaller) graphLane(ctx context.Context, in laneInput) ([]store.Hit, ma
 		hits = append(hits, store.Hit{ID: c.id, Score: c.score, Rank: i + 1})
 		evidenceByID[c.id] = c.ev
 	}
-	return hits, evidenceByID, dropped, nil
+	return hits, evidenceByID, dropped, partialErr
 }
 
 // mapHopsToMemories 把图上的边映射回记忆 ID，并给出可解释的证据。

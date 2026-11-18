@@ -69,6 +69,16 @@ func (r *Recaller) Recall(ctx context.Context, req RecallRequest) (RecallResult,
 	if err := ctx.Err(); err != nil {
 		return RecallResult{}, err
 	}
+	// S-4：Scope 是**必填**的隔离边界，不是"不限"。
+	//
+	// types.go 的 NeighborQuery 与 ports.go 的 GraphStore 都把空 Scope 当调用方
+	// 缺陷（后端应尽快返回错误），但 Recall 之前直接把它传给各 lane，而
+	// matchesFilter 又把空 Scope 解释成"不限"——语义相反。实测后果是跨 scope
+	// 泄漏（user 查询里出现 agent 的边）。在入口一次判定，比在每个 lane 里各判一次可靠。
+	if !req.Scope.Valid() {
+		return RecallResult{}, fmt.Errorf(
+			"recall: invalid scope %q（Scope 是必填的隔离边界，空值不等于不限）", req.Scope)
+	}
 
 	// --- 1. align -----------------------------------------------------------
 	al, err := r.align.Align(ctx, req.Query)
@@ -88,32 +98,14 @@ func (r *Recaller) Recall(ctx context.Context, req RecallRequest) (RecallResult,
 
 	res := RecallResult{Coverage: al.Coverage, Plan: plan}
 
-	// --- 3. R4：覆盖率不足先判，不硬答 ---------------------------------------
-	// 触发条件（§5 R4）：coverage < θ_cov，或未对齐槽位里有必需槽。
-	// 两条都判：覆盖率可能因分母小而虚高（只有一个槽且它对齐了 → 1.0），
-	// 但只要存在"必需且未对齐"的槽，就已经是"我问的维度你没有"。
+	// --- 3. D14：不再在 lane 之前短路 -----------------------------------------
 	//
-	// coverage 只有在**有本体可对齐**时才作判据（al.CoverageAuthoritative）。
-	// 库是空本体时算出的覆盖率没有语义：query 里的词全都"不在空集合里"，
-	// 用它会退化成"任何查询都 insufficient"。这种情形走 Degraded 上报，
-	// 让调用方知道召回是靠词法/图硬撑的。
+	// 旧实现在这里就判 insufficient 并 return，于是"词法通道明明能查到 1 条，
+	// Recall 却返回 insufficient 0 条"。D14：insufficient 必须是"跑完且真零证据"
+	// 的闸，不是先验短路。coverage 与未对齐槽位仍用于 explain，但不再单独否决。
 	lowCoverage := al.CoverageAuthoritative && al.Coverage < r.cfg.ThetaCoverage
-	if lowCoverage || len(al.RequiredMissing) > 0 {
-		res.Status = StatusInsufficient
-		res.Missing = missingFrom(al)
-		res.Degraded = dedupeStrings(degraded)
-		plan.Steps = append(plan.Steps, PlanStep{
-			Step: "insufficient",
-			Detail: fmt.Sprintf("coverage=%.3f (θ=%.2f, 可判定=%v)，必需未对齐槽=%d → 返回 insufficient 而非低分硬答",
-				al.Coverage, r.cfg.ThetaCoverage, al.CoverageAuthoritative, len(al.RequiredMissing)),
-		})
-		for _, m := range res.Missing {
-			plan.Steps = append(plan.Steps, PlanStep{Step: "missing", Detail: m.Reason})
-		}
-		return res, nil
-	}
 
-	// --- 3. 查询向量（可选） -------------------------------------------------
+	// --- 3b. 查询向量（可选） ------------------------------------------------
 	var embedQuery []float32
 	if r.emb != nil && laneSelected(plan, LaneVector) {
 		vecs, err := r.emb.Embed(ctx, []string{req.Query})
@@ -143,6 +135,16 @@ func (r *Recaller) Recall(ctx context.Context, req RecallRequest) (RecallResult,
 	outcomes, err := r.runLanes(ctx, lin)
 	if err != nil {
 		return RecallResult{}, err
+	}
+	// F1/F6：Executed 在这里置位——它们**真的**被调用了（plan.go 计划期不置位）。
+	// 跳过、失败、以及**未被选中**的通道都必须是 Executed=false。
+	for i := range plan.Lanes {
+		lp := &plan.Lanes[i]
+		if !lp.Selected || lp.SkipReason != "" {
+			lp.Executed = false
+			continue
+		}
+		lp.Executed = true
 	}
 	for _, o := range outcomes {
 		if o.err != nil {
@@ -192,20 +194,69 @@ func (r *Recaller) Recall(ctx context.Context, req RecallRequest) (RecallResult,
 	} else {
 		res.Status = StatusOK
 	}
-	// 覆盖率达标但一条都没召回：这是"通道都空"的现实，仍是 insufficient
-	// （Missing 用空覆盖描述），不能返回 ok + 空 Items 让人以为查到了。
+	// D14：只有**跑完所有通道且真零证据**时才返回 insufficient。
+	// 这是 insufficient 的唯一闸门（不再有先验短路）。
+	//
+	// "真零证据"的口径：没有任何通道命中（len(channels)==0），并且没有任何
+	// 可用的候选落到 Items。此时才把 coverage < θ 或未对齐槽位当作"缺什么"报出去。
 	if len(res.Items) == 0 {
 		res.Status = StatusInsufficient
-		res.Missing = []MissingSlot{{
-			Kind:       SlotConcept,
-			Text:       req.Query,
-			Required:   true,
-			Reason:     fmt.Sprintf("槽位已对齐，但在 scope=%q 内没有任何通道召回结果", req.Scope),
-			Suggestion: "确认该 scope 已写入相关记忆（写入请走 Writer.PutMemory 单一入口）",
-		}}
-		plan.Steps = append(plan.Steps, PlanStep{Step: "empty", Detail: "所有通道 0 命中 → insufficient"})
+		res.Missing = missingForZeroEvidence(al, req)
+		detail := fmt.Sprintf("跑完 %d 路通道、零命中；coverage=%.3f (θ=%.2f, 可判定=%v)，未对齐槽=%d → insufficient 而非低分硬答",
+			len(channels), al.Coverage, r.cfg.ThetaCoverage, al.CoverageAuthoritative, len(al.Unmatched))
+		if len(channels) == 0 {
+			detail += "（所有选中 lane 均未执行或均无命中）"
+		}
+		plan.Steps = append(plan.Steps, PlanStep{Step: "insufficient", Detail: detail})
+		for _, m := range res.Missing {
+			plan.Steps = append(plan.Steps, PlanStep{Step: "missing", Detail: m.Reason})
+		}
+		return res, nil
+	}
+	// 有结果但覆盖率偏低：不是 insufficient（已经答得出来），但必须可解释。
+	if lowCoverage || len(al.RequiredMissing) > 0 {
+		plan.Steps = append(plan.Steps, PlanStep{
+			Step: "low_coverage",
+			Detail: fmt.Sprintf("coverage=%.3f < θ=%.2f（或必需未对齐槽=%d），但有通道给出证据 → 仍返回结果（D14）",
+				al.Coverage, r.cfg.ThetaCoverage, len(al.RequiredMissing)),
+		})
 	}
 	return res, nil
+}
+
+// missingForZeroEvidence 在**确认零证据**之后构建 R4 的 Missing[]。
+//
+// 与 missingFrom 的分工：对齐阶段的残槽**默认不 Required**（D14：不得先验
+// 短路），只有跑完所有通道且真零证据时，才把未对齐的内容槽升级为 Required——
+// 此时"你问的这个维度我确实没有任何记录"才是被证据支撑的结论，而不是猜测。
+func missingForZeroEvidence(al Alignment, req RecallRequest) []MissingSlot {
+	var out []MissingSlot
+	seen := map[string]bool{}
+	for _, s := range al.Unmatched {
+		if s.Kind == SlotLiteral {
+			continue // 字面量由词法通道直接可检，不算"缺维度"
+		}
+		key := string(s.Kind) + "|" + s.Text
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, MissingSlot{
+			Kind: s.Kind, Text: s.Text, Required: true,
+			Reason: fmt.Sprintf("查询中的「%s」(%s 槽) 在库中没有任何对齐记录，且跑完全部通道后仍无任何证据",
+				s.Text, s.Kind),
+			Suggestion: suggestionFor(s.Kind),
+		})
+	}
+	// 槽位都对齐了但库/通道为空：必须给一条可读说明，不能返回空 Missing。
+	if len(out) == 0 {
+		out = append(out, MissingSlot{
+			Kind: SlotConcept, Text: req.Query, Required: true,
+			Reason:     fmt.Sprintf("槽位已对齐，但在 scope=%q 内没有任何通道召回结果", req.Scope),
+			Suggestion: "确认该 scope 已写入相关记忆（写入请走 Writer.PutMemory 单一入口）",
+		})
+	}
+	return out
 }
 
 // buildItems 把融合结果落成 RecallItem（含分数分解），并做两次乘性调整：
@@ -353,49 +404,6 @@ func (r *Recaller) recency(m store.Memory, now time.Time) (float64, string) {
 	}
 	return f, fmt.Sprintf("age=%.1fh，半衰期=%.0fh → ×%.3f（下界 %.2f）",
 		age.Hours(), half.Hours(), f, r.cfg.RecencyFloor)
-}
-
-// missingFrom 把对齐缺口翻成 R4 的结构化 Missing[]。
-func missingFrom(al Alignment) []MissingSlot {
-	var out []MissingSlot
-	seen := map[string]bool{}
-	add := func(s Slot, required bool) {
-		key := string(s.Kind) + "|" + s.Text
-		if seen[key] {
-			return
-		}
-		seen[key] = true
-		out = append(out, MissingSlot{
-			Kind:     s.Kind,
-			Text:     s.Text,
-			Required: required,
-			Reason: fmt.Sprintf("查询中的「%s」(%s 槽) 在库中没有任何对齐记录：没有出现过的别名、概念名，也没有相似的定义句",
-				s.Text, s.Kind),
-			Suggestion: suggestionFor(s.Kind),
-		})
-	}
-	for _, s := range al.RequiredMissing {
-		add(s, true)
-	}
-	// 非必需槽也报（如 deprecated 概念质量为 0）：它们解释了"为什么覆盖率偏低"。
-	for _, s := range al.Unmatched {
-		if s.Required {
-			continue
-		}
-		add(s, false)
-	}
-	// 覆盖率不达标但没有具体缺口（例如槽位全对齐、只是因为权重太低）：
-	// 必须给一条**有意义**的说明，不能返回空的 Missing[]。
-	if len(out) == 0 {
-		out = append(out, MissingSlot{
-			Kind:       SlotConcept,
-			Text:       al.Query,
-			Required:   false,
-			Reason:     fmt.Sprintf("整体覆盖率 %.3f 低于 θ_cov，但没有单一槽位完全缺失（多为已弃用概念或低质量对齐）", al.Coverage),
-			Suggestion: "确认 concepts.status 是否已 certified；draft 概念的权重被打折",
-		})
-	}
-	return out
 }
 
 func suggestionFor(k SlotKind) string {

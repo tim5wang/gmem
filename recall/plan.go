@@ -104,7 +104,12 @@ func (p *Planner) makePlan(in planInput) *RecallPlan {
 		}
 	}
 
-	// 执行能力裁剪：这里只标记 Executed/SkipReason，真正执行在 lanes.go。
+	// 执行能力裁剪：这里只标记 SkipReason，**不置 Executed**。
+	//
+	// F1/F6：Executed 必须表示"真的调用了这个通道"。计划阶段就置位会让
+	// insufficient 结果里的 plan 声称"跑过了但没找到"，而那一次通道调用
+	// 可能根本没发生——读 plan 的人会被误导。置位在 recall.go 里、通道
+	// 真正返回之后。
 	for i := range pl.Lanes {
 		lp := &pl.Lanes[i]
 		if !lp.Selected {
@@ -130,15 +135,25 @@ func (p *Planner) makePlan(in planInput) *RecallPlan {
 				lp.SkipReason = "empty query"
 			}
 		}
-		if lp.SkipReason == "" {
-			lp.Executed = true
-		}
+	}
+
+	// F3 的不变量：所有选中 lane 都被跳过时，必须降级到 lexical，
+	// 而不是直接走向 insufficient。词法几乎总能答出点什么。
+	if !hasExecutableLane(pl) {
+		pl.Lanes = append(pl.Lanes, LanePlan{
+			Lane: LaneLexical, Weight: 1.0, Budget: perLane, Selected: true,
+			Reason: "fallback: 选中 lane 均被跳过，降级到 lexical 兼底",
+		})
+		pl.Steps = append(pl.Steps, PlanStep{
+			Step:   "lane:fallback",
+			Detail: "选中 lane 均被跳过 → 追加 lexical 兼底（不直接放弃）",
+		})
 	}
 
 	for _, l := range pl.Lanes {
-		state := "跳过"
-		if l.Executed {
-			state = "执行"
+		state := "待执行"
+		if l.SkipReason != "" {
+			state = "跳过"
 		}
 		detail := fmt.Sprintf("%s: weight=%.2f budget=%d %s；%s", l.Lane, l.Weight, l.Budget, state, l.Reason)
 		if l.SkipReason != "" {
@@ -147,6 +162,16 @@ func (p *Planner) makePlan(in planInput) *RecallPlan {
 		pl.Steps = append(pl.Steps, PlanStep{Step: "lane:" + string(l.Lane), Detail: detail})
 	}
 	return pl
+}
+
+// hasExecutableLane 报告是否至少有一条选中且未被跳过的 lane。
+func hasExecutableLane(pl *RecallPlan) bool {
+	for _, lp := range pl.Lanes {
+		if lp.Selected && lp.SkipReason == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // shape 判定查询形态（§5 lane 选择规则表的行键）。
@@ -221,6 +246,12 @@ func (p *Planner) relations(shape QueryShape, hints []store.Relation) []Relation
 		if !ok {
 			// 表外关系：非传递、1 跳。**仍然列出**，并要求 plan 能解释它。
 			rule = RelationRule{Relation: rel, Transitive: false, MaxHops: 1, Weight: 0.5}
+		}
+		// F8：Transitive 必须**真正控制**传递性遍历，而不是只被复制进 plan 的装饰字段。
+		// 非传递关系（works_at/owns/uses）连续走两条就是噪声（两跳就到别人公司），
+		// 因此这里把非传递关系的跳数夹到 1：表里写多大都不允许连走两条。
+		if !rule.Transitive && rule.MaxHops > 1 {
+			rule.MaxHops = 1
 		}
 		seen[rel] = true
 		out = append(out, RelationPlan{

@@ -42,9 +42,6 @@ type alignEntry struct {
 	end   int
 	slot  Slot
 	match *Match
-	// residual 表示这是"未被任何本体路径解释的残槽"，其 Required 由
-	// finalizeResidualRequired 统一判定（见该函数注释）。
-	residual bool
 }
 
 // Align 把 query 对齐到概念槽位，输出 matched[] / unmatched_slots[] / coverage。
@@ -159,7 +156,15 @@ func (a *Aligner) Align(ctx context.Context, query string) (Alignment, error) {
 		})
 	}
 
-	// --- 4. 关系线索词（最长优先，且不与已接受槽位重叠） ----------------------
+	// --- 4. 关系线索词（最长优先；与已接受槽位重叠时**只取 relation hint**） -------------
+	//
+	// F4：原先线索与已接受槽位（例如概念名）有任何重叠就整条丢弃，于是
+	// "Alice 在哪个公司工作"里的「哪个公司」被概念名「公司」吃掉，
+	// RelationHints 为空 → 形态退化为 full_with_anchor → 走 shape-default 的 3 跳盲扩展，
+	// 而同义的"Alice 在哪工作"能靠 works_at 1 跳答出。两个问法必须行为一致。
+	//
+	// 修法：允许重叠匹配。重叠时**不占用** blocked（不去掩盖已接受的概念槽位），
+	// 只把 relation 作为线索附加在同一个槽位上，供 Planner 定跳数。
 	type cueCand struct {
 		start, end int
 		relation   store.Relation
@@ -185,15 +190,24 @@ func (a *Aligner) Align(ctx context.Context, query string) (Alignment, error) {
 		}
 		return cueCands[i].start < cueCands[j].start
 	})
+	cueSeen := map[store.Relation]bool{}
+	var overlapHints []store.Relation
 	for _, c := range cueCands {
+		if cueSeen[c.relation] {
+			continue
+		}
+		cueSeen[c.relation] = true
 		if overlaps(blocked, c.start, c.end) {
+			// 已被概念/别名占用：只取 relation hint，不新增槽位，也不改 blocked。
+			// 这样 coverage 不被重复计入，而 Planner 能拿到真实关系（F4）。
+			overlapHints = append(overlapHints, c.relation)
 			continue
 		}
 		mark(blocked, c.start, c.end)
 		text := string(orig[c.start:c.end])
 		entries = append(entries, alignEntry{
 			start: c.start, end: c.end,
-			slot: Slot{Kind: SlotRelation, Text: text, Required: true, Weight: a.slotWeight(SlotRelation)},
+			slot: Slot{Kind: SlotRelation, Text: text, Required: false, Weight: a.slotWeight(SlotRelation)},
 			match: &Match{
 				Kind: SlotRelation, Text: text, Relation: c.relation,
 				Method: MatchRelationCue, Quality: 1, StatusFactor: 1,
@@ -237,17 +251,19 @@ func (a *Aligner) Align(ctx context.Context, query string) (Alignment, error) {
 		}
 		// 未对齐：库里没有这个维度的概念。
 		//
-		// Required 留待 finalizeResidualRequired 统一判定（它需要看到全部槽位
-		// 才知道 query 的实质内容是否已经对齐上了）。
+		// Required 留 false：D14 要求"本体里没这个概念"不得先验地等同于
+		// "我没有这个维度"——是否构成硬缺口由 Recall 在跑完所有通道、
+		// 确认零证据之后裁定（见 recall.go 的 missingForZeroEvidence）。
 		entries = append(entries, alignEntry{
 			start: seg.start, end: seg.end,
-			slot:     Slot{Kind: SlotEntity, Text: text, Required: false, Weight: a.slotWeight(SlotEntity)},
-			residual: true,
+			slot: Slot{Kind: SlotEntity, Text: text, Required: false, Weight: a.slotWeight(SlotEntity)},
 		})
 	}
 
-	// 只有"有本体可对齐"时，残槽未对齐才构成硬缺口（见 finalizeResidualRequired）。
-	finalizeResidualRequired(entries, al.CoverageAuthoritative)
+	// D14：残槽**默认不构成硬缺口**。"本体里没这个概念"不能先验地当成
+	// "我没有这个维度"——词法通道很可能能答（记忆正文里就有这个词）。
+	// 是否算硬缺口由 Recall 在**跑完所有通道且真零证据**之后裁定（见 recall.go）。
+	// 这里只把残槽记为 Unmatched（参与 coverage 分母），不置 Required。
 
 	// --- 汇总 -----------------------------------------------------------------
 	sort.SliceStable(entries, func(i, j int) bool {
@@ -274,7 +290,16 @@ func (a *Aligner) Align(ctx context.Context, query string) (Alignment, error) {
 		m := *e.match
 		m.SlotIndex = len(al.Slots) - 1
 		m.Weight = e.slot.Weight * m.Quality * m.StatusFactor
-		got += m.Weight
+		// F2b：coverage 只衡量"有没有听懂 query 的各个维度"，因此**不含** StatusFactor。
+		//
+		// 旧实现让 StatusFactor 进入 coverage，于是 draft 概念的精确查询得到
+		// 0.9（ConceptNameQuality）× 0.6（draft 打折）= 0.54 < θ 0.6 → 必失败。
+		// 本体越丰富、draft 越多，越容易把"完全听懂的问题"判成 insufficient，
+		// 这是反向的：认知度不该被认证状态惩罚。
+		//
+		// StatusFactor 只影响排序权重（R2：只有 certified 参与硬契约 → draft 打折、
+		// deprecated 归零都在 Match.Weight 与最终排序里体现）。
+		got += e.slot.Weight * m.Quality
 		al.Matched = append(al.Matched, m)
 		if m.NodeID != "" && !anchorSeen[m.NodeID] {
 			anchorSeen[m.NodeID] = true
@@ -288,56 +313,26 @@ func (a *Aligner) Align(ctx context.Context, query string) (Alignment, error) {
 			al.RelationHints = append(al.RelationHints, m.Relation)
 		}
 	}
+	// F4：与已接受槽位重叠的关系线索只能以 hint 形式存在（没有自己的槽位），
+	// 必须单独补进 RelationHints，否则 Planner 看不到它。
+	for _, rel := range overlapHints {
+		dup := false
+		for _, got := range al.RelationHints {
+			if got == rel {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			al.RelationHints = append(al.RelationHints, rel)
+		}
+	}
 	if total > 0 {
 		al.Coverage = clamp01(got / total)
 	}
 	// 覆盖率 100% 但"缺"的那个槽位质量为 0（如 deprecated 概念）时，
 	// RequiredMissing 仍然是权威结论，因此两者同时上报。
 	return al, nil
-}
-
-// finalizeResidualRequired 决定未对齐的残槽是否为"必需槽"（R4 的硬失败条件）。
-//
-// 两条前提必须同时成立：
-//
-//  1. **有本体可对齐**（authoritative）。本体为空或后端不支持枚举时走的是降级
-//     路径：对齐侧根本无从判断"库里没这个概念"还是"词典还没建"。此时把它判成
-//     硬缺口，会让"记忆写好了但本体还没长出来"的库完全不可用——那是把降级
-//     误报成"我没有这个维度"，比低分硬答更有害。
-//
-//  2. **query 的实质内容完全没有对齐**（matchedContent == 0），或者残槽就是
-//     query 里唯一的内容槽。残槽是"没有被 aliases/concepts/定义句解释的片段"，
-//     自然语言问句里大量出现在限定语上（"最新的"、"怎么配置"）：当 query 的
-//     主体已经对齐（比如实体与概念都命中），这些残槽由 coverage 削弱权重即可，
-//     逐条硬判 insufficient 会把"能答的问题"错判成"不知道"。
-//     反过来，一个实体都没对上时，残槽正是"你问的维度我没有"，此时必须硬判。
-//
-// 内容槽 = 实体/概念/关系槽；字面量槽不算（它由词法通道直接可检）。
-func finalizeResidualRequired(entries []alignEntry, authoritative bool) {
-	if !authoritative {
-		return
-	}
-	content, matchedContent := 0, 0
-	for i := range entries {
-		if entries[i].slot.Kind == SlotLiteral {
-			continue
-		}
-		content++
-		if !entries[i].residual {
-			matchedContent++
-		}
-	}
-	if content == 0 {
-		return
-	}
-	for i := range entries {
-		if !entries[i].residual {
-			continue
-		}
-		if matchedContent == 0 || content == 1 {
-			entries[i].slot.Required = true
-		}
-	}
 }
 
 // matchByDefinition 用定义句词法包含度做对齐（不依赖 embedder）。

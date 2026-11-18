@@ -78,14 +78,26 @@ func TestHopWhitelistWorksAtIsOneHop(t *testing.T) {
 		t.Fatalf("Plan.Hops=%d, want 1", res.Plan.Hops)
 	}
 
-	// (2) 结果集：只有 1 跳的 m-b，两跳外的 m-c/m-d 绝不能出现。
+	// (2) 结果集：1 跳答案 m-b 必须出现；m-c/m-d 绝不能被 **graph 通道**走到。
+	//
+	// 断言口径在原意图（“works_at 只允许 1 跳”）上不变，只把观测面从 items 收窄到
+	// graph 证据：F3 给 relational 形态加上了 lexical 通道（词法能答就不该弃答），
+	// 而 m-c/m-d 的正文里就有“单位”二字，词法本来就能命中它们（与跳数无关）。
+	// 因此“不出现在 items 里”不再是跳数白名单的性质，而是词法相关性的性质；
+	// 真正的跳数证据是**它们不能被 graph 通道召回**（不挂任何边证据）。
 	ids := itemIDs(res.Items)
 	if !containsID(ids, "m-b") {
 		t.Fatalf("1 跳答案 m-b 未召回：items=%v", ids)
 	}
 	for _, banned := range []string{"m-c", "m-d"} {
-		if containsID(ids, banned) {
-			t.Fatalf("%s 在 works_at 的 2/3 跳之外，却被召回（跳数白名单失效）：items=%v", banned, ids)
+		for _, it := range res.Items {
+			if it.Memory.ID != banned {
+				continue
+			}
+			if len(it.GraphEvidence) != 0 {
+				t.Fatalf("%s 在 works_at 的 2/3 跳之外，却挂了图证据（跳数白名单失效）：%+v",
+					banned, it.GraphEvidence)
+			}
 		}
 	}
 
@@ -357,7 +369,8 @@ func TestFollowUpConceptFanoutIsImprecise(t *testing.T) {
 		t.Fatalf("Recall: %v", err)
 	}
 
-	pin(t, pinFollowUp, "F2", "节点→记忆按 concept 扇出，一抢全中且证据不可区分",
+	pinKnownLimitation(t, pinFollowUp, "F2", "节点→记忆按 concept 扇出，一抢全中且证据不可区分",
+		"P2 抽取质量（节点应近 1:1 对应记忆），本卡只修 P1 召回契约",
 		func() string {
 			if len(res.Items) < 5 {
 				return fmt.Sprintf("预期 5 条同概念记忆全部被召回，实际 %v（现象已变化）", itemIDs(res.Items))
@@ -372,13 +385,5 @@ func TestFollowUpConceptFanoutIsImprecise(t *testing.T) {
 				return fmt.Sprintf("预期全部条目挂同一条边证据，实际 %d/%d", sameEdge, len(res.Items))
 			}
 			return ""
-		},
-		func() string {
-			// 修复方向：映射应能区分具体节点（source_episode 或节点级记忆指针），
-			// 无关记忆不应因共享 concept 被召回。
-			if len(res.Items) <= 1 {
-				return ""
-			}
-			return fmt.Sprintf("仍因共享 concept 扇出 %d 条无关记忆：%v", len(res.Items), itemIDs(res.Items))
 		})
 }

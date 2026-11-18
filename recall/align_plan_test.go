@@ -184,7 +184,7 @@ func TestPlannerLaneRulesDeclarative(t *testing.T) {
 		ShapeFullWithAnchor: {LaneGraph: 0.5, LaneVector: 0.3, LaneLexical: 0.2},
 		ShapeFullNoAnchor:   {LaneLexical: 0.6, LaneVector: 0.4},
 		ShapeLiteral:        {LaneLexical: 1.0},
-		ShapeRelational:     {LaneGraph: 0.7, LaneVector: 0.3},
+		ShapeRelational:     {LaneGraph: 0.7, LaneVector: 0.3, LaneLexical: 0.2},
 	}
 	for shape, want := range rules {
 		got := p.laneWeights(shape)

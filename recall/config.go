@@ -111,8 +111,16 @@ func DefaultLaneRules() []LaneRule {
 			Lanes: []LaneWeight{
 				{Lane: LaneGraph, Weight: 0.7},
 				{Lane: LaneVector, Weight: 0.3},
+				// F3：关系型问句也必须算词法通道。
+				//
+				// 原先这里只有 graph+vector，于是「graph 没锚点 + vector 没 embedder」时
+				// 融合阶段只剩 0 路通道，返回 insufficient——而同一个 query 直接调
+				// Lexical.Search 是有命中的。记忆里的决策句（“从 session 换成 JWT”）
+				// 正是靠词法才能匹配上，丢掉它等于对最容易回答的一类问句弃答。
+				// 权重最低：关系型问句的主体仍是图，词法只做兼底。
+				{Lane: LaneLexical, Weight: 0.2},
 			},
-			Reason: "关系型问句：graph 主、vector 辅（未校准起点）",
+			Reason: "关系型问句：graph 主、vector 辅、lexical 兼底（未校准起点）",
 		},
 	}
 }

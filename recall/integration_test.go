@@ -441,7 +441,7 @@ func TestPlanIsAssertable(t *testing.T) {
 	if plan.Shape != recall.ShapeRelational {
 		t.Fatalf("Shape=%s, want relational", plan.Shape)
 	}
-	wantWeights := map[recall.LaneName]float64{recall.LaneGraph: 0.7, recall.LaneVector: 0.3}
+	wantWeights := map[recall.LaneName]float64{recall.LaneGraph: 0.7, recall.LaneVector: 0.3, recall.LaneLexical: 0.2}
 	if len(plan.Lanes) != len(wantWeights) {
 		t.Fatalf("Lanes=%+v, want %d 条", plan.Lanes, len(wantWeights))
 	}

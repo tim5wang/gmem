@@ -182,7 +182,24 @@ type Concept struct {
 	ParentID   string // 可空
 	Status     ConceptStatus
 	Definition string
+	// Origin 记录这条概念是怎么来的（D15）：空 = 显式声明，
+	// ConceptOriginImplicit = 写入时因 concept_id 不存在而隐式落成的草稿。
+	//
+	// 为什么要单独一列而不是靠 status=draft 推断：certified 的概念也可能是
+	// 隐式长出来后被人认证的，那时仍需保留"它最初是隐式的"这条审计线索。
+	Origin ConceptOrigin
 }
+
+// ConceptOrigin 是概念的来源标记。
+type ConceptOrigin string
+
+const (
+	// ConceptOriginImplicit 表示该概念由写入路径隐式创建（D15 B 方案）。
+	//
+	// 这类概念必须是 draft：草稿永不参与硬契约，只在召回里按 StatusFactor 打折。
+	// 它们会随 agent 的随意输入增长，因此 P3 必须提供 Promote/Prune 清理路径。
+	ConceptOriginImplicit ConceptOrigin = "implicit"
+)
 
 // Alias 是 surface form 到节点的词典映射（L0 词典规则的最高置信来源）。
 type Alias struct {

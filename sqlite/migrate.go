@@ -165,6 +165,18 @@ func migrations() []migration {
 			Name:    "p0_versioned_fts",
 			Apply:   applyVersionedFTS,
 		},
+		{
+			// D15（B 方案）：concept_id 是**观察性引用**，不是准入门禁。
+			// v1/v4 给 memories.concept_id 与 nodes.concept_id 加了外键，导致写入
+			// 一个未声明的 concept 会 FOREIGN KEY constraint failed 并把整笔写入
+			// （含 FTS）一起回滚——直接违背 D1/R1「本体不拒绝写入」。
+			//
+			// 同时补 concepts.origin：记录概念是显式声明还是写入路径隐式落成的草稿。
+			// source_episode 的外键**必须保留**（血缘约束有意义），见 v1 的现状不动。
+			Version: 6,
+			Name:    "p1_concept_id_soft_ref",
+			Apply:   applyConceptIDSoftRef,
+		},
 	}
 }
 
@@ -341,6 +353,193 @@ func applyVersionedBitemporal(ctx context.Context, q querier) error {
 		}
 	}
 	return nil
+}
+
+// applyConceptIDSoftRef 是 D15 的 schema 侧：移除 memories.concept_id 与
+// nodes.concept_id 的外键，保留 source_episode 的外键，并补 concepts.origin。
+//
+// 为什么必须重建表：SQLite 不支持 DROP CONSTRAINT。重建顺序是刻意的：
+// nodes 被 edges/aliases 用外键引用，直接 DROP nodes 会让这两个子表的外键悬空，
+// 提交时整笔事务报 FOREIGN KEY constraint failed（已实测）。
+// 因此在同一事务内**先重建子表并把它们指向新父表**，再删旧父表、统一改名：
+// 改名后 SQLite 会把子表的外键一并重定向到新表名，约束因此完整保留。
+//
+// 幂等性：schema_migrations 丢失后整个清单会被重跑，因此先查 concept_id 上
+// 是否还有外键，没有就只补列与索引，绝不第二次拷贝数据。
+func applyConceptIDSoftRef(ctx context.Context, q querier) error {
+	memoriesFK, err := foreignKeyExists(ctx, q, "memories", "concept_id")
+	if err != nil {
+		return err
+	}
+	nodesFK, err := foreignKeyExists(ctx, q, "nodes", "concept_id")
+	if err != nil {
+		return err
+	}
+
+	if memoriesFK {
+		if err := rebuildTable(ctx, q, "memories", memoriesV6DDL("memories_v6"), memoryCols); err != nil {
+			return fmt.Errorf("sqlite: migration 6 (memories): %w", err)
+		}
+	}
+	if nodesFK {
+		if err := rebuildGraphTables(ctx, q); err != nil {
+			return fmt.Errorf("sqlite: migration 6 (graph): %w", err)
+		}
+	}
+
+	// 索引在重建后需要补回（重复 CREATE INDEX IF NOT EXISTS 无害）。
+	for _, stmt := range memoriesIndexes {
+		if _, err := q.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("sqlite: migration 6 index: %w", err)
+		}
+	}
+
+	// concepts.origin：ALTER TABLE ADD COLUMN 幂等由列判断保证。
+	hasOrigin, err := tableHasColumn(ctx, q, "concepts", "origin")
+	if err != nil {
+		return err
+	}
+	if !hasOrigin {
+		if _, err := q.ExecContext(ctx,
+			`ALTER TABLE concepts ADD COLUMN origin TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("sqlite: migration 6 (concepts.origin): %w", err)
+		}
+	}
+	return nil
+}
+
+// memoriesV6DDL 返回与 v4 同构、但 concept_id 不再带外键的 memories 表 DDL。
+// source_episode 的外键刻意保留（D15 明确要求）。
+func memoriesV6DDL(table string) string {
+	return `CREATE TABLE ` + table + ` (
+	id             TEXT    NOT NULL,
+	version        INTEGER NOT NULL DEFAULT 1,
+	scope          TEXT    NOT NULL CHECK (scope IN ('user','agent','project','global')),
+	concept_id     TEXT,
+	kind           TEXT    NOT NULL
+	               CHECK (kind IN ('semantic','episodic','procedural','decision')),
+	content        TEXT    NOT NULL,
+	t_valid        INTEGER NOT NULL DEFAULT 0,
+	t_invalid      INTEGER,
+	t_created      INTEGER NOT NULL DEFAULT 0,
+	t_expired      INTEGER,
+	source_episode TEXT REFERENCES episodes(id),
+	importance     REAL    NOT NULL DEFAULT 0.5,
+	recall_count   INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (id, version)
+)`
+}
+
+var memoriesIndexes = []string{
+	`CREATE INDEX IF NOT EXISTS idx_memories_scope_bi ON memories(scope, t_invalid, t_valid)`,
+	`CREATE INDEX IF NOT EXISTS idx_memories_concept_id ON memories(concept_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_memories_source_episode ON memories(source_episode)`,
+	`CREATE INDEX IF NOT EXISTS idx_memories_current ON memories(id, t_expired)`,
+}
+
+// rebuildTable 用"建新表 → 拷数据 → 删旧表 → 改名"重建一张表。
+//
+// 表名只来自本包常量（不拼接外部输入），因此这里直接用字符串拼 SQL。
+func rebuildTable(ctx context.Context, q querier, name, ddl, cols string) error {
+	tmp := name + "_v6"
+	stmts := []string{
+		`DROP TABLE IF EXISTS ` + tmp,
+		ddl,
+		`INSERT INTO ` + tmp + ` (` + cols + `) SELECT ` + cols + ` FROM ` + name,
+		`DROP TABLE ` + name,
+		`ALTER TABLE ` + tmp + ` RENAME TO ` + name,
+	}
+	for _, stmt := range stmts {
+		if _, err := q.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// rebuildGraphTables 重建 nodes（去掉 concept_id 外键）及其两个子表 edges/aliases。
+//
+// 子表必须先指向**新**父表再删旧父表：否则 DROP nodes 时子表外键指向不存在的表，
+// 整个事务在提交时失败。这里用同一套三步法，父表改名后子表的外键自动重定向。
+func rebuildGraphTables(ctx context.Context, q querier) error {
+	stmts := []string{
+		`DROP TABLE IF EXISTS nodes_v6`,
+		`CREATE TABLE nodes_v6 (
+			id             TEXT PRIMARY KEY,
+			scope          TEXT NOT NULL CHECK (scope IN ('user','agent','project','global')),
+			concept_id     TEXT,
+			canonical_name TEXT NOT NULL,
+			props_json     TEXT NOT NULL DEFAULT '{}',
+			source_episode TEXT REFERENCES episodes(id)
+		)`,
+		`INSERT INTO nodes_v6 (id, scope, concept_id, canonical_name, props_json, source_episode)
+		 SELECT id, scope, concept_id, canonical_name, props_json, source_episode FROM nodes`,
+		`DROP TABLE IF EXISTS edges_v6`,
+		`CREATE TABLE edges_v6 (
+			id         TEXT    NOT NULL,
+			version    INTEGER NOT NULL DEFAULT 1,
+			from_id    TEXT    NOT NULL REFERENCES nodes_v6(id),
+			to_id      TEXT    NOT NULL REFERENCES nodes_v6(id),
+			relation   TEXT    NOT NULL,
+			weight     REAL    NOT NULL DEFAULT 1.0,
+			t_valid    INTEGER NOT NULL DEFAULT 0,
+			t_invalid  INTEGER,
+			t_created  INTEGER NOT NULL DEFAULT 0,
+			t_expired  INTEGER,
+			PRIMARY KEY (id, version)
+		)`,
+		`INSERT INTO edges_v6 (id, version, from_id, to_id, relation, weight, t_valid, t_invalid,
+			t_created, t_expired)
+		 SELECT id, version, from_id, to_id, relation, weight, t_valid, t_invalid,
+			t_created, t_expired FROM edges`,
+		`DROP TABLE IF EXISTS aliases_v6`,
+		`CREATE TABLE aliases_v6 (
+			surface    TEXT NOT NULL,
+			node_id    TEXT NOT NULL REFERENCES nodes_v6(id),
+			source     TEXT NOT NULL DEFAULT '',
+			confidence REAL NOT NULL DEFAULT 0,
+			PRIMARY KEY (surface, node_id)
+		)`,
+		`INSERT INTO aliases_v6 (surface, node_id, source, confidence)
+		 SELECT surface, node_id, source, confidence FROM aliases`,
+		// 先删子表，再删父表：父表被引用时直接 DROP 会违反外键。
+		`DROP TABLE edges`,
+		`DROP TABLE aliases`,
+		`DROP TABLE nodes`,
+		`ALTER TABLE nodes_v6 RENAME TO nodes`,
+		`ALTER TABLE edges_v6 RENAME TO edges`,
+		`ALTER TABLE aliases_v6 RENAME TO aliases`,
+		`CREATE INDEX IF NOT EXISTS idx_nodes_scope_name ON nodes(scope, canonical_name)`,
+		`CREATE INDEX IF NOT EXISTS idx_nodes_concept_id ON nodes(concept_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_edges_from_rel ON edges(from_id, relation)`,
+		`CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_edges_rel_bi ON edges(relation, t_invalid)`,
+		`CREATE INDEX IF NOT EXISTS idx_edges_current ON edges(id, t_expired)`,
+		`CREATE INDEX IF NOT EXISTS idx_aliases_node_id ON aliases(node_id)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := q.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// foreignKeyExists 报告 table 的 column 上是否存在外键约束。
+func foreignKeyExists(ctx context.Context, q querier, table, column string) (bool, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT COUNT(1) FROM pragma_foreign_key_list(?) WHERE "from" = ?`, table, column)
+	if err != nil {
+		return false, fmt.Errorf("sqlite: fk list %s.%s: %w", table, column, err)
+	}
+	defer rows.Close()
+	var n int
+	if rows.Next() {
+		if err := rows.Scan(&n); err != nil {
+			return false, fmt.Errorf("sqlite: scan fk list %s.%s: %w", table, column, err)
+		}
+	}
+	return n > 0, rows.Err()
 }
 
 // tableExists 报告表（含虚表）是否存在。

@@ -170,12 +170,18 @@ func insertMemory(ctx context.Context, q querier, m store.Memory, version int) e
 //   - 与当前版本完全等价的重写 → 幂等空操作（不动 t_invalid / t_expired）；
 //   - 内容或时间戳不同 → 插入 version+1，并把旧版本置 t_expired（系统时间轴的真实写入路径）；
 //   - 旧版本若已 t_invalid（世界时间失效），新版本继承该 t_invalid，避免"已失效事实复活"（B-2）。
+//
+// D15：concept_id 不是准入门禁。指向未声明概念时**隐式建 draft 概念**后正常写入，
+// 绝不因本体没长出来而拒写（D1/R1）。
 func (s *storeImpl) PutMemory(ctx context.Context, m store.Memory) error {
 	if err := m.Validate(); err != nil {
 		return err
 	}
 	q, err := s.c.querier(ctx)
 	if err != nil {
+		return err
+	}
+	if err := ensureConcept(ctx, q, m.ConceptID); err != nil {
 		return err
 	}
 
@@ -414,7 +420,38 @@ func (s *storeImpl) TouchRecall(ctx context.Context, id string) error {
 // concepts
 // ---------------------------------------------------------------------------
 
-const conceptCols = `id, name, parent_id, status, definition`
+const conceptCols = `id, name, parent_id, status, definition, origin`
+
+// ensureConcept 落实 D15：concept_id 指向的概念若不存在，就**隐式落成 draft**。
+//
+// 为什么放在存储层而不是 recall.Writer：外键曾在这里拒写，"不拒绝写入"也必须在
+// 这里成立。任何写入路径（Writer 或直接 Store）都得同一个行为，否则绕过 Writer 的
+// 调用方会拿到 787 而不是一条可用记忆。
+//
+// draft 干干永不参与硬契约（召回侧按 StatusFactor 打折），因此隐式创建不会让噪声
+// 概念污染召回；代价是草稿表会增长，P3 的 Promote/Prune 负责清理。
+func ensureConcept(ctx context.Context, q querier, conceptID string) error {
+	if conceptID == "" {
+		return nil
+	}
+	var one int
+	err := q.QueryRowContext(ctx, `SELECT 1 FROM concepts WHERE id = ?`, conceptID).Scan(&one)
+	switch {
+	case err == nil:
+		return nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("sqlite: check concept %q: %w", conceptID, err)
+	}
+	// 名称取 id（确定性、可追溯）；正文片段取首个可命名片段属于 P2 的抽取质量，不在此处猜。
+	if _, err := q.ExecContext(ctx,
+		`INSERT OR IGNORE INTO concepts (id, name, parent_id, status, definition, origin)
+		 VALUES (?, ?, NULL, ?, '', ?)`,
+		conceptID, conceptID, string(store.ConceptDraft), string(store.ConceptOriginImplicit),
+	); err != nil {
+		return fmt.Errorf("sqlite: implicit concept %q: %w", conceptID, err)
+	}
+	return nil
+}
 
 func (s *storeImpl) PutConcept(ctx context.Context, c store.Concept) error {
 	if err := c.Validate(); err != nil {
@@ -425,11 +462,12 @@ func (s *storeImpl) PutConcept(ctx context.Context, c store.Concept) error {
 		return err
 	}
 	_, err = q.ExecContext(ctx, `
-		INSERT INTO concepts (`+conceptCols+`) VALUES (?, ?, ?, ?, ?)
+		INSERT INTO concepts (`+conceptCols+`) VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, parent_id=excluded.parent_id,
-			status=excluded.status, definition=excluded.definition`,
-		c.ID, c.Name, nullableText(c.ParentID), string(c.Status), c.Definition)
+			status=excluded.status, definition=excluded.definition,
+			origin=excluded.origin`,
+		c.ID, c.Name, nullableText(c.ParentID), string(c.Status), c.Definition, string(c.Origin))
 	if err != nil {
 		return fmt.Errorf("sqlite: put concept %q: %w", c.ID, err)
 	}
@@ -443,9 +481,9 @@ func (s *storeImpl) GetConcept(ctx context.Context, id string) (store.Concept, e
 	}
 	var c store.Concept
 	var parentID sql.NullString
-	var status string
+	var status, origin string
 	err = q.QueryRowContext(ctx, `SELECT `+conceptCols+` FROM concepts WHERE id = ?`, id).
-		Scan(&c.ID, &c.Name, &parentID, &status, &c.Definition)
+		Scan(&c.ID, &c.Name, &parentID, &status, &c.Definition, &origin)
 	if errors.Is(err, sql.ErrNoRows) {
 		return store.Concept{}, store.ErrNotFound
 	}
@@ -454,6 +492,7 @@ func (s *storeImpl) GetConcept(ctx context.Context, id string) (store.Concept, e
 	}
 	c.ParentID = fromNullableText(parentID)
 	c.Status = store.ConceptStatus(status)
+	c.Origin = store.ConceptOrigin(origin)
 	return c, nil
 }
 
