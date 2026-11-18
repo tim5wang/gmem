@@ -593,16 +593,23 @@ func (b *OpsBackend) CountConceptRefs(ctx context.Context, conceptID string) (in
 	return n, nil
 }
 
-// ListStaleDrafts 返回 scope 内笔“活得太久”且无引用的 draft 概念。
+// ListStaleDrafts 返回 scope 内“活得太久”且无引用的 draft 概念。
 //
-// # 时间基准必须是 MAX(最后使用, 创建时间)（F-1）
+// # 时间基准：有使用记录信使用时间，否则信创建时间（F-1）
 //
 // 旧实现把缺失的统计行登记成 last_used_at=0，而 cutoff=now-TTL 恒为正，
 // 于是 0 <= cutoff 恒真：**刚创建的稿子第一次 Prune 就被删**。
 // 那不是“清过期草稿”，而是“清所有无引用的新稿子”——D15 的反面，且不可恢复。
 //
-// 现在两路取大：有过使用记录就按使用时间，没有就按创建时间（v8 的 concepts.created_at）。
+// 现在：有过真实使用（last_used_at > 0）就按使用时间，否则按创建时间
+// （v8 的 concepts.created_at，由 PutConcept 兼底保证非 0）。
 // 因此“刚建且从未使用”的稿子至少能活一个完整 TTL。
+//
+// # 为什么不是 MAX(last_used_at, created_at)
+//
+// created_at 来自**墙钟**（PutConcept 里的 time.Now），而 cutoff 来自调用方的时钟；
+// 两者来源不同（测试里甚至是不同维度的时间），取大值会选到“未来”时间，
+// 把本该过期的旧稿子永远留在库里（清理失效）。以“最近一次真实使用”优先才符合 D15。
 //
 // 为什么不再“首次见到即登记”（旧实现的副作用）：
 // 那条 INSERT 正是缺陷的源头，而且让一个**读路径**在生产事务里写行。
@@ -626,9 +633,13 @@ func (b *OpsBackend) ListStaleDrafts(ctx context.Context, scope store.Scope, cut
 		FROM concepts c LEFT JOIN concept_usage u ON u.concept_id = c.id
 		WHERE c.status = ?
 		  AND (c.scope = ? OR c.scope = '')
-		  AND CASE WHEN COALESCE(u.last_used_at, 0) > COALESCE(c.created_at, 0)
+		  -- 时间基准：有使用记录就信它，否则用创建时间。
+		  -- 不能用 MAX(last_used_at, created_at)：created_at 来自墙钟（PutConcept 兜底用的
+		  -- time.Now），而 cutoff 来自调用方的时钟；两者混用时 MAX 会取到“未来”时间，
+		  -- 把本该过期的旧稿子永远留在库里（清理失效）。以“最近一次真实使用”优先才符合 D15。
+		  AND CASE WHEN COALESCE(u.last_used_at, 0) > 0
 		           THEN COALESCE(u.last_used_at, 0) ELSE COALESCE(c.created_at, 0) END <= ?
-		ORDER BY CASE WHEN COALESCE(u.last_used_at, 0) > COALESCE(c.created_at, 0)
+		ORDER BY CASE WHEN COALESCE(u.last_used_at, 0) > 0
 		              THEN COALESCE(u.last_used_at, 0) ELSE COALESCE(c.created_at, 0) END ASC,
 		         c.id ASC`
 	args := []any{string(store.ConceptDraft), string(scope), cutoff}

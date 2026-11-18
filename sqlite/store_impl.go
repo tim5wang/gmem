@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/tim5wang/gmem/store"
 )
@@ -460,6 +461,24 @@ func ensureConcept(ctx context.Context, q querier, conceptID string, scope store
 func (s *storeImpl) PutConcept(ctx context.Context, c store.Concept) error {
 	if err := c.Validate(); err != nil {
 		return err
+	}
+	// created_at 兜底（F-1，**真实写入路径**的必修项）。
+	//
+	// # 为什么必须在这里
+	//
+	// DraftTTL 的判定是 MAX(last_used_at, created_at) <= cutoff。若 created_at 是 0，
+	// 而「从未被使用」的草稿又没有 usage 行（last_used_at 也按 0 算），判定就恒为真——
+	// 刚创建的隐式 draft 在第一次 Prune 就被删（数据丢失级）。
+	//
+	// 光靠 v8 迁移不够：它只回填**迁移时刻已存在**的行（新列 DEFAULT 0）。
+	// 而 `extract/pipeline.go` 造概念建议时并不填 CreatedAt，于是**迁移之后**新建的
+	// 隐式 draft 全都是 0，F-1 的症状原样存在。
+	//
+	// 放在 PutConcept 而不是各个调用点：这是概念的**唯一写入口**（存储层是卡口），
+	// 新增调用方不可能忘。ON CONFLICT 分支里的“只补空值”语义与这里配套：
+	// 已有 created_at 的概念不会被重写改写为“创建于现在”。
+	if c.CreatedAt == 0 {
+		c.CreatedAt = time.Now().UnixMilli()
 	}
 	q, err := s.c.querier(ctx)
 	if err != nil {

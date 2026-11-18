@@ -133,6 +133,54 @@ func TestStructuredDraftIsNotImmediatelyPruned(t *testing.T) {
 	}
 }
 
+// TestPutConceptWithoutCreatedAtIsNotImmediatelyPruned 是 F-1 在**真实写入路径**上的回归。
+//
+// # 为什么这条必须单独存在
+//
+// 上面的用例走 PutMemory → ensureConcept，那条路本来就会把 created_at 填成记忆的
+// TCreated，因此它**绕开**了本缺陷。真正会漏的是直接调 PutConcept 的调用方——
+// extract/pipeline.go:416 造定义句 draft 时就不填 CreatedAt，v8 迁移只回填
+// “迁移时刻已存在”的行，于是迁移之后新建的隐式 draft 全都是 created_at=0，
+// 判定依旧恒真，F-1 的症状原样存在。
+//
+// 变异点：去掉 PutConcept 里的 `if c.CreatedAt == 0 { c.CreatedAt = now }` 兜底 →
+// 第一条断言必红。
+func TestPutConceptWithoutCreatedAtIsNotImmediatelyPruned(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+
+	// 完全按 extract/pipeline.go 的形态造 draft：不设 CreatedAt、不设 Scope。
+	if err := e.db.Store().PutConcept(ctx, store.Concept{
+		ID: "c-pipe", Name: "c-pipe", Status: store.ConceptDraft,
+		Definition: "定义句", Origin: store.ConceptOriginImplicit,
+	}); err != nil {
+		t.Fatalf("PutConcept(c-pipe): %v", err)
+	}
+	// 另一条显式给定“超过 TTL”的创建时间：必须被清掉（证明不是把恒真改成恒假）。
+	oldMs := e.clk.Now().Add(-90 * 24 * time.Hour).UnixMilli()
+	if err := e.db.Store().PutConcept(ctx, store.Concept{
+		ID: "c-pipe-old", Name: "c-pipe-old", Status: store.ConceptDraft,
+		Origin: store.ConceptOriginImplicit, CreatedAt: oldMs, Scope: store.ScopeUser,
+	}); err != nil {
+		t.Fatalf("PutConcept(c-pipe-old): %v", err)
+	}
+
+	// 前置：兜底必须真的把 created_at 写成非 0（0 = 判定恒真）。
+	if got := e.countRows(`SELECT COUNT(1) FROM concepts WHERE id='c-pipe' AND created_at > 0`); got != 1 {
+		t.Fatalf("PutConcept 未给 created_at 兜底：它仍是 0，DraftTTL 会把它判成“很久以前”")
+	}
+
+	e.mustRun(ops.Request{Op: ops.OpPrune, Scope: store.ScopeUser,
+		Input: ops.Input{DraftTTLSeconds: 30 * 24 * 3600}})
+
+	if got := e.countRows(`SELECT COUNT(1) FROM concepts WHERE id='c-pipe'`); got != 1 {
+		t.Errorf("刚创建（0 秒龄）的 draft 进了 Prune 计划并被删除——F-1 在真实写入路径上仍存在")
+	}
+	if got := e.countRows(`SELECT COUNT(1) FROM concepts WHERE id='c-pipe-old'`); got != 0 {
+		t.Errorf("超过 TTL 且无引用的 draft 未被删除（清理失效）")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // F-2 / F-3【阻塞】Debouncer generation token
 // ---------------------------------------------------------------------------
