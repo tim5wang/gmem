@@ -24,6 +24,7 @@
 | **D10** | LLMClient 保留**轻量 tool-calling**，支持多轮查询后再产出 | `Complete` 仍是单轮 primitive，**循环由 Gmem 拥有**，收敛由 Gmem 硬约束（§3.2） | §3.2 |
 | **D11** | P4 做**内嵌前端** | 允许引入前端库与构建链（Node 作为**开发期**依赖可以接受）；产物 `//go:embed` 进二进制，运行时零外部依赖 | §9 |
 | **D12** | 双时态采用**系统时间版本化**（B-4/B-5 裁决） | `memories`/`edges` 主键改为 `(id, version)`；`Update` 插新版并把旧版置 `t_expired`；默认读当前版本，`as_of` 按版本区间选；FTS 索引所有版本 | §2 |
+| **D13** | 只有**内容承载字段**变更才产生新版本 | `recall_count` / `last_recalled_at` 等运营计数**就地更新**，不得版本化（否则召回即版本爆炸）；FTS 也必须按 `(id, version)` 索引并携带版本，否则 `as_of` 词法召回静默漏旧版 | §2 |
 
 **三条核心取舍，都必须先认下来：**
 
@@ -171,11 +172,12 @@ erDiagram
    - **世界时间** `t_valid` / `t_invalid`：这个事实**在现实世界中**何时成立。矛盾发生 → 只置 `t_invalid`，**永不物理删除**。
    - **系统时间** `t_created` / `t_expired`：**系统何时知道/何时不再认为它是当前版本**。`Update` 不改行，而是**插入新版本并把旧版本置 `t_expired`**。
 3. **版本化主键 `(id, version)`**：`id` 是用户可见的逻辑身份，`version` 从 1 递增。**默认读取 = 当前版本（`t_expired IS NULL`）**；`as_of` 选 `t_created ≤ as_of < t_expired` 的版本。这一条是 B-4 的裁决 —— 若不版本化，`t_created`/`t_expired` 就是两列死字段，双时态退化成单时态。
+   - **什么才算新版本（D13）**：只有**内容承载字段**变化才生成新版本（`content`、`kind`、`concept_id`、`t_valid`、`t_invalid`、`source_episode`、`importance`）。**运营计数类字段（`recall_count`、`last_recalled_at`）一律不得产生版本**，它们应就地更新或被移出主表。否则每被召回一次就多一个版本，叠加 per-version FTS 会直接把库撑爆。
 4. **`concepts.status` 是 D1 的关键**：`draft` / `certified` / `deprecated`。只有 `certified` 参与硬契约。这是让"本体不拒绝写入"能成立的机制——概念先以草稿累积，认证后才约束召回。
 
 **派生索引**：`memories_fts`（FTS5 + bigram 列）、`vec_blob`（int8 量化快照）。二者都可从主表重建。
 
-> **FTS 与版本的关系（B-5 裁决）**：FTS 索引**每一行的每个版本**，查询时 join 到 `memories(id, version)` 并按上述有效性规则过滤。代价是索引体积随版本数增长（常见情况仅 1–2 版，可接受）；收益是 `as_of` 与词法检索可以组合，不会出现"回溯查询静默少了词法通道"。
+> **FTS 与版本的关系（B-5 裁决）**：FTS 索引**每一行的每个版本**，查询时 join 到 `memories(id, version)` 并按上述有效性规则过滤。因此 `memories_fts` 的主键语义是 `(id, version)` 而不是 `id`，`store.Hit` 必须能表达版本。代价是索引体积随版本数增长（配合 D13 后常见情况仅 1–2 版，可接受）；收益是 `as_of` 与词法检索可以组合，不会出现"回溯查询静默少了词法通道"。
 
 > **范围隔离是 Port 契约的一部分**：`NeighborQuery` 等一切查询**必须带 `Scope` 且在后端强制过滤**。漏一个字段就是跨 scope 泄漏（review 实测曾出现 user→agent 的边），这不是性能问题而是隔离缺陷。
 
