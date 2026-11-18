@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tim5wang/gmem/store"
@@ -28,10 +30,10 @@ type LLMExtractor struct {
 	// SystemPrompt / ResponseSchema 允许宿主整段覆盖（§3.1 责任边界第 1 条）。
 	SystemPrompt   string
 	ResponseSchema json.RawMessage
-	// last 是最近一次 Extract 的轨迹（由 LastTrajectory 暴露）。
-	//
-	// 它只被 LoopOwned 的调用点写一次，且测试是串行跑的；
-	// 若同一 Extractor 被并发使用，语义是"最后一次"，不影响抽取结果。
+	// mu 保护 last：同一个 LLMExtractor 被并发使用（例如一个 scope 一个 goroutine
+	// 并发跑 Pipeline.Run）是正常用法，「测试是串行跑的」不是库的契约。
+	mu sync.Mutex
+	// last 是最近一次 Extract 的轨迹（由 LastTrajectory 暴露）。语义是「最后一次」。
 	last Trajectory
 }
 
@@ -166,13 +168,19 @@ type Trajectory struct {
 	DuplicateCalls int
 	// NoProgressRounds 是连续无进展的轮数（用于 G4 判定）。
 	NoProgressRounds int
+	// RepairRetries 是修复式重试次数（它计入轮配额，见 M4）。
+	RepairRetries int
 }
 
 // LastTrajectory 返回最近一次 Extract 的轨迹（供测试与 doctor 观测）。
 //
 // 刻意做成方法而不是返回值字段：ExtractResult 是两条 LLM 路径共用的形状（§3.3），
 // 不应掺入 Gmem 内部的收敛细节。
-func (x *LLMExtractor) LastTrajectory() Trajectory { return x.last }
+func (x *LLMExtractor) LastTrajectory() Trajectory {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.last
+}
 
 // Extract 执行一次 L2 抽取，内含多轮 tool-calling 循环。
 //
@@ -212,7 +220,14 @@ func (x *LLMExtractor) Extract(ctx context.Context, req ExtractRequest) (Extract
 	// LLMClient 是**单轮 primitive**（没有 message 历史），因此上下文只能由 Gmem 拼装。
 	var transcript []string
 	seenCalls := make(map[string]struct{}, 8)
+	// seenResultIDs 是已见过的结果 id（node/edge/memory）。
+	// G4 的"无进展"必须是"无**新增**结果"：只数 len(Items) 的话，模型换个说法
+	// 反复命中同一行就永远不会被 G4 收口（M1）。
+	seenResultIDs := make(map[string]struct{}, 16)
 	turns := 0
+	// spent 是已用掉的**轮配额**：工具轮与修复式重试都计入。
+	// 它保证"总调用次数 <= MaxTurns+1"是真硬上界（M4），而不是"工具轮 + 1 + 重试"。
+	spent := 0
 	noProgress := 0
 	budgetExceeded := false
 	wallClockExceeded := false
@@ -220,7 +235,9 @@ func (x *LLMExtractor) Extract(ctx context.Context, req ExtractRequest) (Extract
 	defer func() {
 		traj.Duration = cfg.now().Sub(start)
 		traj.NoProgressRounds = noProgress
+		x.mu.Lock()
 		x.last = traj
+		x.mu.Unlock()
 	}()
 
 	for {
@@ -239,7 +256,7 @@ func (x *LLMExtractor) Extract(ctx context.Context, req ExtractRequest) (Extract
 			reason = GateWallClock
 		case budgetExceeded || (cfg.TokenBudget > 0 && traj.Tokens >= cfg.TokenBudget):
 			reason = GateTokenBudget
-		case turns >= cfg.MaxTurns:
+		case turns >= cfg.MaxTurns || spent >= cfg.MaxTurns:
 			reason = GateMaxTurns
 		case noProgress >= 2:
 			reason = GateNoProgress
@@ -268,15 +285,22 @@ func (x *LLMExtractor) Extract(ctx context.Context, req ExtractRequest) (Extract
 		}
 
 		// G5：墙钟到点后只给一次极短的收尾窗口（FinalGrace），拿不到就降级返回。
-		callCtx := ctx
+		//
+		// **工具轮也必须带 deadline**（B-2）：如果只在强制终稿轮设超时，
+		// 宿主客户端卡在工具轮时 Gmem 没有任何中断手段，WallClock 对在飞调用
+		// 完全无效（实测 20ms 配置跑了 610ms）。
+		//
+		// 强制终稿轮用 now+FinalGrace（而不是 deadline+FinalGrace）：那时的语义是
+		// "已经决定收口，再给一次极短机会"，不应再等满整个 WallClock。
+		var callCtx context.Context
 		var cancel context.CancelFunc
-		if !allowTools {
+		if allowTools {
+			callCtx, cancel = context.WithDeadline(ctx, deadline)
+		} else {
 			callCtx, cancel = context.WithTimeout(ctx, cfg.FinalGrace)
 		}
 		resp, err := x.client.Complete(callCtx, llmReq)
-		if cancel != nil {
-			cancel()
-		}
+		cancel()
 		traj.Calls++
 		if resp.Model != "" {
 			traj.Models = append(traj.Models, resp.Model)
@@ -305,27 +329,35 @@ func (x *LLMExtractor) Extract(ctx context.Context, req ExtractRequest) (Extract
 				return res, nil
 			}
 			// 解析失败：**不静默丢弃**（§3.1）。只在门禁未触发时重试 1 次，
-			// 因为强制终稿那一轮不允许再花一次调用（否则总调用次数会超出 MaxTurns+1，
-			// D10 的断言就不再是硬保证）。
-			if !traj.ForcedFinal && turns < cfg.MaxTurns {
+			// 且重试**占用轮配额**（spent++）：否则总调用次数会变成 MaxTurns+2，
+			// D10 的"总调用 == MaxTurns+1"就不再是硬上界（M4）。
+			if !traj.ForcedFinal && spent < cfg.MaxTurns {
 				transcript = append(transcript,
 					"【系统】上一轮输出无法解析："+perr.Error()+"。请只输出修正后的 JSON 对象。")
-				// 用一次独立的修复式重试，不计入工具轮；仍失败则降级。
-				fixResp, fixErr := x.client.Complete(ctx, LLMRequest{
+				spent++
+				traj.RepairRetries++
+				fixCtx, fixCancel := context.WithDeadline(ctx, deadline)
+				fixResp, fixErr := x.client.Complete(fixCtx, LLMRequest{
 					System: x.SystemPrompt, User: x.buildUserPrompt(req, transcript),
 					JSONSchema: x.ResponseSchema, MaxTokens: cfg.MaxTokens, Temperature: 0,
 				})
+				fixCancel()
 				traj.Calls++
 				traj.Tokens += fixResp.Usage.Tokens()
 				if fixResp.Model != "" {
 					traj.Models = append(traj.Models, fixResp.Model)
 				}
-				if fixErr == nil {
-					if fixed, ferr := x.parsePayload(fixResp.Text); ferr == nil {
-						res.Degraded = append(res.Degraded, "L2 终稿首次解析失败，修复式重试成功："+perr.Error())
-						x.applyPayload(fixed, req, &res)
+				if fixErr != nil {
+					if errors.Is(fixErr, context.DeadlineExceeded) || errors.Is(fixErr, context.Canceled) {
+						res.Degraded = append(res.Degraded, fmt.Sprintf(
+							"L2 中断：修复式重试超时/取消（%v）", fixErr))
+						traj.Gates = appendUnique(traj.Gates, GateWallClock)
 						return res, nil
 					}
+				} else if fixed, ferr := x.parsePayload(fixResp.Text); ferr == nil {
+					res.Degraded = append(res.Degraded, "L2 终稿首次解析失败，修复式重试成功："+perr.Error())
+					x.applyPayload(fixed, req, &res)
+					return res, nil
 				}
 				res.Degraded = append(res.Degraded, "L2 终稿解析失败（含修复式重试）："+perr.Error())
 				return res, nil
@@ -344,12 +376,15 @@ func (x *LLMExtractor) Extract(ctx context.Context, req ExtractRequest) (Extract
 
 		// ---- 执行工具（只读、有行数上限、hops 硬上限 1） ----
 		executed := 0
-		roundItems := 0
+		// rejected 是本轮被 G3 拒掉的跳数；newIDs 是本轮首次出现的**结果 id**数。
+		rejected := 0
+		newIDs := 0
 		for _, call := range resp.ToolCalls {
 			key := normalizeCall(call)
 			if _, dup := seenCalls[key]; dup {
 				// G3：直接拒这一跳，不再回注（也不重复花钱）。
 				traj.DuplicateCalls++
+				rejected++
 				traj.Gates = appendUnique(traj.Gates, GateDuplicate)
 				transcript = append(transcript, fmt.Sprintf(
 					"【工具 %s】该查询与之前完全相同，已被去重拒绝；请基于已有结果产出终稿。", call.Name))
@@ -362,16 +397,35 @@ func (x *LLMExtractor) Extract(ctx context.Context, req ExtractRequest) (Extract
 				transcript = append(transcript, fmt.Sprintf("【工具 %s 失败】%v", call.Name, toolErr))
 				continue
 			}
-			roundItems += len(out.Items)
+			for _, id := range out.resultIDs() {
+				if _, ok := seenResultIDs[id]; ok {
+					continue
+				}
+				seenResultIDs[id] = struct{}{}
+				newIDs++
+			}
 			transcript = append(transcript, formatToolResult(out))
 		}
 		turns++
+		spent++
 		traj.ToolRounds = turns
 
-		// G4：连续 2 轮工具结果为空/无新增节点 → 下一轮强制终稿。
-		if executed == 0 || roundItems == 0 {
+		// G4：连续 2 轮"无进展" → 下一轮强制终稿。
+		//
+		// "无进展"的口径是**本轮没有带来首次出现的 node/edge/memory id**（M1）。
+		// 旧口径只数 len(Items)，于是模型把同一条查询换个措辞（vim / vi / v）
+		// 反复命中同一行时 noProgress 永远归零、G4 永不触发。
+		//
+		// 但**全部跳都被 G3 拒掉的一轮不算无进展**（B-3）：那一轮模型根本没拿到
+		// 新证据，原因是我们自己拒绝执行，不是模型停滞。若把它计入，MaxTurns>=4 时
+		// 每一跳都被拒 → G4 在第 3 轮抢先收口 → D10 的 Calls==MaxTurns+1 在 4/5/6
+		// 上变成 4（这就是本次要修的阻塞）。
+		switch {
+		case executed == 0 && rejected > 0:
+			// G3 拒跳不叠加到 G4 上（也不重置：它既不是进展也不是停滞）。
+		case newIDs == 0:
 			noProgress++
-		} else {
+		default:
 			noProgress = 0
 		}
 		if cfg.now().After(deadline) {
@@ -556,30 +610,79 @@ func stripCodeFence(s string) string {
 	return strings.TrimSpace(t)
 }
 
-// normalizeCall 是 G3 的归一化键：工具名 + 排序后的参数（去空白、小写）。
+// normalizeCall 是 G3 的归一化键：工具名 + **该工具声明过的有效参数**（去空白、小写）。
 //
 // 归一化必须**不依赖 JSON 文本的字段顺序**：宿主模型每次序列化顺序可能不同，
 // 用原始 JSON 字符串比较会让"同一条查询"漏检。
+//
+// 同时不能把**空值参数**算进键（M2）：模型只要每轮多塞一个 `{"concept":""}`
+// 就能把同一条语义查询变成"新查询"，G3 就形同虚设。因此按工具声明逐个规约：
+// 空/缺省参数直接剔除，数值参数先夹到**真正生效**的值（hops<=1、k<=SearchLimit）。
 func normalizeCall(c ToolCall) string {
-	var key string
-	if len(c.Arguments) > 0 {
-		var m map[string]any
-		if err := json.Unmarshal(c.Arguments, &m); err == nil {
-			keys := make([]string, 0, len(m))
-			for k := range m {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			parts := make([]string, 0, len(keys))
-			for _, k := range keys {
-				parts = append(parts, strings.ToLower(k)+"="+normalizeValue(m[k]))
-			}
-			key = strings.Join(parts, "&")
-		} else {
-			key = normalizeValue(string(c.Arguments))
-		}
+	name := strings.ToLower(strings.TrimSpace(c.Name))
+	if len(c.Arguments) == 0 {
+		return name + "?"
 	}
-	return strings.ToLower(strings.TrimSpace(c.Name)) + "?" + key
+	var m map[string]any
+	if err := json.Unmarshal(c.Arguments, &m); err != nil {
+		return name + "?" + normalizeValue(string(c.Arguments))
+	}
+
+	// effective 是该工具真正生效的参数集合；nil 表示未知工具（回退到全参数）。
+	var effective map[string]string
+	switch name {
+	case ToolLookupEntity:
+		effective = map[string]string{"name": normalizeValue(m["name"])}
+		if v := normalizeValue(m["concept"]); v != "" {
+			effective["concept"] = v
+		}
+	case ToolNeighbors:
+		effective = map[string]string{"node_id": normalizeValue(m["node_id"])}
+		if v := normalizeValue(m["relation"]); v != "" {
+			effective["relation"] = v
+		}
+		// 无论模型给 0/1/3，工具侧都会夹到 HardMaxHops，语义等价。
+		effective["hops"] = strconv.Itoa(HardMaxHops)
+	case ToolSearchMemories:
+		effective = map[string]string{"query": normalizeValue(m["query"])}
+		// k 夹取后比较：k 缺省、k=0、k>上限 在工具侧得到同一个生效值。
+		k := defaultSearchLimit
+		if f, ok := m["k"].(float64); ok {
+			if n := int(f); n > 0 && n < k {
+				k = n
+			}
+		}
+		effective["k"] = strconv.Itoa(k)
+	}
+
+	keys := make([]string, 0, len(m))
+	parts := make([]string, 0, len(m))
+	if effective != nil {
+		for k, v := range effective {
+			if strings.TrimSpace(v) == "" {
+				continue // 空参不进键（M2）
+			}
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			parts = append(parts, k+"="+effective[k])
+		}
+		return name + "?" + strings.Join(parts, "&")
+	}
+
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := normalizeValue(m[k])
+		if v == "" {
+			continue // 未知工具也剔除空参：空值不可能改变查询语义
+		}
+		parts = append(parts, strings.ToLower(k)+"="+v)
+	}
+	return name + "?" + strings.Join(parts, "&")
 }
 
 func normalizeValue(v any) string {
@@ -587,7 +690,10 @@ func normalizeValue(v any) string {
 	case string:
 		return strings.Join(strings.Fields(strings.ToLower(t)), " ")
 	case float64:
-		return strings.TrimSuffix(strings.TrimSuffix(fmt.Sprintf("%f", t), "0"), ".")
+		// -1 精度直接输出最短表示：旧写法只剥一个尾零，1.10 与 1.1 会被判成不同。
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case nil:
+		return ""
 	default:
 		b, err := json.Marshal(v)
 		if err != nil {

@@ -3,7 +3,6 @@ package p2verify
 import (
 	"context"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -38,7 +37,24 @@ func newExtractor(t *testing.T, cfg extract.Config, client extract.LLMClient) (*
 	d := openMemoryDB(t)
 	seedNode(t, d, "n-vim", "vim")
 	seedAlias(t, d, "vim", "n-vim", 0.99)
+	// 为 D10 的“每轮不同查询”夹具再种一批**互不相同**的行。
+	//
+	// 为什么必须多行（M1 之后）：G4 的正确语义是“连续 2 轮无**新增**结果”，
+	// 所以“换一个措辞反复命中同一行”本来就该被 G4 收口。要隔离出 G1，
+	// 夹具必须让每轮真的拿到一条**新**结果，而不只是换一个查询字符串。
+	// 旧夹具只有 “vim” 一条，所以它测到的“每轮不同”是自欺的。
+	for i := 0; i < 12; i++ {
+		name := gatRowName(i)
+		sid := "n-" + name
+		seedNode(t, d, sid, name)
+		seedAlias(t, d, name, sid, 0.99)
+	}
 	return extract.NewLLMExtractor(client, d.Ports(), cfg), context.Background()
+}
+
+// gatRowName 返回第 i 条专用行的名字（0-based，两位数保证互不为子串）。
+func gatRowName(i int) string {
+	return "gtrow" + string(rune('a'+i/10)) + string(rune('a'+i%10))
 }
 
 // probeEpisode 是给 L2 的输入（内容只需合法，L2 的行为由 client 决定）。
@@ -49,13 +65,16 @@ func probeEpisode() extract.RawEpisode {
 	}
 }
 
-// distinctHittingNames 生成"每轮不同、且都能命中同一条 alias"的查询名。
+// distinctHittingNames 生成“每轮不同、且每轮命中**不同一行**”的查询名。
 //
-// 为什么用 `vim` + 递增的 `!`：lookup_entity 是**双向包含**匹配，
-// 任一含 "vim" 的串都会命中 "vim" 这条词典项；而它们的归一化键互不相同，
-// 因此既不触发 G3（同 query 重复），也不触发 G4（连续空结果）。
+// 为什么不能用 `vim` + 递增的 `!`：lookup_entity 是**双向包含**匹配，
+// 任何含 "vim" 的串都命中**同一条** alias。在 M1 修正后，G4 的判据是
+// “本轮无**新增**结果”，所以那样写会先被 G4 收口（MaxTurns>=4 时调用恒为 4）。
+// 那正是 B-3 现象的另一面：夹具自己把 G1 的隔离条件破坏了。
+// 这里每轮用一个独立行名（gtrowaa / gtrowab / …），既不重复（G3 不触发），
+// 又每轮都有新结果（G4 不触发），于是只剩 G1 能收口。
 func distinctHittingNames(n int) string {
-	return "vim" + strings.Repeat("!", n+1)
+	return gatRowName(n)
 }
 
 // TestD10ExactlyMaxTurnsPlusOne 是 D10 的**主判据**。
@@ -282,26 +301,39 @@ func TestG3RepeatedIdenticalQueryIsRejected(t *testing.T) {
 	mustContain(t, "回注上下文", same.lastUser(t), "已被去重拒绝")
 }
 
-// TestG3G4BoundUnboundedModel 是"不得死循环"的正面证明。
+// TestG3G4BoundUnboundedModel 是“不得死循环”的正面证明。
 //
-// 模型永远返回同一条查询、MaxTurns 给到 100：如果 G3/G4 有任一失效，
-// 这里会跑到 101 次调用（或在 Go 里跑到测试超时）。
+// 模型永远返回同一条查询、MaxTurns 给到 100：G1 必须把它在 MaxTurns+1 次调用内
+// 收口（D10 的硬等式）。
+//
+// # 为什么不再断言 “≤4 次”
+//
+// 旧断言成立的前提是 B-3 那个缺陷：G3 每轮拒跳都不计 executed，于是整轮被 G4
+// 误判为无进展，第 3 轮就强制终稿。修好 B-3 后，“同一条查询反复发”的正确结局
+// 是“每次都被 G3 拒、循环由 G1 在 MaxTurns 处收口”——它**不可能**在 4 次内收口，
+// 除非 MaxTurns≤3。保留的原意图不变：不得死循环、必须有门禁拦住、必须强制终稿。
 func TestG3G4BoundUnboundedModel(t *testing.T) {
+	const maxTurns = 100
 	llm := extract.NewRepeatingFakeLLM(extract.FakeStep{
 		ToolCalls: []extract.ToolCall{
 			extract.ToolCallJSON(extract.ToolLookupEntity, `{"name":"vim"}`),
 		},
 	})
-	x, ctx := newExtractor(t, extract.Config{MaxTurns: 100}, llm)
+	x, ctx := newExtractor(t, extract.Config{MaxTurns: maxTurns}, llm)
 	if _, err := x.Extract(ctx, extract.ExtractRequest{Episode: probeEpisode()}); err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
 	traj := x.LastTrajectory()
-	if calls := llm.CallCount(); calls > 4 {
-		t.Fatalf("重复查询应在 ≤4 次调用内收口（G3/G4），实际 %d 次", calls)
+	if calls := llm.CallCount(); calls != maxTurns+1 {
+		t.Fatalf("不得死循环，也不得提前放弃：应为 MaxTurns+1=%d 次调用，实际 %d 次（gates=%v）",
+			maxTurns+1, calls, traj.Gates)
 	}
-	if !hasGate(traj.Gates, extract.GateNoProgress) && !hasGate(traj.Gates, extract.GateDuplicate) {
-		t.Fatalf("必须有 G3 或 G4 拦住它，实际 gates=%v", traj.Gates)
+	// 逐轮重复的跳必须被 G3 拒（不是被静默重复执行）。
+	if !hasGate(traj.Gates, extract.GateDuplicate) {
+		t.Fatalf("重跳必须被 G3 拒绝，实际 gates=%v", traj.Gates)
+	}
+	if traj.DuplicateCalls == 0 {
+		t.Error("应记录被拒跳数（DuplicateCalls>0）")
 	}
 	if traj.ForcedFinal != true {
 		t.Error("必须强制终稿")

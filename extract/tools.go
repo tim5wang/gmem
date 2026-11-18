@@ -26,6 +26,12 @@ import (
 // 而放开它就等于把多跳遍历的控制权交给模型，G5 就不再是硬保证。
 const HardMaxHops = 1
 
+// defaultSearchLimit 是 search_memories 的默认条数上限（§3.2 表：5）。
+//
+// 它是 G3 归一化的依据之一：k 缺省、k=0、k>5 在工具侧都收敛到同一个生效值，
+// 因此它们是**同一条查询**（M2），不能因为字面参数不同就被当成新查询。
+const defaultSearchLimit = 5
+
 // 工具名常量。
 const (
 	ToolLookupEntity   = "lookup_entity"
@@ -90,6 +96,24 @@ type toolResult struct {
 	Items     []map[string]any `json:"items"`
 	Total     int              `json:"total"`
 	Truncated bool             `json:"truncated"`
+}
+
+// resultIDs 抽取本次结果里各行稳定标识（node/edge/memory）。
+//
+// G4 的"无进展"必须是"无**新增**"（M1）：只看 len(Items) 的话，模型把同一条
+// 查询换个措辞（`vim` / `vi` / `v`）反复命中同一行，noProgress 永远归零、G4 永不触发。
+// 这里只返回**已存在**于 Items 里的 id；缺失的整行不计入（宁可偏保守）。
+func (r toolResult) resultIDs() []string {
+	out := make([]string, 0, len(r.Items))
+	for _, it := range r.Items {
+		for _, k := range []string{"node_id", "edge_id", "memory_id"} {
+			if v, ok := it[k].(string); ok && v != "" {
+				out = append(out, k+":"+v)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // toolRunner 执行只读工具。它只持有 ports，不持有 Writer——
@@ -291,12 +315,22 @@ func (t *toolRunner) searchMemories(ctx context.Context, raw json.RawMessage) (t
 		k = limit
 	}
 	hits, err := t.ports.Lexical.Search(ctx, store.LexicalQuery{
-		Query: query, Scope: t.scope, Limit: k,
+		Query: query, Scope: t.scope, Limit: k + 1,
 	})
 	if err != nil {
 		return toolResult{Tool: ToolSearchMemories, Items: []map[string]any{}}, fmt.Errorf("search_memories: %w", err)
 	}
 	res := toolResult{Tool: ToolSearchMemories, Items: []map[string]any{}, Total: len(hits)}
+	// 内部按 k+1 查询：多出 1 条就说明“还有更多”，必须给出截断标记。
+	//
+	// 为什么不能只靠 k 被夹紧：k≤SearchLimit 时后端只返回 k 条，工具无从知道
+	// “还有更多”，模型会把“只给了 k 条”理解成“只有 k 条相关记忆”，
+	// 从而漏掉已有的上下文证据（表现为抽取质量下降，不报错）。
+	if len(hits) > k {
+		hits = hits[:k]
+		res.Truncated = true
+		res.Total = k + 1 // 命中的下界：至少还有 1 条没返回
+	}
 	for _, h := range hits {
 		item := map[string]any{"memory_id": h.ID, "version": h.Version, "score": h.Score}
 		if m, err := t.ports.Store.GetMemory(ctx, h.ID); err == nil {

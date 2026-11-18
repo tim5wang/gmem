@@ -149,7 +149,12 @@ func TestZoneAutoMerge(t *testing.T) {
 			t.Errorf("分解项加权应等于总分：%.6f vs %.6f", sum, got.Breakdown[0].Score)
 		}
 	}
-	_ = before
+
+	// 关键断言（原先只算不验，属假测试）：自动合并 = 写 alias，**不新建节点**。
+	// 变异验证：把 auto_merge 分支改成也调 makeNode，这里必须变红。
+	if after := countNodes(t, raw); after != before {
+		t.Errorf("自动合并不得新建节点：nodes %d → %d", before, after)
+	}
 }
 
 // TestZoneGrayWritesPossiblySameOnly 是「灰区不合并」的专项用例：
@@ -246,7 +251,6 @@ func TestZoneNewCreatesNode(t *testing.T) {
 	if len(res) != 1 || res[0].Zone != ZoneNew {
 		t.Fatalf("不相似名称应判为新建，实际 %+v", zonesOf(res))
 	}
-	_ = before
 
 	p := NewPipeline(d.Ports(), Config{}, PipelineOptions{})
 	// 关系三元组的主语是连续字符类（不含空格），因此这里用无空格写法；
@@ -256,8 +260,17 @@ func TestZoneNewCreatesNode(t *testing.T) {
 		Content: "Kubernetes调度器 使用 etcd 存储，这是一条足够长的内容。",
 	})
 	id := NodeID(store.ScopeUser, "Kubernetes调度器")
-	if _, err := d.Graph().GetNode(context.Background(), id); err != nil {
+	n, err := d.Graph().GetNode(context.Background(), id)
+	if err != nil {
 		t.Errorf("应新建节点 %q：%v", id, err)
+	} else if n.CanonicalName != "Kubernetes调度器" {
+		t.Errorf("新节点的 canonical_name 应为表面形式，实际 %q", n.CanonicalName)
+	}
+	// 关键断言（原先只算不验，属假测试）：新建路径必须**真的**多出节点。
+	// 不断言恰好 +1：同一段文本里的字面量/其它候选会各自建节点，那是另一条规则。
+	// 变异验证：把 ZoneNew 分支的 makeNode 去掉，GetNode 与这里都会变红。
+	if after := countNodes(t, raw); after <= before {
+		t.Errorf("新建路径必须新增节点：nodes %d → %d", before, after)
 	}
 	if got := countEdgesByRelation(t, raw, string(RelationPossiblySame)); got != 0 {
 		t.Errorf("新建不应写 possiblySame，实际 %d 条", got)

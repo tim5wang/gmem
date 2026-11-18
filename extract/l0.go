@@ -387,6 +387,13 @@ func (l *L0) dictionary(content string) []Finding {
 // 为什么必须有它："这是一个足够长的句子"、"那是缓存层"这类日常表述会被
 // `X 是 Y` 规则当成概念定义，于是每次写入都凭空造出叫"这""那"的概念草稿，
 // 灰区里还会多出"这 vs 某实体"的候选。定义句只在主语**可命名**时才有意义。
+// MaxDefinitionSubjectRunes 是定义句主语的**最大字符数**（M5）。
+//
+// 实体/概念名不会是一个从句：超过这个长度的“主语”几乎必然是句子片段
+// （实测 19 字的垃圾实体就是这么来的）。取 12 是因为带小限定语的合法
+// 中文/英文概念名（如“身份认证服务”“Kubernetes 集群”——不含空格）就在这个量级内。
+const MaxDefinitionSubjectRunes = 12
+
 var definitionSubjectStopwords = map[string]struct{}{
 	"这": {}, "那": {}, "它": {}, "他": {}, "她": {}, "此": {}, "其": {},
 	"这个": {}, "那个": {}, "这里": {}, "那里": {}, "这些": {}, "那些": {},
@@ -406,6 +413,22 @@ func (l *L0) definitions(content string) []Finding {
 			subject := strings.TrimSpace(m[1])
 			def := strings.TrimSpace(m[2])
 			if subject == "" || len([]rune(def)) < 2 {
+				continue
+			}
+			// 主语必须是**一个可命名的词**，而不是句子片段（M5）。
+			//
+			// 旧规则只要求“1-40 字符 + 含字母/汉字”，于是
+			// “vim 使用 插件管理器 来扩展功能，这 是 …” 会把整段从句当成实体名，
+			// 每次写入都凭空造一个垃圾节点 + alias，污染消歧候选池。
+			//
+			// 两道闸：长度上限（实体名不会是一个从句），以及**不得含句读标点**——
+			// 逗号/句号/冒号/括号出现就意味着已经跨过了一个短语边界。
+			// 内部空格**不拦**：多词实体名（如 “vim 编辑器”）是正常形态，
+			// 拦它会把合法概念一起干掉，那是另一个缺陷。
+			if len([]rune(subject)) > MaxDefinitionSubjectRunes {
+				continue
+			}
+			if strings.ContainsAny(subject, "\t\u00a0，,。、；;：:！!？?\n\r") {
 				continue
 			}
 			// 主语不可命名（指示代词/人称代词）时不构成定义句：

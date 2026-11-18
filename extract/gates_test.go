@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tim5wang/gmem/sqlite"
 	"github.com/tim5wang/gmem/store"
 )
 
@@ -40,14 +41,21 @@ func newGateExtractor(t *testing.T, cfg Config, client LLMClient) (*LLMExtractor
 
 // TestG1ForcedFinalExactlyMaxTurnsPlusOne 是 D10 的唯一验收依据。
 //
-// 断言三件事：
-//  1. 恰好 3 轮给了工具（MaxTurns=3）；
-//  2. 第 4 次调用**没有**工具（强制终稿），且总调用次数 == MaxTurns+1 == 4；
-//  3. 触发原因是 G1，并且降级可见（模型仍在请求工具 → Degraded 有说明）。
+// # 为什么是 MaxTurns=5 + 每轮发**不同且都能命中新行**的查询
+//
+// 旧版本取 MaxTurns=3 且每轮发**同一条** lookup_entity（`{"name":"vim"}`），
+// 那恰好落在“G1 与 G3+G4 的交叉点”上：MaxTurns<=3 时调用次数碰巧也算 4，
+// 但 MaxTurns>=4 时调用恒为 4（+1 来自 G4，不是 G1）——它在为错误的原因而通过。
+// 修好后：每轮查询名互不相同（G3 不触发）且每轮命中一条**新**行
+// （G4 的“无新增结果”不触发），于是只剩 G1 能收口，匿名验证才成立。
 func TestG1ForcedFinalExactlyMaxTurnsPlusOne(t *testing.T) {
-	cfg := Config{MaxTurns: 3}
-	client := alwaysToolCallLLM()
-	x, p := newGateExtractor(t, cfg, client)
+	const maxTurns = 5
+	d := openMemoryDB(t)
+	seedOntology(t, d)
+	names := seedDistinctLookupRows(t, d, maxTurns)
+	client := &distinctHittingLLM{names: names, tokens: 5}
+	x := NewLLMExtractor(client, d.Ports(), Config{MaxTurns: maxTurns})
+	p := NewPipeline(d.Ports(), Config{MaxTurns: maxTurns}, PipelineOptions{Extractor: x})
 
 	res, err := p.Run(context.Background(), RawEpisode{
 		ID: "e-g1", Scope: store.ScopeUser,
@@ -56,34 +64,50 @@ func TestG1ForcedFinalExactlyMaxTurnsPlusOne(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	_ = res
 
 	traj := x.LastTrajectory()
-	if want := cfg.MaxTurns + 1; traj.Calls != want {
-		t.Fatalf("D10：总调用次数必须 == MaxTurns+1 == %d，实际 %d（toolRounds=%d）",
-			want, traj.Calls, traj.ToolRounds)
+	if want := maxTurns + 1; traj.Calls != want {
+		t.Fatalf("D10：总调用次数必须 == MaxTurns+1 == %d，实际 %d（toolRounds=%d gates=%v）",
+			want, traj.Calls, traj.ToolRounds, traj.Gates)
 	}
-	if traj.ToolRounds != cfg.MaxTurns {
-		t.Errorf("恰好 %d 轮应执行工具，实际 %d", cfg.MaxTurns, traj.ToolRounds)
+	if traj.ToolRounds != maxTurns {
+		t.Errorf("恰好 %d 轮应执行工具，实际 %d", maxTurns, traj.ToolRounds)
 	}
 	if !traj.ForcedFinal {
 		t.Errorf("第 %d 次调用必须是强制终稿（工具面被收走）", traj.Calls)
 	}
-	if got := client.CallsWithTools(); got != cfg.MaxTurns {
-		t.Errorf("给了工具声明的调用次数应为 %d，实际 %d", cfg.MaxTurns, got)
+	// 隔离：本用例只能由 G1 收口。G3/G4 出现就说明夹具没隔离住，
+	// 此时等式即使成立也不构成 G1 的证据。
+	if !hasGate(traj.Gates, GateMaxTurns) {
+		t.Errorf("应触发 G1 MaxTurns，实际 gates=%v", traj.Gates)
 	}
-	if got := client.CallsWithoutTools(); got != 1 {
+	for _, other := range []GateReason{GateDuplicate, GateNoProgress, GateTokenBudget, GateWallClock} {
+		if hasGate(traj.Gates, other) {
+			t.Errorf("用例隔离失败：%v 抢先触发，G1 未被真正验证（gates=%v）", other, traj.Gates)
+		}
+	}
+	if traj.DuplicateCalls != 0 {
+		t.Errorf("每轮查询不同，不应有被 G3 拒掉的跳，实际 %d", traj.DuplicateCalls)
+	}
+	if got := client.callsWithTools(); got != maxTurns {
+		t.Errorf("给了工具声明的调用次数应为 %d，实际 %d", maxTurns, got)
+	}
+	if got := client.callsWithoutTools(); got != 1 {
 		t.Errorf("收走工具面的调用次数必须恰好 1，实际 %d", got)
 	}
-	// 最后一次请求必须显式告知"工具已收回、必须现在产出"。
+	// 最后一次请求必须显式告知“工具已收回、必须现在产出”。
 	last := client.Calls[len(client.Calls)-1]
 	if !strings.Contains(last.User, "工具已全部收回") {
-		t.Errorf("强制终稿轮的 prompt 必须要求立即产出，实际末尾：%q",
-			tail(last.User, 200))
+		t.Errorf("强制终稿轮的 prompt 必须要求立即产出，实际末尾：%q", tail(last.User, 200))
 	}
-	// G1 必须在轨迹里可见。
-	if !hasGate(traj.Gates, GateMaxTurns) {
-		t.Errorf("轨迹里应记录 G1 触发，实际 %v", traj.Gates)
+	// PipelineResult 不得被丢弃：模型无视收口必须在 Degraded 里可见，
+	// 且 L0/L1 的产物仍需落库（收口 ≠ 丢弃结果）。
+	joined := strings.Join(append([]string{}, res.Degraded...), " ")
+	if !strings.Contains(joined, "强制终稿后模型仍返回") {
+		t.Errorf("模型无视收口必须在 Degraded 可见，实际 %v", res.Degraded)
+	}
+	if len(res.Writes) == 0 {
+		t.Error("强制终稿后 L0/L1 的产物仍必须落库，实际 Writes 为空")
 	}
 }
 
@@ -106,9 +130,13 @@ func TestG1MaxTurnsIsConfigurable(t *testing.T) {
 }
 
 // TestG2TokenBudgetForcesFinal 验证 G2：累计 token 越过预算即强制终稿。
+//
+// 断言下界与上界都行（旧版只断 `Calls > 4` 这个上界，拑不到“阈值算错”：
+// 把 TokenBudget 写小只会让 Calls 变小，依然“> 4 不成立”而假绿）。
 func TestG2TokenBudgetForcesFinal(t *testing.T) {
-	cfg := Config{MaxTurns: 100, TokenBudget: 50}
-	// 每轮报 30 token：第 1 轮后 30（未超），第 2 轮后 60（超）→ 第 3 轮应为强制终稿。
+	const budget = 50
+	cfg := Config{MaxTurns: 100, TokenBudget: budget}
+	// 每轮报 30 token：第 1 轮 30（未超）→ 第 2 轮 60（超）→ 第 3 轮强制终稿。
 	client := NewRepeatingFakeLLM(FakeStep{
 		ToolCalls: []ToolCall{ToolCallJSON(ToolLookupEntity, `{"name":"vim"}`)},
 		Usage:     LLMUsage{TotalTokens: 30},
@@ -122,10 +150,21 @@ func TestG2TokenBudgetForcesFinal(t *testing.T) {
 	}
 	traj := x.LastTrajectory()
 	if !hasGate(traj.Gates, GateTokenBudget) {
-		t.Errorf("应当触发 G2，实际 gates=%v tokens=%d", traj.Gates, traj.Tokens)
+		t.Fatalf("应当触发 G2，实际 gates=%v tokens=%d", traj.Gates, traj.Tokens)
 	}
-	if traj.Calls > 4 {
-		t.Errorf("G2 应尽早收口，实际调用了 %d 次", traj.Calls)
+	if hasGate(traj.Gates, GateMaxTurns) {
+		t.Errorf("G2 用例被 G1 抢先（隔离失败）：MaxTurns=100，gates=%v", traj.Gates)
+	}
+	// 精确下界 + 上界：30+30 越线的下一次调用就是强制终稿。
+	if traj.Calls != 3 {
+		t.Errorf("G2 应在第 3 次调用收口（预算 %d、每轮 30），实际 %d 次", budget, traj.Calls)
+	}
+	// token 记账：实计必须真的越线（否则“触发”不是因预算）。
+	if traj.Tokens < budget {
+		t.Errorf("触发 G2 时累计 token 应 ≥ 预算 %d，实际 %d", budget, traj.Tokens)
+	}
+	if !traj.ForcedFinal {
+		t.Error("G2 收口必须强制终稿")
 	}
 }
 
@@ -161,16 +200,9 @@ func TestG3DuplicateQueryRejected(t *testing.T) {
 func TestG4NoProgressForcesFinal(t *testing.T) {
 	// 查询一个词典里不存在的名字：工具成功但返回 0 条。
 	n := 0
-	client := &FakeLLM{
-		RepeatLast: true,
-		Steps:      []FakeStep{{Usage: LLMUsage{TotalTokens: 5}}},
-	}
-	client.OnCall = func(int, LLMRequest) {}
-	client.Steps[0].ToolCalls = nil
 	// 用一个"每轮都问不同名字、但都查不到"的适配器。
 	distinct := &distinctMissingLLM{n: &n}
 	x, p := newGateExtractor(t, Config{MaxTurns: 100}, distinct)
-	_ = client
 
 	if _, err := p.Run(context.Background(), RawEpisode{
 		ID: "e-g4", Scope: store.ScopeUser, Content: "Alice 使用 vim 写代码，认证服务依赖 Redis 做缓存。",
@@ -182,7 +214,53 @@ func TestG4NoProgressForcesFinal(t *testing.T) {
 		t.Errorf("连续空结果应触发 G4，实际 gates=%v rounds=%d", traj.Gates, traj.ToolRounds)
 	}
 	if traj.ToolRounds != 2 {
-		t.Errorf("G4 应在连续 2 轮空结果后收口（工具轮=2），实际 %d", traj.ToolRounds)
+		t.Errorf("G4 应连续 2 轮无新增结果后收口（工具轮=2），实际 %d", traj.ToolRounds)
+	}
+	if traj.NoProgressRounds != 2 {
+		t.Errorf("应记录 2 轮无进展，实际 %d", traj.NoProgressRounds)
+	}
+	if hasGate(traj.Gates, GateMaxTurns) {
+		t.Errorf("G4 用例被 G1 抢先（隔离失败）：MaxTurns=100，gates=%v", traj.Gates)
+	}
+}
+
+// TestG4NoNewResultDespiteNonEmptyHits 是 M1 的专项用例：
+//
+// 模型每轮发**不同**字符串（G3 不触发）、且都能命中**同一条**行
+// （len(Items)>0），但没有任何**新增**结果。
+// 旧口径（只看 len(Items)）会认为“有进展”，G4 永不触发 → 靠 G1 兜底。
+// 正确口径（“无新增 node/edge/memory id”）必须判为无进展并在连续 2 轮后收口。
+//
+// 轮数推导：第 1 轮首次看到 n-vim（有新增，noProgress=0）；
+// 第 2、3 轮同一条行再无新增（noProgress=1、2）→ 第 4 次调用是强制终稿，
+// 因此工具轮数应为 3（而不是 2：空结果用例才从第 1 轮就无进展）。
+func TestG4NoNewResultDespiteNonEmptyHits(t *testing.T) {
+	d := openMemoryDB(t)
+	seedOntology(t, d)
+	// 所有查询都命中同一条 "vim"（lookup_entity 是双向包含匹配）。
+	llm := &sameRowLLM{names: []string{"vim", "vi", "v", "vim 编辑器", "编辑"}}
+	x := NewLLMExtractor(llm, d.Ports(), Config{MaxTurns: 100})
+	if _, err := x.Extract(context.Background(), ExtractRequest{
+		Episode: RawEpisode{ID: "e-g4b", Scope: store.ScopeUser,
+			Content: "Alice 使用 vim 写代码，认证服务依赖 Redis 做缓存。"},
+	}); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	traj := x.LastTrajectory()
+	if !hasGate(traj.Gates, GateNoProgress) {
+		t.Fatalf("非空但无**新增**结果应触发 G4，实际 gates=%v calls=%d", traj.Gates, traj.Calls)
+	}
+	if traj.DuplicateCalls != 0 {
+		t.Errorf("每轮查询名不同，不应有 G3 拒跳，实际 %d", traj.DuplicateCalls)
+	}
+	if traj.NoProgressRounds != 2 {
+		t.Errorf("应记录连续 2 轮无新增，实际 %d", traj.NoProgressRounds)
+	}
+	if traj.ToolRounds != 3 {
+		t.Errorf("应在 1 轮有新增 + 2 轮无新增后收口（工具轮=3），实际 %d", traj.ToolRounds)
+	}
+	if hasGate(traj.Gates, GateMaxTurns) {
+		t.Errorf("G4 用例被 G1 抢先（隔离失败）：MaxTurns=100，gates=%v", traj.Gates)
 	}
 }
 
@@ -220,6 +298,110 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b)
+}
+
+// seedDistinctLookupRows 种 n 条**互不相同**的节点 + 词典项，返回可供
+// lookup_entity 逐轮查询的行名。
+//
+// 为什么每轮必须命中不同行：G4 的正确语义是“无**新增**结果”。同一个 alias
+// 反复被命中不产生新增，本来就该被 G4 收口。要隔离出 G1，夹具必须让每轮
+// 真的拿到一条新结果（详见 TestG1ForcedFinalExactlyMaxTurnsPlusOne 的说明）。
+func seedDistinctLookupRows(t *testing.T, d *sqlite.DB, n int) []string {
+	t.Helper()
+	ctx := context.Background()
+	names := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		name := "gtrow" + itoa(i) + "x"
+		id := "n-" + name
+		if err := d.Graph().PutNode(ctx, store.Node{
+			ID: id, Scope: store.ScopeUser, CanonicalName: name,
+		}); err != nil {
+			t.Fatalf("PutNode(%q): %v", id, err)
+		}
+		if err := d.Store().PutAlias(ctx, store.Alias{
+			Surface: name, NodeID: id, Source: "gate", Confidence: 0.9,
+		}); err != nil {
+			t.Fatalf("PutAlias(%q): %v", name, err)
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
+// distinctHittingLLM 按次序每轮发一条**互不相同且都能命中新行**的查询。
+//
+// 它就是“永远返回 tool call”的对抗序列在**隔离 G1** 下应有的形态：
+// 每轮都请求工具（不自行收口），但每轮都拿到新证据。
+// 序号越过剧本后重复最后一条（G3 会拒它，但那时 G1 已经先收口了）。
+type distinctHittingLLM struct {
+	names  []string
+	tokens int
+	Calls  []LLMRequest
+}
+
+func (d *distinctHittingLLM) Complete(ctx context.Context, req LLMRequest) (LLMResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return LLMResponse{}, err
+	}
+	idx := len(d.Calls)
+	d.Calls = append(d.Calls, req)
+	if len(req.Tools) == 0 {
+		// 强制终稿轮：仍请求工具（模拟“永远不自行收口”的模型）。
+		return LLMResponse{
+			ToolCalls: []ToolCall{ToolCallJSON(ToolLookupEntity,
+				`{"name":"`+d.names[len(d.names)-1]+`"}`)},
+			Usage: LLMUsage{TotalTokens: d.tokens}, Model: "fake",
+		}, nil
+	}
+	if idx >= len(d.names) {
+		idx = len(d.names) - 1
+	}
+	return LLMResponse{
+		ToolCalls: []ToolCall{ToolCallJSON(ToolLookupEntity,
+			`{"name":"`+d.names[idx]+`"}`)},
+		Usage: LLMUsage{TotalTokens: d.tokens}, Model: "fake",
+	}, nil
+}
+
+// callsWithTools 返回“给了工具声明”的调用次数。
+func (d *distinctHittingLLM) callsWithTools() int {
+	n := 0
+	for _, c := range d.Calls {
+		if len(c.Tools) > 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// callsWithoutTools 返回“收走工具面”的调用次数。
+func (d *distinctHittingLLM) callsWithoutTools() int {
+	return len(d.Calls) - d.callsWithTools()
+}
+
+// sameRowLLM 每轮发**不同**字符串，但都命中同一条 "vim"（双向包含匹配）。
+//
+// 它专门用来揭穿“只看 len(Items) 就算有进展”的 G4 旧口径（M1）。
+type sameRowLLM struct {
+	names []string
+	Calls []LLMRequest
+}
+
+func (s *sameRowLLM) Complete(ctx context.Context, req LLMRequest) (LLMResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return LLMResponse{}, err
+	}
+	idx := len(s.Calls) % len(s.names)
+	s.Calls = append(s.Calls, req)
+	if len(req.Tools) == 0 {
+		return LLMResponse{Text: BuildFinalJSON([]EntityJSON{{Name: "vim"}}, nil),
+			Usage: LLMUsage{TotalTokens: 5}, Model: "fake"}, nil
+	}
+	return LLMResponse{
+		ToolCalls: []ToolCall{ToolCallJSON(ToolLookupEntity,
+			`{"name":"`+s.names[idx]+`"}`)},
+		Usage: LLMUsage{TotalTokens: 5}, Model: "fake",
+	}, nil
 }
 
 // TestG5WallClockForcesFinal 验证 G5：墙钟超时后不再给工具。

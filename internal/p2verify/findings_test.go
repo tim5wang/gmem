@@ -150,7 +150,8 @@ func TestBlockerAutoMergeEdgeFK(t *testing.T) {
 		t.Fatalf("用例前提失效：本应出现 auto_merge 判定，实际：%s\n%s",
 			zoneLine.String(), report)
 	}
-	if blockerGate() {		t.Fatal(report)
+	if blockerGate() {
+		t.Fatal(report)
 	}
 	t.Log(report)
 }
@@ -185,9 +186,16 @@ func TestDeferredJudgeKeepsStalePending(t *testing.T) {
 		t.Fatalf("前置条件：应为灰区，实际 %q", gray.Zone)
 	}
 	newID := extract.NodeID(store.ScopeUser, candidateName)
+	// livePending 数的是**当前版本**里仍然有效的 possiblySame 边。
+	//
+	// 为什么必须带 t_expired 条件（这个断言原先漏了它）：
+	// D12/D13 要求实效写“新版本 + 旧版本 t_expired”，旧行是**审计保留**的。
+	// 只查 `t_invalid IS NULL` 会把已被新版本取代的历史行也算成“有效”，
+	// 于是即使实现完全正确，计数也不会归零——那是断言写错了，不是缺陷。
+	// 本用例的原意图不变：裁决后不得再有**有效**的 possiblySame 边。
 	livePending := func() int {
 		return countRows(t, raw,
-			`SELECT COUNT(1) FROM edges WHERE relation = ? AND t_invalid IS NULL`,
+			`SELECT COUNT(1) FROM edges WHERE relation = ? AND t_invalid IS NULL AND t_expired IS NULL`,
 			string(extract.RelationPossiblySame))
 	}
 	if got := livePending(); got != 1 {
@@ -202,6 +210,20 @@ func TestDeferredJudgeKeepsStalePending(t *testing.T) {
 		t.Fatalf("Judge: %v", err)
 	}
 	stale := livePending()
+	// 第二个观测面（更接近真实消费方）：图端口沿两个端点都不应再看到它，
+	// 灰区积压护栏正是靠这个邻域查询计数的。
+	for _, id := range []string{gray.NodeID, newID} {
+		hops, err := d.Graph().Neighbors(ctx, store.NeighborQuery{
+			NodeID: id, Scope: store.ScopeUser,
+			Relations: []store.Relation{extract.RelationPossiblySame}, Hops: 1,
+		})
+		if err != nil {
+			t.Fatalf("Neighbors(%q): %v", id, err)
+		}
+		if len(hops) != 0 {
+			t.Errorf("裁决后 Neighbors(%q) 仍返回 %d 条 possiblySame（僵尸边）", id, len(hops))
+		}
+	}
 	if stale == 0 {
 		t.Log("裁决已作废对应 possiblySame 边（本项已修复，可摘除 GMEM_VERIFY_DEFERRED 门禁）")
 		return

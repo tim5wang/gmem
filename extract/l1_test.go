@@ -123,6 +123,16 @@ func TestL1EmptyAndSingle(t *testing.T) {
 }
 
 // TestL1VectorChannel 验证注入 embedder 时向量通道参与相似度（且降级消失）。
+//
+// # 为什么断言要具体到"哪个对、多少分"（原来只断"非空"）
+//
+// 旧版只断 `len(res.Pairs) != 0` 与 `Pairs[0].Vector > 0`：
+// 把相似度公式改错、或把 vector 权重摊掉，这两条仍然会绿。
+// 这里把三块都钉死：
+//   - 只有 a/b 一对（不凭空多出别的对）；
+//   - Lexical 与 Vector 两个通道都 > 0（两者真的都被算进去了）；
+//   - Similarity == (lex+vec)/2（融合公式本身，而不是"大于 0"）；
+//   - 簇真的把 a/b 放在一起，且簇相似度落在 (0,1]。
 func TestL1VectorChannel(t *testing.T) {
 	emb := EmbedderFunc(func(ctx context.Context, texts []string) ([][]float32, error) {
 		out := make([][]float32, len(texts))
@@ -132,7 +142,7 @@ func TestL1VectorChannel(t *testing.T) {
 		}
 		return out, nil
 	})
-	l1 := NewL1(Config{L1MinSimilarity: 0.5}, emb)
+	l1 := NewL1(Config{L1MinSimilarity: 0.3}, emb)
 	res, err := l1.Cluster(context.Background(), []L1Item{
 		{ID: "a", Surface: "缓存服务"},
 		{ID: "b", Surface: "缓存服务层"},
@@ -143,10 +153,37 @@ func TestL1VectorChannel(t *testing.T) {
 	if len(res.Degraded) != 0 {
 		t.Errorf("注入 embedder 后不应再有 vector 缺席降级，实际 %v", res.Degraded)
 	}
-	if len(res.Pairs) == 0 {
-		t.Fatal("应当产出候选对")
+	if len(res.Pairs) != 1 {
+		t.Fatalf("两项输入应产出恰好 1 个候选对，实际 %d：%+v", len(res.Pairs), res.Pairs)
 	}
-	if res.Pairs[0].Vector <= 0 {
-		t.Errorf("向量通道应当参与打分，实际 Vector=%.3f", res.Pairs[0].Vector)
+	p := res.Pairs[0]
+	if !((p.A == "a" && p.B == "b") || (p.A == "b" && p.B == "a")) {
+		t.Errorf("候选对应是 a/b，实际 %q/%q", p.A, p.B)
+	}
+	if p.Lexical <= 0 {
+		t.Errorf("词法通道应参与打分（近似串的 BM25 相似度 > 0），实际 %.4f", p.Lexical)
+	}
+	if p.Vector <= 0 {
+		t.Errorf("向量通道应参与打分，实际 Vector=%.4f", p.Vector)
+	}
+	if want := (p.Lexical + p.Vector) / 2; p.Similarity != want {
+		t.Errorf("融合相似度应为 (lex+vec)/2=%.6f，实际 %.6f（公式被改坏或直接拷贝了单一通道）",
+			want, p.Similarity)
+	}
+	if p.Similarity <= 0 || p.Similarity > 1 {
+		t.Errorf("相似度应在 (0,1]，实际 %.4f", p.Similarity)
+	}
+	if len(res.Clusters) != 1 {
+		t.Fatalf("应产出恰好 1 个簇，实际 %d：%+v", len(res.Clusters), res.Clusters)
+	}
+	got := map[string]bool{}
+	for _, s := range res.Clusters[0].Surfaces {
+		got[s] = true
+	}
+	if !got["缓存服务"] || !got["缓存服务层"] {
+		t.Errorf("簇应同时包含两个表面形式，实际 %v", res.Clusters[0].Surfaces)
+	}
+	if c := res.Clusters[0].Similarity; c <= 0 || c > 1 {
+		t.Errorf("簇相似度应在 (0,1]，实际 %.4f", c)
 	}
 }

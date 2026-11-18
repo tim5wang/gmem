@@ -325,6 +325,9 @@ type WriteReport struct {
 	NodeIDs  []string
 	EdgeIDs  []string
 	AliasIDs []string
+	// LexicalIndexed 透传 recall.PutResult.LexicalIndexed：写入点即可确认
+	// 词法通道已同步，不必靠事后检索才发现"写入成功但永远搜不到"。
+	LexicalIndexed bool
 }
 
 // PipelineResult 是一次完整管线运行的结果。

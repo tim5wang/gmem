@@ -231,9 +231,38 @@ func (d *Disambiguator) scoreMention(ctx context.Context, scope store.Scope, m M
 		res.Warnings = append(res.Warnings, "消歧 cosine 通道缺席（无向量）：权重会重新按剩余通道归一")
 	}
 
+	// 排除"该提及自身派生出的节点"：重复写入同一段 episode 时，它已经存在于
+	// 候选池里，与自己的 cosine 恒为 1，会把三区判定变成"永远自动合并到自身"。
+	// 这不是合并，而是自指——必须排除，否则 repeat-write 的判定无法复现。
+	//
+	// # 但"只查自指就清空候选池"是另一个缺陷
+	//
+	// 自指节点常常是**唯一**候选（实体第一次写入时，库里就它一个同 scope 节点）。
+	// 把它无条件剔掉会让最常见的实体永远落到 ZoneNew，于是 §4 的
+	// "自动合并 → 写 alias · confidence=high"在最常见的形态上从不发生。
+	//
+	// 因此排除条件收紧为：**还有别的候选时**才排除自指节点；若排除后池子空掉，
+	// 就保留它（合并到自身的 id 是幂等写，同时把 auto 别名记账补上）。
+	selfID := NodeID(scope, m.Surface)
+	pool := make([]candidate, 0, len(cands))
+	for _, c := range cands {
+		if c.node.ID == selfID {
+			continue
+		}
+		pool = append(pool, c)
+	}
+	if len(pool) == 0 {
+		for _, c := range cands {
+			if c.node.ID == selfID {
+				pool = append(pool, c)
+			}
+		}
+	}
+
 	// BM25 语料 = 每个候选的 name + aliases（§4 的 BM25(name, aliases)）。
-	texts := make([][]string, len(cands))
-	for i, c := range cands {
+	// 语料与 pool 必须一一对应：BM25 的 doc 下标要和下面 scoring 循环的下标一致。
+	texts := make([][]string, len(pool))
+	for i, c := range pool {
 		toks := bigram.Tokens(c.node.CanonicalName)
 		for _, a := range c.aliases {
 			toks = append(toks, bigram.Tokens(a.Surface)...)
@@ -254,15 +283,7 @@ func (d *Disambiguator) scoreMention(ctx context.Context, scope store.Scope, m M
 	}
 	norm := w1 + w2 + w3
 
-	// 排除"该提及自身派生出的节点"：重复写入同一段 episode 时，它已经存在于
-	// 候选池里，与自己的 cosine 恒为 1，会把三区判定变成"永远自动合并到自身"。
-	// 这不是合并，而是自指——必须排除，否则 repeat-write 的判定无法复现。
-	selfID := NodeID(scope, m.Surface)
-
-	for i, c := range cands {
-		if c.node.ID == selfID {
-			continue
-		}
+	for i, c := range pool {
 		bd := ScoreBreakdown{NodeID: c.node.ID}
 		if len(mv) > 0 {
 			if cv := d.candidateVector(ctx, c); len(cv) > 0 {

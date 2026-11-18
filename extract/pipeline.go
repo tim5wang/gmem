@@ -458,6 +458,28 @@ func (p *Pipeline) writeEpisode(
 	seenAlias := make(map[string]struct{}, 8)
 	seenEdge := make(map[string]struct{}, 8)
 
+	// resolved 是「表面形式(lower) → 本次写入实际落点的节点 id」。
+	//
+	// # 为什么必须显式建这张表（B-1 的修复）
+	//
+	// 边端点**不能**再用 NodeID(scope, surface) 现算：节点 id 与表面形式会在两条
+	// 完全正常的生产路径上脱钩——(1) Judge(Same=true) 写 alias（保留既有 id）、
+	// (2) 自动合并把 L2 给的 aliases 一并写成 alias。
+	// ZoneAutoMerge **只写 alias、不建节点**（这是对的：合并到既有节点），因此现算
+	// 出来的端点节点根本不存在，edges 的外键（787）会让整笔图写入回滚。
+	// 结论：端点解析必须以「消歧结论」为唯一事实来源。
+	resolved := make(map[string]string, len(decisions))
+	addResolve := func(surface, nodeID string) {
+		key := strings.ToLower(strings.TrimSpace(surface))
+		if key == "" || nodeID == "" {
+			return
+		}
+		if _, dup := resolved[key]; dup {
+			return
+		}
+		resolved[key] = nodeID
+	}
+
 	mentionBySurface := make(map[string]Mention, len(decisions))
 	for _, m := range buildMentions(l0res, extracted) {
 		mentionBySurface[strings.ToLower(strings.TrimSpace(m.Surface))] = m
@@ -485,8 +507,11 @@ func (p *Pipeline) writeEpisode(
 				if w != "" {
 					res.Warnings = append(res.Warnings, w)
 				}
+				// 被降级为灰区：落点是新建节点，不是候选节点。
+				addResolve(surface, newID)
 				continue
 			}
+			addResolve(surface, d.NodeID)
 			if a, ok := makeAlias(surface, d.NodeID, "extract:auto", 0.95, seenAlias); ok {
 				aliases = append(aliases, a)
 			}
@@ -494,6 +519,7 @@ func (p *Pipeline) writeEpisode(
 				if a, ok := makeAlias(alt, d.NodeID, "extract:auto", 0.9, seenAlias); ok {
 					aliases = append(aliases, a)
 				}
+				addResolve(alt, d.NodeID)
 			}
 		case ZoneGray:
 			// 灰区：**绝不合并**。新建自己的节点 + 一条 possiblySame 边入待审池；
@@ -504,6 +530,7 @@ func (p *Pipeline) writeEpisode(
 			if w != "" {
 				res.Warnings = append(res.Warnings, w)
 			}
+			addResolve(surface, newID)
 		case ZoneNegative, ZoneNew:
 			if n, ok := makeNode(ep, newID, surface, m, seenNode); ok {
 				nodes = append(nodes, n)
@@ -511,6 +538,7 @@ func (p *Pipeline) writeEpisode(
 			if a, ok := makeAlias(surface, newID, "extract:new", 0.8, seenAlias); ok {
 				aliases = append(aliases, a)
 			}
+			addResolve(surface, newID)
 		}
 	}
 
@@ -538,8 +566,60 @@ func (p *Pipeline) writeEpisode(
 	}
 
 	// ---- 关系边（L0 三元组 + L2 关系） ----
-	addEdge := func(from, to string, rel store.Relation, conf float64) {
-		if from == "" || to == "" || from == to || !relationWhitelisted(rel) {
+	//
+	// 端点一律经 resolved 解析，**不再用 NodeID(scope, surface) 现算**。
+	// 解析不到（或落点节点既不在本批次、也不在库里）时**跳过这一条边并记 Warnings**：
+	// 一条边不值得让整段 episode 的节点/别名/边一起回滚（B-1）。
+	// 本批次要建的节点都在 seenNode 里；其余落点（自动合并目标）必须真实存在。
+	existsCache := make(map[string]bool, 8)
+	nodeExists := func(id string) bool {
+		if _, ok := seenNode[id]; ok {
+			return true
+		}
+		if v, ok := existsCache[id]; ok {
+			return v
+		}
+		_, err := p.ports.Graph.GetNode(ctx, id)
+		v := err == nil
+		existsCache[id] = v
+		return v
+	}
+	warnedEdge := make(map[string]struct{}, 8)
+	warnEdge := func(key, msg string) {
+		if _, dup := warnedEdge[key]; dup {
+			return
+		}
+		warnedEdge[key] = struct{}{}
+		res.Warnings = append(res.Warnings, msg)
+	}
+	addEdge := func(fromSurface, toSurface string, rel store.Relation, conf float64) {
+		if !relationWhitelisted(rel) {
+			return
+		}
+		fromKey := strings.ToLower(strings.TrimSpace(fromSurface))
+		toKey := strings.ToLower(strings.TrimSpace(toSurface))
+		from, okF := resolved[fromKey]
+		to, okT := resolved[toKey]
+		if !okF || !okT {
+			missing := fromSurface
+			if okF {
+				missing = toSurface
+			}
+			warnEdge("unresolved:"+missing, fmt.Sprintf(
+				"关系 %s-%s->%s 已跳过：端点 %q 未解析到节点（不写这条边，避免整笔写入回滚）",
+				fromSurface, rel, toSurface, missing))
+			return
+		}
+		for _, id := range []string{from, to} {
+			if nodeExists(id) {
+				continue
+			}
+			warnEdge("absent:"+id, fmt.Sprintf(
+				"关系 %s-%s->%s 已跳过：端点节点 %q 不存在（不写这条边，避免整笔写入回滚）",
+				fromSurface, rel, toSurface, id))
+			return
+		}
+		if from == to {
 			return
 		}
 		id := EdgeID(from, to, rel)
@@ -556,10 +636,10 @@ func (p *Pipeline) writeEpisode(
 		if f.Category != CatRelation {
 			continue
 		}
-		addEdge(NodeID(ep.Scope, f.Subject), NodeID(ep.Scope, f.Object), f.Relation, f.Confidence)
+		addEdge(f.Subject, f.Object, f.Relation, f.Confidence)
 	}
 	for _, r := range extracted.Relations {
-		addEdge(NodeID(ep.Scope, r.From), NodeID(ep.Scope, r.To), r.Relation, r.Confidence)
+		addEdge(r.From, r.To, r.Relation, r.Confidence)
 	}
 
 	if len(nodes) == 0 && len(edges) == 0 && len(aliases) == 0 {
@@ -648,6 +728,9 @@ func (p *Pipeline) write(ctx context.Context, bundle recall.WriteBundle, aliases
 		}
 		rep.MemoryID = put.ID
 		rep.Version = put.Version
+		// 词法索引是否同步：透传 recall.Writer 的结论，
+		// 让调用方在**写入点**就能发现"索引没同步"，而不必事后检索才发现。
+		rep.LexicalIndexed = put.LexicalIndexed
 		for _, n := range bundle.Nodes {
 			rep.NodeIDs = append(rep.NodeIDs, n.ID)
 		}
@@ -883,19 +966,14 @@ func (p *Pipeline) Judge(ctx context.Context, v Verdict) (WriteReport, error) {
 			Relation: RelationNegativeSameAs, Weight: 1, TCreated: now,
 		})
 		// 已有的 possiblySame 边置失效（世界时间），保留行以便审计。
-		if pending, err := p.ports.Graph.Neighbors(ctx, store.NeighborQuery{
-			NodeID: v.KeepNodeID, Scope: v.Scope,
-			Relations: []store.Relation{RelationPossiblySame}, Hops: HardMaxHops,
-		}); err == nil {
-			for _, hop := range pending {
-				if pairKey(hop.Edge.FromID, hop.Edge.ToID) != key {
-					continue
-				}
-				e := hop.Edge
-				e.TInvalid = now
-				edges = append(edges, e)
-			}
-		}
+		//
+		// # 必须**双向**查（M3 的修复）
+		//
+		// 灰区边的方向是「新提及 → 候选」，而裁决时 Keep 往往正是那个候选节点。
+		// 只查 Keep 的出边会一条都查不到，于是陈旧边保持有效：它继续计入 §4 的
+		// 灰区积压护栏，GrayBacklogLimit 一旦触发就**永久**停 L2，且裁决解除不了。
+		// 两端各查一次（与 pairHasPending 已正确的双向实现对齐）。
+		invalidatePending(ctx, p.ports.Graph, v.Scope, v.KeepNodeID, v.OtherNodeID, key, now, &edges)
 	}
 
 	carrier := store.Memory{
@@ -906,6 +984,47 @@ func (p *Pipeline) Judge(ctx context.Context, v Verdict) (WriteReport, error) {
 		TCreated: now, Importance: 0.4,
 	}
 	return p.write(ctx, recall.WriteBundle{Memory: carrier, Edges: edges}, aliases)
+}
+
+// invalidatePending 把某一对节点之间仍然有效的 possiblySame 边置为失效（世界时间）。
+//
+// 两端各查一次：GraphStore.Neighbors 只沿 from→to 方向遍历，只查一端会漏掉
+// 反方向的灰区边（灰区边是「新提及 → 候选」，而 Keep 通常是候选节点）。
+// 未失效的陈旧边会永久计入灰区积压（GrayBacklogLimit），把安全阀变成永久开关。
+func invalidatePending(
+	ctx context.Context, g store.GraphStore, scope store.Scope,
+	a, b, key string, now int64, edges *[]store.Edge,
+) {
+	seen := make(map[string]struct{}, 2)
+	for _, id := range []string{a, b} {
+		if id == "" {
+			continue
+		}
+		pending, err := g.Neighbors(ctx, store.NeighborQuery{
+			NodeID: id, Scope: scope,
+			Relations: []store.Relation{RelationPossiblySame}, Hops: HardMaxHops,
+		})
+		if err != nil {
+			// 邻域不可读不影响裁决本身（negative_SameAs 已写）；
+			// 严格性由 pairHasPending 侧的上报口径覆盖。
+			continue
+		}
+		for _, hop := range pending {
+			if hop.Edge.Relation != RelationPossiblySame {
+				continue
+			}
+			if pairKey(hop.Edge.FromID, hop.Edge.ToID) != key {
+				continue
+			}
+			if _, dup := seen[hop.Edge.ID]; dup {
+				continue
+			}
+			seen[hop.Edge.ID] = struct{}{}
+			e := hop.Edge
+			e.TInvalid = now
+			*edges = append(*edges, e)
+		}
+	}
 }
 
 func sameLabel(same bool) string {

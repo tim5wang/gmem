@@ -107,45 +107,79 @@ func TestNoopExtractorRejectedStillVisible(t *testing.T) {
 // ===========================================================================
 
 // TestGuardGrayBacklogPausesL2 验证"灰区积压 > N → 降级为仅 L0/L1"。
+//
+// # 这条用例原先两处假绿（已修）
+//
+//  1. 整段断言被包在 `if res2.SkippedL2` 里，**没有 else 分支**：护栏失效时
+//     用例静默通过。现在护栏不触发就是 Fatal。
+//  2. 里面写的是 `llm.CallCount() > 0 && res2.EnabledL2()`，而该分支里
+//     `EnabledL2() == !SkippedL2 == false`，所以条件**恒假**。
+//     现在改为对比“运行前/后的调用计数”：真的没有新增调用才算没调模型。
+//
+// # 为什么直接种 2 条 possiblySame 边，而不是靠跑管线攒积压
+//
+// 靠跑管线攒积压依赖消歧分数的巧合（s 必须落进灰区），那个前提一旦漂移，
+// 护栏就变成“没测到但也没报错”。直接种边让积压数成为确定的输入（2），
+// 上限设为 1，于是 2 > 1 必然触发。
 func TestGuardGrayBacklogPausesL2(t *testing.T) {
 	d := openMemoryDB(t)
-	seedSimilarNode(t, d, "n-vim-edit", "vim 编辑器", "vim 编辑器")
-	llm := NewFakeLLM(FakeStep{Text: BuildFinalJSON([]EntityJSON{{Name: "vim 编辑器"}}, nil)})
+	ctx := context.Background()
+	// 种子：2 个带 alias 的节点、各自一条 possiblySame 边指向一个候选节点。
+	if err := d.Graph().PutNode(ctx, store.Node{
+		ID: "n-cand", Scope: store.ScopeUser, CanonicalName: "候选",
+	}); err != nil {
+		t.Fatalf("PutNode(cand): %v", err)
+	}
+	for i, id := range []string{"n-g1", "n-g2"} {
+		if err := d.Graph().PutNode(ctx, store.Node{
+			ID: id, Scope: store.ScopeUser, CanonicalName: id,
+		}); err != nil {
+			t.Fatalf("PutNode(%q): %v", id, err)
+		}
+		surface := "灰区项" + itoa(i)
+		if err := d.Store().PutAlias(ctx, store.Alias{
+			Surface: surface, NodeID: id, Source: "seed", Confidence: 0.9,
+		}); err != nil {
+			t.Fatalf("PutAlias(%q): %v", surface, err)
+		}
+		if err := d.Graph().PutEdge(ctx, store.Edge{
+			ID: "e-pending-" + id, FromID: id, ToID: "n-cand",
+			Relation: RelationPossiblySame, Weight: 0.5, TCreated: 1,
+		}); err != nil {
+			t.Fatalf("PutEdge(%q): %v", id, err)
+		}
+	}
 
-	cfg := Config{GrayBacklogLimit: 0 + 1} // 上限 1
+	llm := NewFakeLLM(FakeStep{Text: BuildFinalJSON([]EntityJSON{{Name: "vim 编辑器"}}, nil)})
+	cfg := Config{GrayBacklogLimit: 1} // 上限 1，积压 2 → 必须触发
 	p := NewPipeline(d.Ports(), cfg, PipelineOptions{
 		Embedder: bigramEmbedder(64), Extractor: NewLLMExtractor(llm, d.Ports(), cfg),
 	})
 
-	// 先制造 2 条灰区积压（两次不同的相似提及）。
-	res1 := mustRun(t, p, RawEpisode{
-		ID: "e-g1", Scope: store.ScopeUser, At: 1000,
+	callsBefore := llm.CallCount()
+	res := mustRun(t, p, RawEpisode{
+		ID: "e-backlog", Scope: store.ScopeUser, At: 1000,
 		Content: "vim 编辑器 是 一个模式化文本编辑器。",
 	})
-	if res1.Reviewable == 0 {
-		t.Fatalf("前置条件：首轮应产生灰区待审项，zones=%+v degraded=%v",
-			zonesOf(res1.Disambiguation), res1.Degraded)
-	}
 
-	// 第 2 段：积压已超上限 → L2 必须暂停，且显式上报。
-	res2 := mustRun(t, p, RawEpisode{
-		ID: "e-g2", Scope: store.ScopeUser, At: 2000,
-		Content: "vim 编辑器 是 一个模式化文本编辑器。",
-	})
-	if res2.SkippedL2 {
-		if res2.EnabledL2() {
-			t.Error("EnabledL2 与 SkippedL2 不得矛盾")
-		}
-		if !strings.Contains(strings.Join(res2.Degraded, " "), "灰区待审积压") {
-			t.Errorf("暂停 L2 必须显式说明原因，实际 %v", res2.Degraded)
-		}
-		// 暂停 L2 后不得再调用模型。
-		if llm.CallCount() > 0 && res2.EnabledL2() {
-			t.Error("SkippedL2 时不应调用 LLM")
-		}
+	// 判据 1（原先缺失）：护栏必须**真的**触发。
+	if !res.SkippedL2 {
+		t.Fatalf("灰区积压 2 > GrayBacklogLimit=1， L2 必须被暂停，实际 SkippedL2=false（warnings=%v）",
+			res.Warnings)
 	}
-	// 无论是否暂停，L0/L1 的写入都必须照常（降级 ≠ 罢工）。
-	if len(res2.Writes) == 0 {
+	if res.EnabledL2() {
+		t.Error("EnabledL2 与 SkippedL2 不得矛盾")
+	}
+	// 判据 2：暂停原因必须可见。
+	if !strings.Contains(strings.Join(res.Degraded, " "), "灰区待审积压") {
+		t.Errorf("暂停 L2 必须显式说明原因，实际 %v", res.Degraded)
+	}
+	// 判据 3（原先恒假）：暂停后不得再调用模型。
+	if got := llm.CallCount() - callsBefore; got != 0 {
+		t.Errorf("SkippedL2 时不得调用 LLM，实际新增 %d 次调用", got)
+	}
+	// 判据 4：降级 ≠ 罢工——L0/L1 的产物仍必须落库。
+	if len(res.Writes) == 0 {
 		t.Error("即使暂停 L2，L0/L1 的产物仍必须落库")
 	}
 }

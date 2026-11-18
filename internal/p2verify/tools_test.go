@@ -44,7 +44,14 @@ func runOneTool(t *testing.T, cfg extract.Config, ports store.Ports, call extrac
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	_ = res
+	// res 不得被丢弃（旧版是 `_ = res`）：工具轮之后的 Extract 仍必须给出合法结果，
+	// 且轨迹要真的记录了两轮调用——否则下面用 reqs[1] 做的断言可能打在空内容上。
+	if len(res.Degraded) != 0 {
+		t.Fatalf("两个工具轮的正常剧本不应产生降级，实际 %v", res.Degraded)
+	}
+	if traj := x.LastTrajectory(); traj.Calls != 2 {
+		t.Fatalf("工具轮 + 终稿轮应恰好 2 次调用，实际 %d（占位断言防空跑）", traj.Calls)
+	}
 	if len(llm.reqs) < 2 {
 		t.Fatalf("应有至少 2 轮请求（工具轮 + 终稿轮），实际 %d 轮", len(llm.reqs))
 	}
