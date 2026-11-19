@@ -85,6 +85,34 @@ func (m *Maintainer) ReviewSimilar(ctx context.Context, req ReviewRequest) (Revi
 	return out, nil
 }
 
+// JudgeRequest 是一次**待审裁决**（`gmem_review` 的写侧）。
+//
+// # 为什么需要它（P4）
+//
+// ReviewSimilar 只列待审对（不写），Merge 只能表达"同一"。而图上裁决有**两个**
+// 结论：同一 → Merge，不同 → 写 negative_SameAs。后者的既有实现藏在
+// disambiguateOp 的 pair_verdict 步骤里，之前没有任何公开入口能触发它。
+//
+// 这里不复制那段逻辑：Judge 仍然只构造 Input.Verdicts 交给同一个 Runner →
+// 同一个 disambiguateOp（D3：Agent 显式调用与自动触发不可能分叉）。
+// 裁决为 same 时 op 内部走的就是 mergeNodes，与 Merge 方法同一实现。
+type JudgeRequest struct {
+	Scope store.Scope
+	// Verdicts 是待落地的裁决，至少一条。Verdict 只接受 "same" / "different"。
+	Verdicts []PairVerdict
+	Actor    string
+	Reason   string
+}
+
+// Judge 落一次裁决：same → Merge（同一实现），different → 写 negative_SameAs。
+func (m *Maintainer) Judge(ctx context.Context, req JudgeRequest) (Result, error) {
+	return m.runner.Run(ctx, Request{
+		Op: OpDisambiguate, Scope: req.Scope,
+		Trigger: Trigger{Kind: TriggerAgent, Actor: actorOf(req.Actor), Reason: reasonOf(req.Reason, "Agent 在图上裁决待审对")},
+		Input:   Input{Verdicts: req.Verdicts},
+	})
+}
+
 // MergeRequest 是 Merge 的请求。
 type MergeRequest struct {
 	Scope    store.Scope
