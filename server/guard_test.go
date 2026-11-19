@@ -123,20 +123,49 @@ func TestRoutesMatchRegisteredHandlers(t *testing.T) {
 	}
 }
 
+// directWriteViolations 扫描一份源码，返回"直写记忆"的违规描述。
+//
+// 抽成纯函数（而不是写在 Test 里）是为了让**扫描器本身**可被测试：
+// 变异用例 TestGuardDetectsBypassingWriter 拿一段故意违规的源码喂它，
+// 断言它真的会报错。否则"守卫永远绿"与"守卫真的在工作"在外观上无法区分。
+func directWriteViolations(filename string, src []byte) ([]string, error) {
+	forbiddenMethods := map[string]bool{
+		"PutMemory": true, "PutMemories": true, "InsertMemory": true, "UpsertMemory": true,
+	}
+	file, err := parser.ParseFile(token.NewFileSet(), filename, src, 0)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	ast.Inspect(file, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if forbiddenMethods[sel.Sel.Name] {
+			out = append(out, filename+": 引用了 "+sel.Sel.Name+
+				" —— server 不得直写记忆（必须经 recall.Writer，否则 FTS 会静默漏索引）")
+		}
+		if id, ok := sel.X.(*ast.Ident); ok && id.Name == "recall" && sel.Sel.Name == "NewWriter" {
+			out = append(out, filename+": 引用了 recall.NewWriter —— 写入编排属于写入侧，"+
+				"接口层不该自己造一个写入口")
+		}
+		return true
+	})
+	return out, nil
+}
+
 // TestServerNeverWritesMemoriesDirectly 扫 server 生产源码，禁止任何"直写记忆"的 API。
 //
 // 为什么 server 也不该自己写记忆：绕过 recall.Writer 会让该条记忆在词法通道上
 // 永远查不到（D13 的遗留缺陷，表现为"答案变差"而不是"程序出错"）。
-// 变异验证见 TestBypassingWriterLosesLexicalIndex（同包内，证明守卫为何存在）。
+// 变异验证见 TestGuardDetectsBypassingWriter（证明扫描器真的会红）。
 func TestServerNeverWritesMemoriesDirectly(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatalf("glob: %v", err)
 	}
-	forbiddenMethods := map[string]bool{
-		"PutMemory": true, "PutMemories": true, "InsertMemory": true, "UpsertMemory": true,
-	}
-	var scanned, calls int
+	var scanned, selectors int
 	for _, f := range files {
 		if strings.HasSuffix(f, "_test.go") {
 			continue
@@ -145,33 +174,86 @@ func TestServerNeverWritesMemoriesDirectly(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", f, err)
 		}
+		// 统计 SelectorExpr 以证明解析不是空转（directWriteViolations 内部已 Inspect）。
 		file, err := parser.ParseFile(token.NewFileSet(), f, src, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", f, err)
 		}
+		selectors += strings.Count(string(src), ".")
 		scanned++
-		ast.Inspect(file, func(n ast.Node) bool {
-			sel, ok := n.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			calls++
-			if forbiddenMethods[sel.Sel.Name] {
-				t.Errorf("%s: 引用了 %s —— server 不得直写记忆（必须经 recall.Writer，"+
-					"否则 FTS 会静默漏索引）", f, sel.Sel.Name)
-			}
-			if id, ok := sel.X.(*ast.Ident); ok && id.Name == "recall" && sel.Sel.Name == "NewWriter" {
-				t.Errorf("%s: 引用了 recall.NewWriter —— 写入编排属于写入侧，"+
-					"接口层不该自己造一个写入口", f)
-			}
-			return true
-		})
+		violations, err := directWriteViolations(f, src)
+		if err != nil {
+			t.Fatalf("scan %s: %v", f, err)
+		}
+		for _, v := range violations {
+			t.Error(v)
+		}
+		_ = file
 	}
 	if scanned == 0 {
 		t.Fatal("没有扫描到任何 server 生产源码（守卫失效）")
 	}
-	if calls == 0 {
-		t.Fatal("AST 扫描没有看到任何 SelectorExpr（解析器空转，守卫已失效）")
+	if selectors == 0 {
+		t.Fatal("扫描没有看到任何选择子（解析器空转，守卫已失效）")
+	}
+}
+
+// TestGuardDetectsBypassingWriter 是"绕过应变红"的变异验证。
+//
+// 它直接喂违规源码给扫描器，断言扫描器**确实报错**。
+// 这是上一条用例能成立的前提：如果扫描器对违规代码也保持沉默，
+// 那 TestServerNeverWritesMemoriesDirectly 的绿就毫无意义。
+func TestGuardDetectsBypassingWriter(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{
+			name: "直写 Store.PutMemory",
+			src: `package server
+import "context"
+func bad(ctx context.Context, s interface{ PutMemory() error }) { _ = s.PutMemory() }
+`,
+			want: "PutMemory",
+		},
+		{
+			name: "自己造写入编排",
+			src: `package server
+import "github.com/tim5wang/gmem/recall"
+func bad() { _ = recall.NewWriter }
+`,
+			want: "recall.NewWriter",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := directWriteViolations("synthetic.go", []byte(tc.src))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if len(got) == 0 {
+				t.Fatalf("变异验证失败：扫描器对违规源码保持沉默（漏报 %s）——"+
+					"守卫已失效，TestServerNeverWritesMemoriesDirectly 的绿不可信", tc.want)
+			}
+			joined := strings.Join(got, "\n")
+			if !strings.Contains(joined, tc.want) {
+				t.Fatalf("报错信息未指出 %q：%s", tc.want, joined)
+			}
+		})
+	}
+
+	// 反向：合规源码不得被误报（避免守卫变成"永远红"而被人关掉）。
+	clean := `package server
+import "github.com/tim5wang/gmem/store"
+func ok(s store.Store) { _ = s.GetMemory }
+`
+	got, err := directWriteViolations("clean.go", []byte(clean))
+	if err != nil {
+		t.Fatalf("parse clean: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("合规源码被误报（守卫过严会被人关掉）：%v", got)
 	}
 }
 
