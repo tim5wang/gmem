@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gmem · Graph View</title>
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <form id="search-form" class="search">
+    <input id="q-input" type="search" placeholder="搜索实体（回家键，写 ?q=）" autocomplete="off">
+    <button type="submit">搜索</button>
+    <button type="button" id="overview-btn" title="清空 focus / q，回到概览（按 concept 折叠）">概览</button>
+  </form>
+
+  <label class="num">hops
+    <input id="hops-input" type="number" min="1" max="8" step="1" value="1">
+  </label>
+  <label class="num">budget
+    <input id="budget-input" type="number" min="1" max="2000" step="1" value="200">
+  </label>
+
+  <span class="spacer"></span>
+  <span id="mode-badge" class="badge" title="入口：focus / search / overview">-</span>
+  <button type="button" id="relayout-btn" title="仅在本地用 d3-force 重算坐标，不回写服务端">重新布局</button>
+  <button type="button" id="copy-btn" title="把当前视图（focus/q/hops/budget/as_of）复制成链接">复制视图链接</button>
+</header>
+
+<div id="banners" class="banners" role="status" aria-live="polite"></div>
+
+<main class="layout">
+  <aside id="filters" class="panel filters">
+    <h2>过滤</h2>
+    <p class="hint">概念与关系类型都是多选；清空 = 不过滤。</p>
+    <h3>concept</h3>
+    <div id="concept-filters" class="checks"></div>
+    <h3>relation</h3>
+    <div id="relation-filters" class="checks"></div>
+
+    <h2>视觉编码</h2>
+    <ul class="legend">
+      <li><span class="sw" data-legend="concept"></span>颜色 = concept</li>
+      <li><span class="sw hatch"></span>斜纹 = draft 概念（本体未认证）</li>
+      <li><span class="sw" data-legend="size"></span>大小 = degree</li>
+      <li><span class="ln solid"></span>实线 = 当前有效边</li>
+      <li><span class="ln dashed"></span>虚线淡边 = 已失效（t_invalid 非零）</li>
+      <li><span class="ln blue"></span>蓝边 = possiblySame（可裁决）</li>
+      <li><span class="sw matched"></span>红描边 = 本次召回命中（matched）</li>
+      <li>边标签只在悬停时出现</li>
+    </ul>
+  </aside>
+
+  <section id="stage" class="stage">
+    <svg id="graph-svg" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="实体关系图"></svg>
+    <canvas id="graph-canvas" hidden></canvas>
+    <div id="tooltip" class="tooltip" hidden></div>
+    <div id="stage-note" class="stage-note" hidden></div>
+  </section>
+
+  <aside id="sidebar" class="panel sidebar">
+    <h2>实体卡</h2>
+    <p class="hint">点击节点查看（GET /api/entity/{id}）；双击节点以它为焦点展开一跳。</p>
+    <div id="entity-card" class="card-body"></div>
+  </aside>
+</main>
+
+<footer class="timeline">
+  <label for="asof-range">as_of 时间轴</label>
+  <input id="asof-range" type="range" min="0" max="1000" step="1" value="1000" disabled>
+  <output id="asof-label">当前</output>
+  <button type="button" id="asof-reset">回到当前</button>
+  <span class="hint">拖动只改边的显隐/浓淡，不重排布局</span>
+</footer>
+
+<div id="confirm-modal" class="modal" hidden>
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+    <h3 id="confirm-title">确认裁决</h3>
+    <p id="confirm-text"></p>
+    <div class="modal-actions">
+      <button type="button" id="confirm-cancel">取消</button>
+      <button type="button" id="confirm-ok" class="danger">确认</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="assets/app.js"></script>
+</body>
+</html>

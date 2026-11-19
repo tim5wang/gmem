@@ -1,0 +1,17 @@
+{
+  "name": "gmem-web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Gmem Graph View 前端（构建输入；产物 web/dist 提交进仓库）",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "d3-force": "3.0.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}

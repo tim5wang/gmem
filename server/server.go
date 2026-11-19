@@ -24,12 +24,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
+	"path"
+	"strconv"
 	"strings"
 
 	"github.com/tim5wang/gmem/ops"
 	"github.com/tim5wang/gmem/recall"
 	"github.com/tim5wang/gmem/store"
+	"github.com/tim5wang/gmem/web"
 )
 
 // Catalog 是**可选**的节点/边枚举端口（概览模式与已失效边补齐需要它）。
@@ -88,15 +92,30 @@ type Route struct {
 	Pattern string
 }
 
-// Routes 返回全部路由。
+// Routes 返回全部 **API** 路由（JSON 接口）。
 //
 // 只有 POST /api/review 是写路由：guard 用例要求"写路由集合 == {POST /api/review}"，
 // 因此新增任何写入口都必须同时改测试（否则变红）。
+//
+// 静态资源（GET / 与 GET /assets/*）单独由 StaticRoutes() 申报：它们不是 JSON
+// 接口，混进来会让"路由表 = API 契约"这件事变模糊；而"它们也必须只读"由
+// 另一个 guard 用例（TestStaticRoutesAreReadOnly）钉死。
 func (s *Server) Routes() []Route {
 	return []Route{
 		{Method: http.MethodGet, Pattern: "/api/graph"},
 		{Method: http.MethodGet, Pattern: "/api/entity/"},
 		{Method: http.MethodPost, Pattern: "/api/review"},
+	}
+}
+
+// StaticRoutes 返回内嵌前端的静态路由（只读）。
+//
+// 与 Routes() 分开的理由：静态资源返回的是 HTML/CSS/JS，不是 JSON 契约；
+// 但"只读优先"同样适用，因此单独申报并单独守卫。
+func (s *Server) StaticRoutes() []Route {
+	return []Route{
+		{Method: http.MethodGet, Pattern: "/"},
+		{Method: http.MethodGet, Pattern: "/assets/"},
 	}
 }
 
@@ -106,6 +125,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/graph", s.guardMethod(http.MethodGet, s.handleGraph))
 	mux.HandleFunc("/api/entity/", s.guardMethod(http.MethodGet, s.handleEntity))
 	mux.HandleFunc("/api/review", s.guardMethod(http.MethodPost, s.handleReview))
+	// GET /assets/* 返回 //go:embed 进来的 web/dist 产物（只读）。
+	mux.HandleFunc("/assets/", s.guardMethod(http.MethodGet, s.handleAsset))
 	mux.HandleFunc("/", s.handleRoot)
 	return mux
 }
@@ -126,15 +147,15 @@ func (s *Server) guardMethod(method string, h http.HandlerFunc) http.HandlerFunc
 	}
 }
 
-// handleRoot 给出可读的服务说明（不是 404 空白页）。
+// handleRoot 返回内嵌的 Graph View 页面（GET /）。
 //
-// 前端静态资源（//go:embed 的 web/dist）由下一张卡接入，本卡只回说明，
-// 这样 `curl /` 能得到"服务在跑、接口在哪"的确定答案。
+// 本卡起，GET / **不再**返回"服务说明 JSON"，而是直接给 web/dist/index.html：
+// 前端产物已 //go:embed 进二进制，`gmem serve` 起来就能用，不需要另跑前端服务
+// （TD §9「运行时依然零外部依赖」）。这是本卡唯一允许替换的既有行为。
+//
+// 其它路径仍回 JSON 404：视图状态全部在 query string 里，不需要 SPA 回退路由，
+// 静默返回 index.html 只会把"URL 打错"伪装成"页面能开"。
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		s.writeError(w, notFound("路径 "+r.URL.Path+" 不存在"))
-		return
-	}
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		s.writeError(w, &apiError{
@@ -143,11 +164,74 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"service": "gmem",
-		"routes":  s.Routes(),
-		"note":    "首版只提供 Graph View 的数据接口（TD §9）；前端静态资源由后续卡片接入",
-	})
+	if r.URL.Path != "/" {
+		s.writeError(w, notFound("路径 "+r.URL.Path+" 不存在"))
+		return
+	}
+	index, err := web.IndexHTML()
+	if err != nil {
+		// 产物缺失是**部署事故**，不能静默回一个空 200。
+		s.writeError(w, internalError(err.Error()))
+		return
+	}
+	s.writeHTML(w, index)
+}
+
+// assetMIME 是内嵌产物里用到的扩展名 → MIME。
+//
+// 为什么不完全依赖 mime.TypeByExtension：`.map`（sourcemap）在多数系统的
+// mime.types 里没有注册，会退化成 application/octet-stream —— 浏览器与
+// 调试器都不认，sourcemap 就等于没交。因此对**我们自己产物**涉及的扩展名
+// 显式声明，其它仍交给标准库。
+var assetMIME = map[string]string{
+	".js":   "text/javascript; charset=utf-8",
+	".mjs":  "text/javascript; charset=utf-8",
+	".css":  "text/css; charset=utf-8",
+	".map":  "application/json; charset=utf-8",
+	".html": "text/html; charset=utf-8",
+	".json": "application/json; charset=utf-8",
+	".svg":  "image/svg+xml",
+}
+
+// contentTypeFor 返回文件对应的 MIME（显式表优先，其次标准库）。
+func contentTypeFor(name string) string {
+	if ct, ok := assetMIME[strings.ToLower(path.Ext(name))]; ok {
+		return ct
+	}
+	if ct := mime.TypeByExtension(path.Ext(name)); ct != "" {
+		return ct
+	}
+	return "application/octet-stream"
+}
+
+// handleAsset 返回内嵌静态资源（GET /assets/{name}）。
+//
+// 只从 embed FS 里取，不碰磁盘：这样二进制可单文件分发，也不会有
+// 路径穿越（web.Asset 已拒绝非法路径与反斜杠）。
+func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/assets/")
+	body, ok := web.Asset(name)
+	if !ok {
+		s.writeError(w, notFound("资源 /assets/"+name+" 不存在"))
+		return
+	}
+	ct := contentTypeFor(name)
+	w.Header().Set("Content-Type", ct)
+	// 产物文件名不带哈希（重建后内容会变），因此统一 no-cache：
+	// 让它每次都回源校验，避免"改了前端但浏览器还是旧画面"。
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+// writeHTML 输出 HTML 页面（与 writeJSON 对称，便于统一加头部）。
+func (s *Server) writeHTML(w http.ResponseWriter, body []byte) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 // apiError 是带 HTTP 语义的错误。

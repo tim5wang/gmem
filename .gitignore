@@ -5,3 +5,7 @@
 # 构建与测试产物
 *.test
 *.out
+
+# 前端构建输入（产物 web/dist 必须提交；这两项绝不进仓库）
+web/src/node_modules/
+web/src/.esbuild/
