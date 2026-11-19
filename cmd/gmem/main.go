@@ -46,20 +46,52 @@ func main() {
 }
 
 // run 是可测试的入口：错误一律返回，由 main 决定退出码。
+//
+// 子命令表就是 TD §10 的命令表（P5 全量落地）。分发本身只做一件事：
+// 把 args[1:] 交给对应实现；**没有任何子命令在这里做业务判断**。
 func run(args []string, stdout, stderr io.Writer) error {
+	return runWithStdin(args, os.Stdin, stdout, stderr)
+}
+
+// runWithStdin 让需要 stdin 的子命令（remember --stdin / forget 交互确认）可测试。
+func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		usage(stderr)
-		return errors.New("缺少子命令（本版本只提供 serve）")
+		return errors.New("缺少子命令（用 gmem help 查看全部子命令）")
 	}
 	switch args[0] {
 	case "serve":
 		return runServe(args[1:], stdout, stderr)
+	case "mcp":
+		return runMCP(args[1:], stdout, stderr)
+	case "remember":
+		return runRemember(args[1:], stdin, stdout, stderr)
+	case "recall":
+		return runRecall(args[1:], stdout, stderr)
+	case "get":
+		return runGet(args[1:], stdout, stderr)
+	case "list":
+		return runList(args[1:], stdout, stderr)
+	case "forget":
+		return runForget(args[1:], stdin, stdout, stderr)
+	case "history":
+		return runHistory(args[1:], stdout, stderr)
+	case "consolidate":
+		return runConsolidate(args[1:], stdout, stderr)
+	case "review":
+		return runReview(args[1:], stdout, stderr)
+	case "graph":
+		return runGraph(args[1:], stdout, stderr)
+	case "doctor":
+		return runDoctor(args[1:], stdout, stderr)
+	case "demo":
+		return runDemo(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		usage(stdout)
 		return nil
 	default:
 		usage(stderr)
-		return fmt.Errorf("未知子命令 %q（本版本只提供 serve，其余动词留给 P5）", args[0])
+		return fmt.Errorf("未知子命令 %q（用 gmem help 查看可用子命令）", args[0])
 	}
 }
 
@@ -67,14 +99,38 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `gmem —— 单体 Agent 记忆系统
 
 用法：
-  gmem serve --db <path> [--addr 127.0.0.1:7700]
+  gmem <子命令> [选项]
 
-serve 的选项：
-  --db     SQLite 数据库文件路径（必填；不存在则自动创建并迁移）
-  --addr   监听地址，默认 `+defaultAddr+`（默认只绑回环，不对外暴露）
+记忆五动词（对齐 Mem0 的 add / search / get_all / delete / history）：
+  gmem remember -f <file>|--stdin --scope user [--kind semantic|episodic|procedural|decision]
+  gmem recall "query" [--explain] [--scope S] [--as-of T] [--k N] [--kind K]
+  gmem get <id>
+  gmem list [--scope S] [--kind K] [--limit N] [--include-invalid]
+  gmem forget <id>|--scope S [-y] [--reason R] [--dry-run]
+  gmem history <id>
 
-说明：本版本只提供 Graph View 的数据接口（GET /api/graph、GET /api/entity/{id}、
-POST /api/review）。完整 CLI（五个动词）与其余页面留给后续版本。
+维护面：
+  gmem consolidate [--scope S] [--limit N]
+  gmem review [--scope S]                 列出待审 possiblySame 池（绝不自动合并）
+
+图与可视化：
+  gmem graph --focus <id> --hops N [--as-of T] [--format json|dot]
+  gmem serve --db <path> [--addr `+defaultAddr+`]
+
+接入与自检：
+  gmem mcp --db <path>                    MCP stdio 服务（JSON-RPC 2.0）
+  gmem doctor --db <path> [--self-test]   逐项体检，存在 FAIL 时退出码非 0
+  gmem demo --db <path> [--force]         向空库写入演示数据（走真实写入路径）
+
+通用选项：
+  --db     SQLite 数据库文件路径（除 help 外均必填；不存在则自动创建并迁移）
+  --json   输出严格 JSON（stdout 上只有一个 JSON 文档，可被 jq 解析）
+
+输出约定：默认人类可读；--json 时 stdout 只放结果（日志不混入）；
+错误一律走 stderr 且退出码非 0。
+
+说明：forget 的语义是**只置 t_invalid、不物理删除**（as_of 仍可回溯）。
+真正的物理删除只有 Prune，且默认只清 Archived。
 `)
 }
 

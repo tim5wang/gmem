@@ -41,13 +41,41 @@ const (
 
 // graphParams 是已校验的请求参数。
 type graphParams struct {
-	focus  string
-	query  string
-	scope  store.Scope
-	hops   int
-	asOf   *int64
-	budget int
-	k      int
+	focus   string
+	query   string
+	concept string
+	scope   store.Scope
+	hops    int
+	asOf    *int64
+	budget  int
+	k       int
+}
+
+// validate 是**唯一**的参数校验实现（HTTP / CLI / MCP 共用）。
+//
+// 为什么单独抽出来：P5 的 `gmem graph` 与 MCP `gmem_graph` 必须与 HTTP 接受
+// 完全相同的输入、给出完全相同的错误。若三处各写一遍校验，就会出现
+// "HTTP 拒绝、CLI 放行"这类静默漂移（而它不会报错，只会让两边行为不一致）。
+func (p graphParams) validate() error {
+	if p.focus != "" && p.query != "" {
+		return badRequest("focus", "focus 与 q 只能二选一（概览模式请两者都不传）")
+	}
+	if p.scope != "" && !p.scope.Valid() {
+		return badRequest("scope", "scope 必须是 user / agent / project / global 之一，收到 %q", p.scope)
+	}
+	if p.hops < 1 {
+		return badRequest("hops", "hops 必须 >= 1，收到 %d", p.hops)
+	}
+	if p.budget < 1 {
+		return badRequest("budget", "budget 必须 >= 1，收到 %d", p.budget)
+	}
+	if p.budget > maxBudget {
+		return badRequest("budget", "budget 不能超过硬上限 %d，收到 %d", maxBudget, p.budget)
+	}
+	if p.k < 1 || p.k > maxSeedK {
+		return badRequest("k", "k 必须在 1..%d 之间，收到 %d", maxSeedK, p.k)
+	}
+	return nil
 }
 
 // parseGraphParams 解析并校验 query string。
@@ -57,11 +85,12 @@ type graphParams struct {
 func parseGraphParams(r *http.Request) (graphParams, error) {
 	q := r.URL.Query()
 	p := graphParams{
-		focus:  q.Get("focus"),
-		query:  q.Get("q"),
-		hops:   defaultHops,
-		budget: defaultBudget,
-		k:      defaultSeedK,
+		focus:   q.Get("focus"),
+		query:   q.Get("q"),
+		concept: q.Get("concept"),
+		hops:    defaultHops,
+		budget:  defaultBudget,
+		k:       defaultSeedK,
 	}
 	if p.focus != "" && p.query != "" {
 		return p, badRequest("focus", "focus 与 q 只能二选一（概览模式请两者都不传）")
@@ -78,9 +107,6 @@ func parseGraphParams(r *http.Request) (graphParams, error) {
 		if err != nil {
 			return p, badRequest("hops", "hops 必须是整数，收到 %q", v)
 		}
-		if n < 1 {
-			return p, badRequest("hops", "hops 必须 >= 1，收到 %d", n)
-		}
 		p.hops = n
 	}
 	if v := q.Get("budget"); v != "" {
@@ -88,21 +114,12 @@ func parseGraphParams(r *http.Request) (graphParams, error) {
 		if err != nil {
 			return p, badRequest("budget", "budget 必须是整数，收到 %q", v)
 		}
-		if n < 1 {
-			return p, badRequest("budget", "budget 必须 >= 1，收到 %d", n)
-		}
-		if n > maxBudget {
-			return p, badRequest("budget", "budget 不能超过硬上限 %d，收到 %d", maxBudget, n)
-		}
 		p.budget = n
 	}
 	if v := q.Get("k"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return p, badRequest("k", "k 必须是整数，收到 %q", v)
-		}
-		if n < 1 || n > maxSeedK {
-			return p, badRequest("k", "k 必须在 1..%d 之间，收到 %d", maxSeedK, n)
 		}
 		p.k = n
 	}
@@ -112,6 +129,10 @@ func parseGraphParams(r *http.Request) (graphParams, error) {
 			return p, badRequest("as_of", "as_of 必须是 unix 秒（整数），收到 %q", v)
 		}
 		p.asOf = &n
+	}
+	// 范围校验统一走 validate（与 CLI / MCP 共用同一实现）。
+	if err := p.validate(); err != nil {
+		return p, err
 	}
 	return p, nil
 }
@@ -238,6 +259,23 @@ func (s *Server) buildGraph(ctx context.Context, p graphParams) (GraphResponse, 
 
 	// 解析节点本体（Neighbors 只给 ID）。
 	degraded = append(degraded, s.resolveNodes(ctx, p.scope, nodes)...)
+
+	// concept 过滤（P5 的 gmem_graph 参数）：只保留该概念下的节点。
+	// 放在 resolveNodes 之后：概念归属要靠解析出来的 node.ConceptID 判定。
+	if p.concept != "" {
+		kept := 0
+		for id, acc := range nodes {
+			if acc.node.ConceptID != p.concept {
+				delete(nodes, id)
+				continue
+			}
+			kept++
+		}
+		if kept == 0 {
+			// 不得静默返回一张空图：明确告知“该概念下没有节点”。
+			degraded = append(degraded, fmt.Sprintf("concept 过滤 %q 未命中任何节点", p.concept))
+		}
+	}
 
 	// 丢边：任何一端的节点都解析不出来 → 这条边画不出来。
 	pruneDanglingEdges(nodes, edges)

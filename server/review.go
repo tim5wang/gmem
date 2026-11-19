@@ -75,6 +75,14 @@ func decodeReview(r *http.Request) (ReviewRequest, error) {
 	if err := json.Unmarshal(body, &req); err != nil {
 		return req, badRequest("body", "请求体不是合法 JSON: %v", err)
 	}
+	return validateReviewRequest(req)
+}
+
+// validateReviewRequest 是**唯一**的裁决请求校验（HTTP / CLI / MCP 共用）。
+//
+// 二次确认与"只接受 same/diff"是数据安全阀：这些规则不得只存在于 HTTP 路径上，
+// 否则 MCP 的 gmem_review 就成了一扇后门（相同的 body 经 stdio 就能绕过）。
+func validateReviewRequest(req ReviewRequest) (ReviewRequest, error) {
 	if req.EdgeID == "" {
 		return req, badRequest("edge_id", "edge_id 必填")
 	}

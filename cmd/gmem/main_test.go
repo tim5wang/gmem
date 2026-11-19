@@ -108,14 +108,19 @@ func TestNoSubcommand(t *testing.T) {
 	}
 }
 
-// TestUnknownSubcommand 未知子命令 → 非零退出 + 说明只有 serve（不假装支持五动词）。
+// TestUnknownSubcommand 未知子命令 → 非零退出 + 用法提示（不假装支持不存在的命令）。
+//
+// P5 之前这条用例拿 "recall" 当未知子命令的例子（那时只提供 serve）。
+// P5 把五动词做成了真实子命令，"recall 必须是未知命令"这个前提已被取代；
+// 用例**要证明的东西没变**：给一个不认识的名字必须非零退出并提示可用命令。
+// 因此这里只把例子换成一个真正不存在的名字，判定条件不动。
 func TestUnknownSubcommand(t *testing.T) {
-	code, _, stderr := runChild(t, "recall", "--q", "x")
+	code, _, stderr := runChild(t, "nosuchverb", "--q", "x")
 	if code == 0 {
 		t.Fatal("未知子命令必须非零退出")
 	}
 	if !strings.Contains(stderr, "serve") {
-		t.Errorf("错误信息应指出本版本只提供 serve：%q", stderr)
+		t.Errorf("错误信息应提示可用的子命令（含 serve）：%q", stderr)
 	}
 }
 
@@ -179,9 +184,12 @@ func TestServeSmoke(t *testing.T) {
 	cmd := exec.Command(os.Args[0])
 	cmd.Env = append(os.Environ(), childEnv+"=1",
 		"GMEM_MAIN_ARGS="+strings.Join([]string{"serve", "--db", dbPath, "--addr", addr}, argsSep))
-	var out strings.Builder
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	// syncBuffer（而不是 strings.Builder）：exec.Cmd 在独立 goroutine 里向它写入，
+	// 而本测试同时读 out.String()。strings.Builder 不支持并发读写，-race 会报
+	// DATA RACE（这是 P4 遗留的**测试**缺陷，与产品代码无关）。
+	out := &syncBuffer{}
+	cmd.Stdout = out
+	cmd.Stderr = out
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}

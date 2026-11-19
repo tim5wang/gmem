@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -22,8 +23,35 @@ import (
 // TestServeSmoke 手法：测试二进制自己作为子进程，在子进程里跑真实 run()。
 // ===========================================================================
 
+// syncBuffer 是并发安全的输出缓冲。
+//
+// # 为什么不能用 strings.Builder（这是 P4 遗留的测试缺陷，P5 修掉）
+//
+// exec.Cmd 会在**独立的 goroutine** 里把子进程的 stdout/stderr 拷进写入端，
+// 而测试主 goroutine 同时调 out.String() 读它——strings.Builder 不支持并发
+// 读写，-race 会直接报 DATA RACE。这是**测试**侧的缺陷，与被测代码无关：
+// 换成带锁的实现即可，断言语义一字不改。
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+// Write 实现 io.Writer（被 exec.Cmd 的拷贝 goroutine 调用）。
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// String 返回当前已写入的全部内容。
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // startServe 起一个真实 serve 子进程并等到 /api/graph 可用，返回 base URL。
-func startServe(t *testing.T, dbPath string) (base string, out *strings.Builder) {
+func startServe(t *testing.T, dbPath string) (base string, out *syncBuffer) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -32,7 +60,7 @@ func startServe(t *testing.T, dbPath string) (base string, out *strings.Builder)
 	addr := ln.Addr().String()
 	_ = ln.Close()
 
-	out = &strings.Builder{}
+	out = &syncBuffer{}
 	cmd := exec.Command(os.Args[0])
 	cmd.Env = append(os.Environ(), childEnv+"=1",
 		"GMEM_MAIN_ARGS="+strings.Join([]string{"serve", "--db", dbPath, "--addr", addr}, argsSep))
