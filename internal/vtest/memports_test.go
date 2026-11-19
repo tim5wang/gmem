@@ -648,22 +648,49 @@ func (g *memGraph) Neighbors(_ context.Context, q store.NeighborQuery) ([]store.
 		return e.TInvalid == 0 && e.TExpired == 0
 	}
 
+	if !q.Direction.Valid() {
+		return nil, errEmptyDirection
+	}
+	direction := q.Direction.Resolve()
+
+	// match / next 与 sqlite 后端的递归项同构：方向决定“看哪一端相等”与“前进目标”。
+	// 在两端都要保持一致，否则 conformance 用例就会变成“一个测试体，两个答案”。
+	match := func(e store.Edge, node string) bool {
+		switch direction {
+		case store.DirectionInbound:
+			return e.ToID == node
+		case store.DirectionBoth:
+			return e.FromID == node || e.ToID == node
+		}
+		return e.FromID == node
+	}
+	next := func(e store.Edge, node string) string {
+		if direction == store.DirectionBoth && e.FromID != node {
+			return e.FromID
+		}
+		if direction == store.DirectionInbound {
+			return e.FromID
+		}
+		return e.ToID
+	}
+
 	best := map[string]store.EdgeHop{}
 	frontier := []string{q.NodeID}
 	for depth := 1; depth <= hops; depth++ {
-		var next []string
+		var nextFrontier []string
 		for _, node := range frontier {
 			for _, e := range g.db.edges {
-				if e.FromID != node || !allowed(e) {
+				if !match(e, node) || !allowed(e) {
 					continue
 				}
+				target := next(e, node)
 				if prev, ok := best[e.ID]; !ok || depth < prev.Depth {
-					best[e.ID] = store.EdgeHop{Edge: e, Depth: depth}
+					best[e.ID] = store.EdgeHop{Edge: e, Depth: depth, Reached: target}
 				}
-				next = append(next, e.ToID)
+				nextFrontier = append(nextFrontier, target)
 			}
 		}
-		frontier = next
+		frontier = nextFrontier
 		if len(frontier) == 0 {
 			break
 		}
@@ -691,9 +718,10 @@ type memErr string
 func (e memErr) Error() string { return string(e) }
 
 const (
-	errEmptyDocID    = memErr("mem: empty document id")
-	errEmptyVectorID = memErr("mem: empty vector id")
-	errMissingNode   = memErr("mem: missing node (foreign key)")
-	errEmptyNodeID   = memErr("mem: empty node id")
-	errEmptyScope    = memErr("mem: empty scope")
+	errEmptyDocID     = memErr("mem: empty document id")
+	errEmptyVectorID  = memErr("mem: empty vector id")
+	errMissingNode    = memErr("mem: missing node (foreign key)")
+	errEmptyNodeID    = memErr("mem: empty node id")
+	errEmptyScope     = memErr("mem: empty scope")
+	errEmptyDirection = memErr("mem: invalid neighbor direction")
 )

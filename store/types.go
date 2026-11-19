@@ -325,6 +325,50 @@ type Vector struct {
 	Values []float32
 }
 
+// NeighborDirection 是邻域遍历的方向（F-8）。
+//
+// # 为什么方向必须是显式参数
+//
+// F-8 之前后端只有 from→to 一种走法，于是"扇入型枢纽"（例如 demo 里的
+// n-demo-acme：入边 2 / 出边 0）focus 出来是一张只有自己的空图——而可视化侧的
+// degree 又是双向统计的，界面上就出现"圆圈很大却一根边都没有"的自相矛盾。
+//
+// 但把遍历一律改成双向同样不对：recall 的 graph lane 是**定向**扩展
+// （"Alice 在哪工作"只该沿 works_at 往外走），一旦静默变双向，召回会多出
+// "谁在用这个节点"这类反向噪声。因此方向做成调用方显式声明的参数：
+// 召回侧用零值（= outbound，行为与 F-8 之前完全一致），可视化侧显式要 both。
+type NeighborDirection string
+
+const (
+	// DirectionOutbound 只沿 from→to 走。**也是零值语义**（见 Resolve）。
+	DirectionOutbound NeighborDirection = "outbound"
+	// DirectionInbound 只沿 to→from 走（"谁指向我"）。
+	DirectionInbound NeighborDirection = "inbound"
+	// DirectionBoth 两个方向都走（可视化默认：任何节点的邻域都要能看见）。
+	DirectionBoth NeighborDirection = "both"
+)
+
+// Resolve 把零值归一成 DirectionOutbound。
+//
+// 零值必须是 outbound 而不是 both：NeighborQuery 有几十个既有调用点
+// （recall / extract / ops / 测试），零值一变语义就等于把它们的召回行为
+// 一起改了——那是 F-8 明确禁止的"静默改语义"。
+func (d NeighborDirection) Resolve() NeighborDirection {
+	if d == "" {
+		return DirectionOutbound
+	}
+	return d
+}
+
+// Valid 判断方向是否可识别；零值视为合法（= DirectionOutbound）。
+func (d NeighborDirection) Valid() bool {
+	switch d.Resolve() {
+	case DirectionOutbound, DirectionInbound, DirectionBoth:
+		return true
+	}
+	return false
+}
+
 // NeighborQuery 是 GraphStore 的邻域查询条件。
 //
 // Scope 是**必填**的隔离边界（§2 "范围隔离是 Port 契约的一部分"）：
@@ -336,12 +380,21 @@ type NeighborQuery struct {
 	Relations []Relation // 空 = 不限；非空 = 只看白名单内的关系
 	Hops      int        // <=0 视为 1；上限由实现裁剪
 	AsOf      *int64     // 非空 = 该时刻有效的边
+	// Direction 是遍历方向。零值 = DirectionOutbound（历史行为，召回侧依赖它）。
+	Direction NeighborDirection
 }
 
 // EdgeHop 是带跳数的边，供召回侧做关系型扩展与 explain。
 type EdgeHop struct {
 	Edge  Edge
 	Depth int
+	// Reached 是这条边在本次遍历中被**走到**的那一端（F-8）。
+	//
+	// Depth 记的就是它的距离：outbound 时恒等于 Edge.ToID（与历史语义一致），
+	// inbound 时是 Edge.FromID，both 时是实际前进的那一端。
+	// 上层据此算两端深度（Reached 是 Depth，另一端是 Depth-1）——
+	// 少了这个字段，双向遍历就只能靠猜哪端更近，枢纽节点的 depth 会算错。
+	Reached string
 }
 
 // ---------------------------------------------------------------------------

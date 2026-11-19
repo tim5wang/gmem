@@ -154,23 +154,24 @@ func (s *Server) edgesOfNode(ctx context.Context, scope store.Scope, id string) 
 	if s.ports.Graph == nil {
 		return nil, []string{"边表与图端口都不可用"}
 	}
-	// 退路：按关系逐个 Neighbors（含入边需要反向再查一次，这里保守只取出边并声明降级）。
+	// 退路：按关系逐个 Neighbors。方向必须显式取 both：实体卡要列出“全部关系
+	// （含方向与对端）”，而只走出边时入边永远看不到（F-8 之前就是这样）。
 	table := newHopTable(s.recallerConfigRules())
 	var out []store.Edge
 	for _, rel := range table.relations() {
 		hops, err := s.ports.Graph.Neighbors(ctx, store.NeighborQuery{
 			NodeID: id, Scope: scope, Relations: []store.Relation{rel}, Hops: 1,
+			Direction: store.DirectionBoth,
 		})
 		if err != nil {
 			continue
 		}
 		for _, h := range hops {
-			if h.Edge.FromID == id {
-				out = append(out, h.Edge)
-			}
+			// both 方向下每条返回的边都必然有一端是这个节点（起点），直接收集。
+			out = append(out, h.Edge)
 		}
 	}
-	return out, []string{"后端未提供边表端口：入边与已失效边可能缺失（实体卡不完整）"}
+	return out, []string{"后端未提供边表端口：已失效边可能缺失（实体卡不完整）"}
 }
 
 // groupRelations 把边按关系归组，并给出"为何生效 / 替换了什么"。

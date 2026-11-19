@@ -320,6 +320,12 @@ func (s *Server) buildGraph(ctx context.Context, p graphParams) (GraphResponse, 
 // **跳数裁剪复用 recall 的关系传递性表**：每个关系先查表得到 MaxHops，
 // 再与请求跳数取更严者；跳数相同的关系统一放进一次 Neighbors 调用
 // （GraphStore 的白名单是按关系传的，因此不能把不同跳数的关系混在一起）。
+//
+// **方向固定为 both（F-8）**：可视化要回答“这个实体旁边有什么”，答案不分正反。
+// 之前只沿 from→to 走，于是扇入型枢纽（如 acme：入边 2/出边 0）focus 出来
+// 是 nodes=1 edges=0 的空图，而 degree（下一段按最终边集双向统计）却很大——
+// 界面上就是“圆圈很大却一根边都没有”。注意这**不是**把端口默认值改成双向：
+// recall 的 graph lane 继续用零值（= outbound），它的定向语义不能被可视化拖下水。
 func (s *Server) expand(ctx context.Context, scope store.Scope, seeds []string, requested int,
 	asOf *int64, table hopTable, nodes map[string]*nodeAcc, edges map[string]*edgeAcc) ([]string, error) {
 	if s.ports.Graph == nil {
@@ -345,6 +351,7 @@ func (s *Server) expand(ctx context.Context, scope store.Scope, seeds []string, 
 		for _, h := range hopValues {
 			hops, err := s.ports.Graph.Neighbors(ctx, store.NeighborQuery{
 				NodeID: seed, Scope: scope, Relations: groups[h], Hops: h, AsOf: asOf,
+				Direction: store.DirectionBoth,
 			})
 			if err != nil {
 				// 单次遍历失败不整单失败：显式降级并继续其它关系簇，
@@ -361,13 +368,32 @@ func (s *Server) expand(ctx context.Context, scope store.Scope, seeds []string, 
 				if !ok || eh.Depth < prev.depth {
 					edges[key] = &edgeAcc{edge: eh.Edge, depth: eh.Depth, fromNeighbors: true}
 				}
-				// 节点深度：from 比边浅一跳，to 与边同跳。
-				recordDepth(nodes, eh.Edge.FromID, eh.Depth-1)
-				recordDepth(nodes, eh.Edge.ToID, eh.Depth)
+				// 节点深度：被走到的那端与边同跳，另一端浅一跳。
+				//
+				// 不能写死 "from 浅/to 深"：Direction=both 时一条边可能从 to 端走过来，
+				// 此时 closer 的是 to（不是 from）。写死会让枢纽节点的全部邻居都
+				// 被算成比种子还浅或更深，前端 depth 视觉编码跟着说谎。
+				reached, far := hopEnds(eh)
+				recordDepth(nodes, reached, eh.Depth)
+				recordDepth(nodes, far, eh.Depth-1)
 			}
 		}
 	}
 	return degraded, nil
+}
+
+// hopEnds 返回 (被走到的端点, 另一端)。
+//
+// Reached 为零值时退化为 outbound 语义（to 端是前进目标）：那是 F-8 之前的
+// 后端约定，不能因为新字段缺失就让老实现算出镜像的深度。
+func hopEnds(eh store.EdgeHop) (reached, far string) {
+	switch eh.Reached {
+	case eh.Edge.FromID:
+		return eh.Edge.FromID, eh.Edge.ToID
+	case eh.Edge.ToID:
+		return eh.Edge.ToID, eh.Edge.FromID
+	}
+	return eh.Edge.ToID, eh.Edge.FromID
 }
 
 // recordDepth 只在更浅时更新节点深度（同节点经多条边到达时取最短）。
@@ -421,25 +447,29 @@ func (s *Server) fillEdgesFromCatalog(ctx context.Context, scope store.Scope, p 
 		}
 		// 已失效边仍要返回（前端画虚线），但它的对端可能只靠这条失效边才可达：
 		// Neighbors 不会遍历失效边，于是对端不会出现在节点集里，虚线边就永远画不出来。
-		// 因此在这里把缺失的对端补成节点（方向恒为 from 浅一跳、to 深一跳）。
+		// 因此在这里把缺失的对端补成节点。
+		//
+		// **缺失的一端一律比已知的一端深一跳（F-8）**：补出来的面只能是"从视图里
+		// 已可见的部分再往外一层"，因为这条边是我们唯一能看到它的途径。
+		//
+		// 曾经这里写死了"from 浅一跳 / to 深一跳"，于是当焦点本身就是 to 端
+		// （扇入型枢纽）且它唯一的入边已失效时，代码会认为"种子已是最浅，不能再往上补"
+		// 而直接跳过——枢纽依旧是一张空图（实测 nodes=[n-b] edges=0）。
+		// 方向改成 both 之后，哪一端离种子更近不再由边自身决定，只能由视图决定。
 		//
 		// 概览模式（无 focus/q）不受跳数约束：那时节点集是全量的，没有"种子"概念。
 		if p.focus != "" || p.query != "" {
 			limit := table.effectiveHops(e.Relation, p.hops).MaxHops
-			if okF && !okT && from.depth+1 > limit {
-				continue
+			known := from
+			if okT {
+				known = to
 			}
-			if !okF && okT {
-				if to.depth == 0 {
-					continue // 种子本身已是最浅，不能再往上补一层
-				}
-				if to.depth-1 > limit {
-					continue
-				}
+			if known != nil && known.depth+1 > limit {
+				continue
 			}
 		}
 		if !okF {
-			from = &nodeAcc{depth: maxInt(to.depth-1, 0)}
+			from = &nodeAcc{depth: to.depth + 1}
 			nodes[e.FromID] = from
 		}
 		if !okT {

@@ -40,6 +40,20 @@ type harness struct {
 // newHarness 起一个内存库 + 完整装配的 HTTP 服务。
 func newHarness(t *testing.T, cfgs ...recall.Config) *harness {
 	t.Helper()
+	return newHarnessWith(t, true, cfgs...)
+}
+
+// newHarnessNoCatalog 起一个**不注入 Catalog** 的服务装配。
+//
+// 存在的理由：server 的 edgesOfNode 有两条路径（边表端口 / 退化为 Neighbors），
+// 只测前者就永远不知道后者能不能看到入边——而 F-8 的修复点之一正是在那条路上。
+func newHarnessNoCatalog(t *testing.T, cfgs ...recall.Config) *harness {
+	t.Helper()
+	return newHarnessWith(t, false, cfgs...)
+}
+
+func newHarnessWith(t *testing.T, withCatalog bool, cfgs ...recall.Config) *harness {
+	t.Helper()
 	db, err := sqlite.Open(context.Background(), sqlite.Config{})
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -57,9 +71,11 @@ func newHarness(t *testing.T, cfgs ...recall.Config) *harness {
 	}
 	rec := recall.New(ports, cfg, nil)
 	maint := ops.NewMaintainer(runner)
-	srv, err := server.New(server.Options{
-		Ports: ports, Recaller: rec, Maintainer: maint, Catalog: db.OpsBackend(),
-	})
+	opts := server.Options{Ports: ports, Recaller: rec, Maintainer: maint}
+	if withCatalog {
+		opts.Catalog = db.OpsBackend()
+	}
+	srv, err := server.New(opts)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}

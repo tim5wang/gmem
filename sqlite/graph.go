@@ -185,7 +185,23 @@ func latestEdge(ctx context.Context, q querier, id string) (store.Edge, bool, er
 	return e, true, nil
 }
 
-// Neighbors 用递归 CTE 从 NodeID 出发做 ≤Hops 跳的**定向**遍历（只沿 from→to）。
+// Neighbors 用递归 CTE 从 NodeID 出发做 ≤Hops 跳的遍历，方向由 Direction 显式指定。
+//
+// 方向（F-8）：零值 = DirectionOutbound（只沿 from→to，与历史行为逐字节一致），
+// DirectionInbound 反向走 to→from，DirectionBoth 两个方向都走。
+//
+// # 为什么不是"直接改成双向"
+//
+// 本方法是 recall / extract / ops 共用的端口方法，它们的语义是"从锚点往外扩"。
+// 默认变双向会静默改动召回结果（多出"谁指向我"的反向噪声），而调用方无从察觉。
+// 因此方向是显式参数，可视化侧自己去要 both。
+//
+// # 双向为什么不会爆炸
+//
+// walk 的 UNION 去重键是 (node, depth)：同一节点在两个方向、同一跳数进来只算一次，
+// 因此 walk 的规模上界是 |nodes| × hops；hops 另有 maxHops 硬上限。
+// 前进目标必须按方向算对（inbound 时是 e.from_id），否则会把起点自己当成
+// 邻居反复入栈。
 //
 // 关系白名单（§5 R3）由 Relations 传入：传递性关系允许更多跳、非传递关系只给 1 跳，
 // 这个决定属于 Recall Planner，GraphStore 只按约束遍历，不猜意图。
@@ -207,6 +223,10 @@ func (g *graphStore) Neighbors(ctx context.Context, q store.NeighborQuery) ([]st
 	if !q.Scope.Valid() {
 		return nil, fmt.Errorf("sqlite: neighbors: invalid scope %q", q.Scope)
 	}
+	if !q.Direction.Valid() {
+		return nil, fmt.Errorf("sqlite: neighbors: invalid direction %q", q.Direction)
+	}
+	direction := q.Direction.Resolve()
 	hops := q.Hops
 	if hops <= 0 {
 		hops = 1
@@ -241,9 +261,30 @@ func (g *graphStore) Neighbors(ctx context.Context, q store.NeighborQuery) ([]st
 		filterSQL += ` AND e.t_invalid IS NULL AND e.t_expired IS NULL`
 	}
 
+	// 方向（F-8）决定三件事：递归项/终极 SELECT 的**连接条件**、"前进目标"表达式、
+	// 以及返回体里的 reached 列。三者必须由同一处拼接，否则很容易出现
+	// "按入边选中了边、却把起点自己当成前进目标"这类形状（会无限入栈）。
+	//
+	// outbound 与 inbound 各自只有一个谓词，能吃到 idx_edges_from_rel / idx_edges_to；
+	// both 是 OR 谓词（SQLite 会走 MULTI-INDEX OR）。
+	var matchSQL, nextSQL string
+	switch direction {
+	case store.DirectionInbound:
+		matchSQL = `e.to_id = w.node`
+		nextSQL = `e.from_id`
+	case store.DirectionBoth:
+		matchSQL = `(e.from_id = w.node OR e.to_id = w.node)`
+		// both：从哪一端走到，就从另一端继续。少了这个 CASE，
+		// 同一个节点会把自己当成邻居反复入栈（一直要到 hops 上限才停）。
+		nextSQL = `CASE WHEN e.from_id = w.node THEN e.to_id ELSE e.from_id END`
+	default: // store.DirectionOutbound（零值，历史行为）
+		matchSQL = `e.from_id = w.node`
+		nextSQL = `e.to_id`
+	}
+
 	// 两处拼接共用同一段过滤条件（递归项与终极 SELECT 各一份）。
 	joinSQL := `
-		JOIN edges e ON e.from_id = w.node
+		JOIN edges e ON ` + matchSQL + `
 		JOIN nodes fn ON fn.id = e.from_id
 		JOIN nodes tn ON tn.id = e.to_id
 		WHERE true` + scopeSQL + filterSQL
@@ -252,12 +293,12 @@ func (g *graphStore) Neighbors(ctx context.Context, q store.NeighborQuery) ([]st
 WITH RECURSIVE walk(node, depth) AS (
 	SELECT ?, 0
 	UNION
-	SELECT e.to_id, w.depth + 1
+	SELECT ` + nextSQL + `, w.depth + 1
 	FROM walk w` + joinSQL + `
 	  AND w.depth < ?
 )
 SELECT e.id, e.version, e.from_id, e.to_id, e.relation, e.weight, e.t_valid, e.t_invalid,
-       e.t_created, e.t_expired, w.depth + 1 AS hop
+       e.t_created, e.t_expired, w.depth + 1 AS hop, ` + nextSQL + ` AS reached
 FROM walk w` + joinSQL + `
   AND w.depth < ?
 ORDER BY hop ASC, e.id ASC, e.version DESC`
@@ -284,6 +325,7 @@ ORDER BY hop ASC, e.id ASC, e.version DESC`
 	best := make(map[string]store.EdgeHop, 8)
 	for rows.Next() {
 		var hop int
+		var reached string
 		var raw struct {
 			ID  string
 			Ver int
@@ -297,7 +339,7 @@ ORDER BY hop ASC, e.id ASC, e.version DESC`
 			TE  sql.NullInt64
 		}
 		if err := rows.Scan(&raw.ID, &raw.Ver, &raw.F, &raw.T, &raw.R, &raw.W, &raw.TV,
-			&raw.TI, &raw.TC, &raw.TE, &hop); err != nil {
+			&raw.TI, &raw.TC, &raw.TE, &hop, &reached); err != nil {
 			return nil, fmt.Errorf("sqlite: neighbors scan: %w", err)
 		}
 		e := store.Edge{
@@ -309,7 +351,7 @@ ORDER BY hop ASC, e.id ASC, e.version DESC`
 		if prev, ok := best[e.ID]; ok && prev.Depth <= hop {
 			continue // 环导致重复：保留更短的路径
 		}
-		best[e.ID] = store.EdgeHop{Edge: e, Depth: hop}
+		best[e.ID] = store.EdgeHop{Edge: e, Depth: hop, Reached: reached}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("sqlite: neighbors iterate: %w", err)
