@@ -107,6 +107,17 @@ func (s *Server) applyReview(ctx context.Context, req ReviewRequest) (ReviewResp
 			"边 %q 的关系是 %q，只有 %q 边可以在这里裁决",
 			edge.ID, edge.Relation, relationPossiblySame)
 	}
+	// 已裁决过的边**不能再裁决**：判过 diff 的边会被写成 negative_SameAs 并置
+	// TInvalid，但那条 possiblySame 边本身仍然留在库里（保留历史，不过滤）。
+	// 若不在这里拦住，同一 edge_id 还能再判一次 same → Merge 真的落地，把
+	// 用户**已经判成不同**的两个实体合并掉（TD §4：误合并最难恢复）。
+	// 门禁放在服务端：UI 的条件只是提示，不能当唯一防线。
+	if edge.TInvalid != 0 {
+		return ReviewResponse{}, badRequest("edge_id",
+			"边 %q 已于 t_invalid=%d 失效（裁决已落地），不能重复裁决："+
+				"如需改判请对本对实体新建待审边",
+			edge.ID, edge.TInvalid)
+	}
 	from, to := edge.FromID, edge.ToID
 	if from == "" || to == "" {
 		return ReviewResponse{}, badRequest("edge_id", "边 %q 端点不完整，无法裁决", edge.ID)

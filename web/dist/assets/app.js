@@ -336,13 +336,36 @@ function render(host, scene, opts) {
   if (!useCanvas) {
     canvas.hidden = true;
     svg.hidden = false;
-    renderSVG(svg, scene, opts);
-    return "svg";
+    const out2 = renderSVG(svg, scene, opts);
+    return { renderer: "svg", ...out2 };
   }
   svg.hidden = true;
   canvas.hidden = false;
-  renderCanvas(canvas, scene, opts);
-  return "canvas";
+  const out = renderCanvas(canvas, scene, opts);
+  return { renderer: "canvas", ...out };
+}
+function isPendingReview(e) {
+  return Boolean(e.style.possiblySame) && !e.style.invalid;
+}
+function edgeEndpoints(a2, b, ra, rb) {
+  const dx = b.x - a2.x;
+  const dy = b.y - a2.y;
+  const len = Math.hypot(dx, dy);
+  if (!(len > 0.01)) return { x1: a2.x, y1: a2.y, x2: b.x, y2: b.y };
+  const gap = 2;
+  let t1 = (ra + gap) / len;
+  let t2 = 1 - (rb + gap) / len;
+  if (t2 - t1 < 0.08) {
+    const m2 = Math.max(0, Math.min(1, (t1 + t2) / 2));
+    t1 = Math.max(0, Math.min(1, m2 - 0.04));
+    t2 = Math.max(0, Math.min(1, m2 + 0.04));
+  }
+  return {
+    x1: a2.x + dx * t1,
+    y1: a2.y + dy * t1,
+    x2: a2.x + dx * t2,
+    y2: a2.y + dy * t2
+  };
 }
 function renderSVG(svg, scene, opts) {
   const { width, height } = opts;
@@ -379,17 +402,25 @@ function renderSVG(svg, scene, opts) {
   }
   const pos = /* @__PURE__ */ new Map();
   for (const n of scene.nodes) pos.set(n.id, project(n.x, n.y));
-  for (const e of scene.edges) {
+  const nodeRadius2 = /* @__PURE__ */ new Map();
+  for (const n of scene.nodes) nodeRadius2.set(n.id, n.r);
+  const ordered = [
+    ...scene.edges.filter((e) => !isPendingReview(e)),
+    ...scene.edges.filter(isPendingReview)
+  ];
+  for (const e of ordered) {
     const a2 = pos.get(e.from);
     const b = pos.get(e.to);
     if (!a2 || !b) continue;
+    const pending = isPendingReview(e);
+    const seg = edgeEndpoints(a2, b, nodeRadius2.get(e.from) ?? 0, nodeRadius2.get(e.to) ?? 0);
     const line = el("line", {
-      x1: a2.x.toFixed(1),
-      y1: a2.y.toFixed(1),
-      x2: b.x.toFixed(1),
-      y2: b.y.toFixed(1),
-      stroke: e.style.possiblySame ? STYLE.edgePossiblySameColor : e.style.invalid ? STYLE.edgeInvalidColor : STYLE.edgeColor,
-      "stroke-width": String(e.style.possiblySame ? 2 : 1.2),
+      x1: seg.x1.toFixed(1),
+      y1: seg.y1.toFixed(1),
+      x2: seg.x2.toFixed(1),
+      y2: seg.y2.toFixed(1),
+      stroke: pending ? STYLE.edgePossiblySameColor : e.style.invalid ? STYLE.edgeInvalidColor : STYLE.edgeColor,
+      "stroke-width": String(pending ? 2 : 1.2),
       "stroke-opacity": String(e.style.opacity),
       // 失效边画虚线 = 保留历史（不过滤）。
       "stroke-dasharray": e.style.dashed ? "4 3" : "none",
@@ -397,27 +428,41 @@ function renderSVG(svg, scene, opts) {
       "data-from": e.from,
       "data-to": e.to,
       "data-invalid": e.style.invalid ? "1" : "0",
+      // data-possibly-same 保留服务端语义（关系名），class 才代表“现在可裁决”。
       "data-possibly-same": e.style.possiblySame ? "1" : "0",
-      class: `edge${e.style.possiblySame ? " possibly-same" : ""}${e.style.invalid ? " invalidated" : ""}`
+      "data-pending": pending ? "1" : "0",
+      class: `edge${pending ? " possibly-same" : ""}${e.style.invalid ? " invalidated" : ""}`
     });
     gEdges.appendChild(line);
   }
+  const drillable = Boolean(scene.meta?.truncated);
   for (const c2 of scene.clusters) {
     const p = clusterPos.get(c2.id || c2.concept_id || "");
     if (!p) continue;
     const r = 10 + Math.min(30, Math.sqrt(Math.max(1, c2.count)) * 3.2);
     const g = el("g", {
-      class: "cluster",
+      class: `cluster${drillable ? " drillable" : ""}`,
       "data-cluster-id": c2.concept_id || "",
       "data-cluster-name": c2.concept_name || c2.id || "",
       "data-count": String(c2.count),
       transform: `translate(${p.x.toFixed(1)},${p.y.toFixed(1)})`
     });
+    if (drillable) {
+      g.appendChild(el("circle", {
+        class: "cluster-hit",
+        r: r.toFixed(1),
+        fill: "transparent",
+        stroke: "none",
+        "pointer-events": "auto",
+        "data-cluster-id": c2.concept_id || ""
+      }));
+    }
     g.appendChild(el("circle", {
       r: r.toFixed(1),
       fill: c2.concept_status === "draft" ? "url(#draft-hatch)" : STYLE.clusterFill,
       stroke: c2.matched ? STYLE.matchedStroke : STYLE.clusterStroke,
-      "stroke-width": c2.matched ? "2.5" : "1.5"
+      "stroke-width": c2.matched ? "2.5" : "1.5",
+      "pointer-events": "none"
     }));
     const label = el("text", {
       "text-anchor": "middle",
@@ -504,15 +549,42 @@ function renderCanvas(canvas, scene, opts) {
   const project = makeProjector(scene, width, height);
   const pos = /* @__PURE__ */ new Map();
   for (const n of scene.nodes) pos.set(n.id, project(n.x, n.y));
-  for (const e of scene.edges) {
+  const nodeRadius2 = /* @__PURE__ */ new Map();
+  for (const n of scene.nodes) nodeRadius2.set(n.id, n.r);
+  const ordered = [
+    ...scene.edges.filter((e) => !isPendingReview(e)),
+    ...scene.edges.filter(isPendingReview)
+  ];
+  for (const e of ordered) {
     const a2 = pos.get(e.from);
     const b = pos.get(e.to);
     if (!a2 || !b) continue;
+    const pending = isPendingReview(e);
+    const seg = edgeEndpoints(a2, b, nodeRadius2.get(e.from) ?? 0, nodeRadius2.get(e.to) ?? 0);
     ctx.save();
     ctx.globalAlpha = e.style.opacity;
-    ctx.strokeStyle = e.style.possiblySame ? STYLE.edgePossiblySameColor : e.style.invalid ? STYLE.edgeInvalidColor : STYLE.edgeColor;
-    ctx.lineWidth = e.style.possiblySame ? 2 : 1;
+    ctx.strokeStyle = pending ? STYLE.edgePossiblySameColor : e.style.invalid ? STYLE.edgeInvalidColor : STYLE.edgeColor;
+    ctx.lineWidth = pending ? 2 : 1;
     if (e.style.dashed) ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(seg.x1, seg.y1);
+    ctx.lineTo(seg.x2, seg.y2);
+    ctx.stroke();
+    ctx.restore();
+  }
+  const clusterPos = /* @__PURE__ */ new Map();
+  for (const c2 of scene.clusters) {
+    clusterPos.set(c2.id || c2.concept_id || "", project(c2.x, c2.y));
+  }
+  for (const ce of scene.clusterEdges || []) {
+    const a2 = clusterPos.get(ce.from);
+    const b = clusterPos.get(ce.to);
+    if (!a2 || !b) continue;
+    ctx.save();
+    ctx.strokeStyle = STYLE.clusterStroke;
+    ctx.globalAlpha = ce.invalidated ? 0.25 : 0.55;
+    ctx.lineWidth = Math.min(4, 1 + Math.log2(Math.max(1, ce.count)));
+    if (ce.invalidated) ctx.setLineDash([4, 3]);
     ctx.beginPath();
     ctx.moveTo(a2.x, a2.y);
     ctx.lineTo(b.x, b.y);
@@ -557,7 +629,7 @@ function renderCanvas(canvas, scene, opts) {
     }
     ctx.restore();
   }
-  return { project, pos };
+  return { project, pos, clusterPos };
 }
 function hitTest(scene, project, x2, y2) {
   let best = null;
@@ -1599,10 +1671,10 @@ async function loadView(view) {
   }
   state.raw = resp;
   state.baseScene = buildScene(resp, { asOf: parsed.asOf });
-  applyFiltersAndDraw();
   renderBanners();
   renderFilterPanel();
   renderTimeline();
+  applyFiltersAndDraw();
 }
 function applyFiltersAndDraw() {
   if (!state.baseScene) return;
@@ -1623,11 +1695,17 @@ function stageSize() {
 }
 function draw() {
   if (!state.scene) return;
-  const size = stageSize();
   const useCanvas = shouldUseCanvas(state.scene, MAX_SVG);
   const host = { svg: dom.svg, canvas: dom.canvas };
-  const result = render(host, state.scene, { ...size, useCanvas });
-  state.project = (x2, y2) => result.project(x2, y2);
+  let size = stageSize();
+  let result = null;
+  for (let i = 0; i < 3; i++) {
+    result = render(host, state.scene, { ...size, useCanvas });
+    const again = stageSize();
+    if (again.width === size.width && again.height === size.height) break;
+    size = again;
+  }
+  state.project = result.project;
   dom.stage.dataset.renderer = useCanvas ? "canvas" : "svg";
   dom.stage.dataset.nodes = String(state.scene.nodes.length);
   dom.stage.dataset.clusters = String(state.scene.clusters.length);
@@ -1770,7 +1848,7 @@ function bindInteractions(useCanvas) {
       line.addEventListener("mouseenter", (ev) => showEdgeTooltip(edgeId, ev));
       line.addEventListener("mouseleave", hideTooltip);
     }
-    for (const g of dom.svg.querySelectorAll("g.cluster")) {
+    for (const g of dom.svg.querySelectorAll("g.cluster.drillable")) {
       const conceptId = g.getAttribute("data-cluster-id");
       g.addEventListener("click", (ev) => {
         ev.stopPropagation();
@@ -1795,7 +1873,7 @@ function bindInteractions(useCanvas) {
         lastClickAt = now2;
         return;
       }
-      const cluster = hitTestCluster(state.scene, state.project, x2, y2);
+      const cluster = state.scene.meta?.truncated ? hitTestCluster(state.scene, state.project, x2, y2) : null;
       if (cluster) drillIntoCluster(cluster.concept_id || "");
     };
     canvas.onmousemove = (ev) => {
@@ -1945,15 +2023,15 @@ dom.budgetInput.addEventListener("change", () => {
 dom.conceptFilters.addEventListener("change", (ev) => {
   if (ev.target?.dataset?.role !== "concept") return;
   toggleFilter(state.conceptFilter, ev.target.value, ev.target.checked);
-  applyFiltersAndDraw();
   renderBanners();
+  applyFiltersAndDraw();
   renderStageNote(buildStageNote());
 });
 dom.relationFilters.addEventListener("change", (ev) => {
   if (ev.target?.dataset?.role !== "relation") return;
   toggleFilter(state.relationFilter, ev.target.value, ev.target.checked);
-  applyFiltersAndDraw();
   renderBanners();
+  applyFiltersAndDraw();
   renderStageNote(buildStageNote());
 });
 function toggleFilter(set2, value, checked) {
@@ -2017,6 +2095,7 @@ function drillIntoCluster(conceptId) {
 function openReview(edgeId) {
   const edge = state.scene?.edges.find((e) => e.id === edgeId);
   if (!edge) return;
+  if (!isPendingReview(edge)) return;
   const from = state.scene.nodes.find((n) => n.id === edge.from);
   const to = state.scene.nodes.find((n) => n.id === edge.to);
   const label = `${from?.canonical_name || edge.from} ⇄ ${to?.canonical_name || edge.to}`;
@@ -2114,7 +2193,8 @@ function showEdgeTooltip(edgeId, ev) {
   if (!e) return;
   dom.tooltipEdge = edgeId;
   dom.tooltip.hidden = false;
-  dom.tooltip.textContent = `${e.relation} · ${e.from} → ${e.to} · weight=${e.weight} · t_valid=${e.t_valid}${e.t_invalid ? ` · t_invalid=${e.t_invalid}` : ""}` + (e.style.invalid ? " · 本次视角已失效（虚线保留）" : "") + (e.style.possiblySame ? " · 待审（点击可裁决）" : "");
+  dom.tooltip.textContent = `${e.relation} · ${e.from} → ${e.to} · weight=${e.weight} · t_valid=${e.t_valid}${e.t_invalid ? ` · t_invalid=${e.t_invalid}` : ""}` + (e.style.invalid ? " · 本次视角已失效（虚线保留）" : "") + // 已失效的边不得再自称“待审”：那句提示就是“同一/不同”按钮的入口。
+  (isPendingReview(e) ? " · 待审（点击可裁决）" : "");
   moveTooltip(ev);
 }
 function moveTooltip(ev) {

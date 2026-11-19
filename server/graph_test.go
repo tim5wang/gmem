@@ -578,6 +578,49 @@ func TestGraphErrors(t *testing.T) {
 	}
 }
 
+// TestBudgetHardLimitBoundary 【F-6 回归】maxBudget=2000 的**边界**必须被钉死。
+//
+// 背景：既有用例只用 budget=5000 测越界，而 5000 > 3000 也成立，所以把
+// maxBudget 从 2000 改成 3000（甚至 4999）时全部测试仍然绿 —— 上限附近有一个
+// 宽度未知的“静默漂移窗口”。这里直接钉住边界两侧：
+//
+//	budget=2000 → 200，且 meta.budget=2000 / meta.budget_max=2000
+//	budget=2001 → 400，field=budget，message 可读
+//
+// 变异验证：把 server/graph.go 的 maxBudget 改成 2001/3000，下面第一条会红。
+func TestBudgetHardLimitBoundary(t *testing.T) {
+	h := newHarness(t)
+	h.node("alice", "Alice", store.ScopeUser, "c")
+
+	// 上限本身必须被接受，并把 budget / budget_max 如实回显。
+	status, resp, body := h.getGraph("?budget=2000")
+	if status != http.StatusOK {
+		t.Fatalf("budget=2000 是硬上限内的合法值，必须 200，实际 %d (body=%s)", status, body)
+	}
+	if resp.Meta.Budget != 2000 {
+		t.Errorf("meta.budget=%d, want 2000（不得静默夹取）", resp.Meta.Budget)
+	}
+	if resp.Meta.BudgetMax != 2000 {
+		t.Errorf("meta.budget_max=%d, want 2000（外壳靠它校验上限）", resp.Meta.BudgetMax)
+	}
+
+	// 超出 1 也必须拒绝：报错比“悄悄只画 2000 个”诚实。
+	status, body = h.get("/api/graph?budget=2001")
+	if status != http.StatusBadRequest {
+		t.Fatalf("budget=2001 超硬上限，必须 400，实际 %d (body=%s)", status, body)
+	}
+	var e server.ErrorResponse
+	if err := json.Unmarshal(body, &e); err != nil {
+		t.Fatalf("错误体不是 JSON: %v (body=%s)", err, body)
+	}
+	if e.Field != "budget" {
+		t.Errorf("field=%q, want budget", e.Field)
+	}
+	if e.Message == "" {
+		t.Error("错误信息必须可读（不得空字符串）")
+	}
+}
+
 // TestUnknownRouteAndMethod 未知路径 404、方法不符 405（不得 panic）。
 func TestUnknownRouteAndMethod(t *testing.T) {
 	h := newHarness(t)

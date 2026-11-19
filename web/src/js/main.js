@@ -16,7 +16,7 @@ import {
   conceptColor,
 } from './model.js';
 import { parseView, toQuery, toGraphURL, toEntityURL, overviewView, focusView, searchView, BUDGET_MAX } from './urlstate.js';
-import { render, hitTest, hitTestCluster } from './render.js';
+import { render, hitTest, hitTestCluster, isPendingReview } from './render.js';
 import { shouldUseCanvas } from './geometry.js';
 import { relayout, withLayout } from './layout.js';
 import { requestReview, reviewPrompt } from './reviewflow.js';
@@ -121,10 +121,12 @@ async function loadView(view) {
   state.raw = resp;
   // 默认**直接采用服务端坐标**（buildScene 只复制 x/y，不做任何几何演算）。
   state.baseScene = buildScene(resp, { asOf: parsed.asOf });
-  applyFiltersAndDraw();
+  // 先渲染周边（banner / 侧栏 / 时间轴）再画图：banners 占高会改变 stage 高度，
+  // 若先画图后填 banner，首帧投影会停在旧尺寸（首屏下方一条空白带）。
   renderBanners();
   renderFilterPanel();
   renderTimeline();
+  applyFiltersAndDraw();
 }
 
 function applyFiltersAndDraw() {
@@ -149,11 +151,25 @@ function stageSize() {
 
 function draw() {
   if (!state.scene) return;
-  const size = stageSize();
   const useCanvas = shouldUseCanvas(state.scene, MAX_SVG);
   const host = { svg: dom.svg, canvas: dom.canvas };
-  const result = render(host, state.scene, { ...size, useCanvas });
-  state.project = (x, y) => result.project(x, y);
+  // 首帧陈旧投影的根治：量一次 → 画 → 再量；尺寸变了就重画。
+  //
+  // 旧实现只量一次：draw() 跑在周边布局（banner/侧栏）定稿之前，拿到的
+  // stage 高度偏小（实测 373 而容器 516），viewBox 就停在旧值 —— 首屏下方
+  // 一条空白带，且要等用户 resize 一次才收敛。这里用**同步**重测循环
+  // （最多 3 轮，防止容器持续变化时卡死），不依赖 rAF / ResizeObserver 的
+  // 时序；render 只画在绝对定位的 svg/canvas 上，不会反过来把容器撑大。
+  let size = stageSize();
+  let result = null;
+  for (let i = 0; i < 3; i++) {
+    result = render(host, state.scene, { ...size, useCanvas });
+    const again = stageSize();
+    if (again.width === size.width && again.height === size.height) break;
+    size = again;
+  }
+  // render() 现在返回渲染器产物（含 project）：Canvas 档的命中测试全靠它。
+  state.project = result.project;
   dom.stage.dataset.renderer = useCanvas ? 'canvas' : 'svg';
   dom.stage.dataset.nodes = String(state.scene.nodes.length);
   dom.stage.dataset.clusters = String(state.scene.clusters.length);
@@ -212,10 +228,16 @@ function renderBanners() {
     : '';
   if (reviewed) parts.push(reviewed);
 
+  // 安全说明（F-5）：parts 里每一条都由 banner() 用 textContent 构造后再取
+  // outerHTML —— 服务端可控字符串（meta.degraded / recall.degraded / ApiError.message）
+  // 已经被 textContent 转义成 HTML 实体，永远不可能变成标签或事件属性。
+  // 基线差分实测：恶意库只多出“尖括号被当文本”的元素，可执行元素 0 条。
   dom.banners.innerHTML = parts.join('');
   dom.modeBadge.textContent = meta.mode ? `${meta.mode} · hops=${meta.hops ?? '-'} · budget=${meta.budget ?? '-'}` : '-';
 }
 
+// banner 里的 text 全部经由 textContent 写入，所以下面取 outerHTML 时已是转义后的
+// 字符串（服务端值不会作为标签生效）。
 function banner(kind, text) {
   const div = document.createElement('div');
   div.className = `banner ${kind}`;
@@ -308,7 +330,10 @@ function bindInteractions(useCanvas) {
       g.addEventListener('mouseenter', (ev) => showNodeTooltip(id, ev));
       g.addEventListener('mouseleave', hideTooltip);
     }
-    // (7) possiblySame 边点「同一/不同」：点击蓝边打开裁决小窗。
+    // (7) 待审 possiblySame 边点「同一/不同」：点击蓝边打开裁决小窗。
+    //
+    // 选择器只看 class：render 层已经把 class 定为 possiblySame **且未失效**，
+    // 已裁决过的边不再带 possibly-same（不再蓝、不绑 click），与服务端门禁双保险。
     for (const line of dom.svg.querySelectorAll('line.edge.possibly-same')) {
       const edgeId = line.getAttribute('data-edge-id');
       line.addEventListener('click', (ev) => {
@@ -325,7 +350,9 @@ function bindInteractions(useCanvas) {
       line.addEventListener('mouseleave', hideTooltip);
     }
     // 折叠视图下钻：点 concept 团 → 以该概念的一个代表实体为焦点。
-    for (const g of dom.svg.querySelectorAll('g.cluster')) {
+    // 只在团真的可点时绑（render 层未折叠时给团 circle 设了 pointer-events:none，
+    // 就不该再有 click 语义）。
+    for (const g of dom.svg.querySelectorAll('g.cluster.drillable')) {
       const conceptId = g.getAttribute('data-cluster-id');
       g.addEventListener('click', (ev) => {
         ev.stopPropagation();
@@ -351,7 +378,9 @@ function bindInteractions(useCanvas) {
         lastClickAt = now;
         return;
       }
-      const cluster = hitTestCluster(state.scene, state.project, x, y);
+      const cluster = state.scene.meta?.truncated
+        ? hitTestCluster(state.scene, state.project, x, y)
+        : null;
       if (cluster) drillIntoCluster(cluster.concept_id || '');
     };
     canvas.onmousemove = (ev) => {
@@ -528,16 +557,17 @@ dom.budgetInput.addEventListener('change', () => {
 dom.conceptFilters.addEventListener('change', (ev) => {
   if (ev.target?.dataset?.role !== 'concept') return;
   toggleFilter(state.conceptFilter, ev.target.value, ev.target.checked);
-  applyFiltersAndDraw();
+  // banner 先于画图：banner 占高会改变 stage 高度，顺序反了首帧投影又会陈旧。
   renderBanners();
+  applyFiltersAndDraw();
   renderStageNote(buildStageNote());
 });
 
 dom.relationFilters.addEventListener('change', (ev) => {
   if (ev.target?.dataset?.role !== 'relation') return;
   toggleFilter(state.relationFilter, ev.target.value, ev.target.checked);
-  applyFiltersAndDraw();
   renderBanners();
+  applyFiltersAndDraw();
   renderStageNote(buildStageNote());
 });
 
@@ -622,6 +652,8 @@ function drillIntoCluster(conceptId) {
 function openReview(edgeId) {
   const edge = state.scene?.edges.find((e) => e.id === edgeId);
   if (!edge) return;
+  // 已失效/已裁决的边不得再进裁决（服务端还会再拦一道 400）。
+  if (!isPendingReview(edge)) return;
   const from = state.scene.nodes.find((n) => n.id === edge.from);
   const to = state.scene.nodes.find((n) => n.id === edge.to);
   const label = `${from?.canonical_name || edge.from} ⇄ ${to?.canonical_name || edge.to}`;
@@ -747,7 +779,8 @@ function showEdgeTooltip(edgeId, ev) {
     `${e.relation} · ${e.from} → ${e.to} · weight=${e.weight}` +
     ` · t_valid=${e.t_valid}${e.t_invalid ? ` · t_invalid=${e.t_invalid}` : ''}` +
     (e.style.invalid ? ' · 本次视角已失效（虚线保留）' : '') +
-    (e.style.possiblySame ? ' · 待审（点击可裁决）' : '');
+    // 已失效的边不得再自称“待审”：那句提示就是“同一/不同”按钮的入口。
+    (isPendingReview(e) ? ' · 待审（点击可裁决）' : '');
   moveTooltip(ev);
 }
 
