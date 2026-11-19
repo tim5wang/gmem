@@ -188,7 +188,8 @@ func (b *OpsBackend) DeleteStates(ctx context.Context, ids []string) error {
 // 幂等台账（op_runs）
 // ---------------------------------------------------------------------------
 
-const runCols = `key, op, scope, trigger_kind, actor, reason, status, started_at, finished_at, note`
+const runCols = `key, op, scope, trigger_kind, actor, reason, status, started_at, finished_at, note,
+	skip_count, last_skipped_at`
 
 // InsertRun 插入一次运行登记。key 已存在时返回 ops.ErrDuplicateRun。
 //
@@ -199,9 +200,9 @@ func (b *OpsBackend) InsertRun(ctx context.Context, r ops.RunRecord) error {
 		return err
 	}
 	_, err = q.ExecContext(ctx, `
-		INSERT INTO op_runs (`+runCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO op_runs (`+runCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.Key, string(r.Op), string(r.Scope), string(r.Trigger), r.Actor, r.Reason,
-		string(r.Status), r.StartedAt, r.FinishedAt, r.Note)
+		string(r.Status), r.StartedAt, r.FinishedAt, r.Note, r.SkipCount, r.LastSkippedAt)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return ops.ErrDuplicateRun
@@ -212,6 +213,10 @@ func (b *OpsBackend) InsertRun(ctx context.Context, r ops.RunRecord) error {
 }
 
 // UpdateRun 覆盖运行结论（状态、结束时间、备注）。
+//
+// 它**不碰** skip_count / last_skipped_at：那两列只由 MarkRunSkipped 累加。
+// 否则 "failed/cancelled 后重跑"这条路径会把已有的跳过痕迹抹掉（UpdateRun 用的是
+// 调用方传入的零值 RunRecord，回写 0 等于清空计数）。
 func (b *OpsBackend) UpdateRun(ctx context.Context, r ops.RunRecord) error {
 	q, err := b.c.querier(ctx)
 	if err != nil {
@@ -227,6 +232,32 @@ func (b *OpsBackend) UpdateRun(ctx context.Context, r ops.RunRecord) error {
 	}
 	if n, err := res.RowsAffected(); err == nil && n == 0 {
 		return fmt.Errorf("sqlite: update run %q: %w", r.Key, store.ErrNotFound)
+	}
+	return nil
+}
+
+// MarkRunSkipped 记一次「因幂等 key 已成功而安全跳过」（F-7 收口的唯一写入点）。
+//
+// 只做 UPDATE，且**不新增任何行**：受保护用例
+// internal/p3verify/idempotent_test.go:79 断言 duplicate 之后 op_runs 行数不变，
+// :76 同时钉死了 audit_log 行数也不得变。旧实现在 duplicate 分支两边都不写，
+// 于是「这次为什么什么都没发生」完全无从回答。
+//
+// 找不到该 key 时返回 store.ErrNotFound（运维期能看出台账与调用方已不一致）；
+// 调用方（Runner）扱弃该错误，不影响主结论。
+func (b *OpsBackend) MarkRunSkipped(ctx context.Context, key string, at int64) error {
+	q, err := b.c.querier(ctx)
+	if err != nil {
+		return err
+	}
+	res, err := q.ExecContext(ctx, `
+		UPDATE op_runs SET skip_count = skip_count + 1, last_skipped_at = ?
+		WHERE key = ?`, at, key)
+	if err != nil {
+		return fmt.Errorf("sqlite: mark run skipped %q: %w", key, err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return fmt.Errorf("sqlite: mark run skipped %q: %w", key, store.ErrNotFound)
 	}
 	return nil
 }
@@ -251,7 +282,7 @@ func scanRun(sc interface{ Scan(...any) error }) (ops.RunRecord, error) {
 	var r ops.RunRecord
 	var op, scope, trig, status string
 	if err := sc.Scan(&r.Key, &op, &scope, &trig, &r.Actor, &r.Reason, &status,
-		&r.StartedAt, &r.FinishedAt, &r.Note); err != nil {
+		&r.StartedAt, &r.FinishedAt, &r.Note, &r.SkipCount, &r.LastSkippedAt); err != nil {
 		return ops.RunRecord{}, err
 	}
 	r.Op = ops.OpName(op)

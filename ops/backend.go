@@ -163,6 +163,14 @@ type RunRecord struct {
 	StartedAt  int64
 	FinishedAt int64
 	Note       string
+
+	// SkipCount / LastSkippedAt 是「这一个 key 被 duplicate 安全跳过」的次数与最后一次时刻。
+	//
+	// 为什么放在 op_runs 的列上而不是新表/新行：duplicate 之后 audit_log 与 op_runs
+	// 的**行数都不得变**（internal/p3verify/idempotent_test.go:76 与 :79 硬断言），
+	// 所以痕迹只能写回它自己那一行（MarkRunSkipped 只做 UPDATE）。
+	SkipCount     int
+	LastSkippedAt int64
 }
 
 // Redirect 是 Merge 之后旧 ID → 新 ID 的重定向（TD §8 Merge 语义）。
@@ -198,6 +206,12 @@ type Backend interface {
 	// InsertRun 是**插入**语义：key 已存在时返回 ErrDuplicateRun（并发安全的重入闸）。
 	InsertRun(ctx context.Context, r RunRecord) error
 	UpdateRun(ctx context.Context, r RunRecord) error
+	// MarkRunSkipped 记一次「因幂等 key 已成功而安全跳过」。
+	//
+	// 它**只做 UPDATE**（skip_count+1、last_skipped_at=at）：duplicate 之后 op_runs
+	// 的行数必须不变（internal/p3verify/idempotent_test.go:79），插新行会让那条
+	// 受保护用例变红——那正是这个洞以前的样子（两边都查不到）。
+	MarkRunSkipped(ctx context.Context, key string, at int64) error
 	GetRun(ctx context.Context, key string) (RunRecord, bool, error)
 	ListRuns(ctx context.Context, q RunQuery) ([]RunRecord, error)
 

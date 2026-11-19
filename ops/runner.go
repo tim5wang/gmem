@@ -275,7 +275,12 @@ func (r *Runner) Run(ctx context.Context, req Request) (Result, error) {
 		res.Steps = nil
 		// 这里**不写 audit_log**：受保护用例 ops/ops_test.go:197 与
 		// internal/p3verify/idempotent_test.go:76 都断言 duplicate 后审计行数不得增长。
-		// F-7 要求 duplicate 也落审计行，两者不可兼得——已作为待裁决项上报。
+		//
+		// 但「这次被跳过了」不能零痕迹（F-7）：旧实现在这条分支既不 UpdateRun
+		// 也不 InsertRun，audit_log 与 op_runs 两边都看不到。补救手段是
+		// **就地改它自己那一行**（skip_count+1、last_skipped_at=now），
+		// 因为 internal/p3verify/idempotent_test.go:79 同时钉死了 op_runs 行数也不得变。
+		r.markRunSkipped(ctx, key)
 		return res, nil
 	case canceled || isCancel(txErr):
 		// 事务已回滚（没有半截状态）。用独立事务记一条 cancelled，
@@ -374,8 +379,9 @@ func (r *Runner) recordFailed(ctx context.Context, rec RunRecord, cause error, p
 	//	internal/p3verify/idempotent_test.go:76      duplicate 后 audit_log 行数不得增长
 	//
 	// 而 F-7 要求“三条路径都要落审计行”，两者不可同时成立。
-	// 按“不得删除或弱化受保护用例”的硬约束，这里只补无冲突的 Plan 失败分支，
-	// duplicate/cancelled 仍只能从 op_runs 看到（已在任务卡上作为待裁决项上报）。
+	// 按“不得删除或弱化受保护用例”的硬约束，这里只补无冲突的 Plan 失败分支；
+	// cancelled 由 op_runs.note 可查，duplicate 由 op_runs.skip_count /
+	// last_skipped_at 可查（MarkRunSkipped，同样不新增行，已在任务卡上作为待裁决项上报）。
 	if planErr != nil {
 		r.appendOutcomeAudit(base, rec, RunFailed, "plan_failed", planErr.Error())
 	}
@@ -419,6 +425,26 @@ func (r *Runner) markRun(ctx context.Context, rec RunRecord, status RunStatus, n
 		return nil
 	})
 	// 记账失败不改变主结论；调用方已经从 Result.Status 得到结论。
+}
+
+// markRunSkipped 记一次「因幂等 key 已成功而安全跳过」（F-7）。
+//
+// 手法与 markRun 一致：**独立事务 + 吞掉错误**。理由也一致——
+// “这次被跳过了”本属于运行结论，记账写不进去不该把一次成功的幂等跳过变成失败
+// （调用方已经从 Result.Status 拿到 RunDuplicate）。
+//
+// 为什么用独立事务而不是主事务：dup 分支在 Store.Tx 回调里 return nil，事务随后
+// 正常提交，但那里拿不到“这一行已被别人并发更新”的确定语义；独立事务让这次 UPDATE
+// 自成一个原子步骤，且不会因后续主事务回滚而丢失痕迹。
+//
+// 它**只做 UPDATE**：不插行、不写 audit_log（受保护用例钉死了两边行数）。
+func (r *Runner) markRunSkipped(ctx context.Context, key string) {
+	base := context.WithoutCancel(ctx)
+	tctx, cancel := context.WithTimeout(base, 3*time.Second)
+	defer cancel()
+	_ = r.ports.Store.Tx(tctx, func(inctx context.Context, _ store.Store) error {
+		return r.backend.MarkRunSkipped(inctx, key, r.cfg.Now().UnixMilli())
+	})
 }
 
 func isCancel(err error) bool {

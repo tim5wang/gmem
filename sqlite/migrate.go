@@ -293,7 +293,54 @@ func migrations() []migration {
 			Name:    "p3_concept_created_at_scope",
 			Apply:   applyConceptCreatedAtScope,
 		},
+		{
+			// F-7 收口：duplicate 路径必须留下可追溯痕迹，且**不得新增任何行**。
+			//
+			// 受保护用例把两边都钉死了：duplicate 之后 audit_log 行数不变
+			// （internal/p3verify/idempotent_test.go:76）且 op_runs 行数不变（:79）。
+			// 因此唯一可行的形状是「就地改现有行的列」：命中 duplicate 时把
+			// skip_count+1、last_skipped_at=now 写回它自己那一行。
+			//
+			// 为什么必须是追加迁移：op_runs 的 DDL 在 v1 里，已发布版本逐字节不得改
+			// （publishedMigrations 的指纹钉死了 v1~v3，v6~v8 由名称/形态锁定）。
+			Version: 9,
+			Name:    "p3_op_runs_skip_counters",
+			Apply:   applyOpRunsSkipCounters,
+		},
 	}
+}
+
+// applyOpRunsSkipCounters 给 op_runs 补 skip_count / last_skipped_at 两列。
+//
+// 语义：这两列只由「命中 duplicate」这一条路径累加（ops.Backend.MarkRunSkipped
+// 的 UPDATE），它们回答的是「这一个幂等 key 被安全跳过了多少次、最后一次是什么时候」。
+// 旧实现在 duplicate 分支既不 UpdateRun 也不 InsertRun，所以那张表上完全没有痕迹。
+//
+// 幂等性：schema_migrations 丢失后整个清单会重跑，因此逐列判断是否存在；
+// 已存在的行保持 DEFAULT 0（= 「升级之前没有被跳过过」），不做任何回填。
+func applyOpRunsSkipCounters(ctx context.Context, q querier) error {
+	hasSkipCount, err := tableHasColumn(ctx, q, "op_runs", "skip_count")
+	if err != nil {
+		return err
+	}
+	if !hasSkipCount {
+		if _, err := q.ExecContext(ctx,
+			`ALTER TABLE op_runs ADD COLUMN skip_count INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("sqlite: migration 9 (op_runs.skip_count): %w", err)
+		}
+	}
+
+	hasLastSkippedAt, err := tableHasColumn(ctx, q, "op_runs", "last_skipped_at")
+	if err != nil {
+		return err
+	}
+	if !hasLastSkippedAt {
+		if _, err := q.ExecContext(ctx,
+			`ALTER TABLE op_runs ADD COLUMN last_skipped_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("sqlite: migration 9 (op_runs.last_skipped_at): %w", err)
+		}
+	}
+	return nil
 }
 
 // applyConceptCreatedAtScope 给 concepts 补 created_at / scope 两列并回填。
