@@ -679,6 +679,9 @@ func (s *Server) layout(ctx context.Context, nodes map[string]*nodeAcc, edges ma
 		x, y := clusterCenter(i)
 		centers[k] = [2]float64{x, y}
 	}
+	// 团内序号 + 团内节点数：叶序格点 (r = R*sqrt(j/n), theta = j*goldenAngle) 的两个参数。
+	// 两者都只由本次请求的节点集（已按 ID 排序）决定，因此仍是纯函数。
+	leafIndex, leafCount := leafOrder(refs)
 
 	// 2) 折叠判定：节点数 > budget → 先聚簇折叠（不是降帧，也不是静默截断）。
 	total := len(nodes)
@@ -701,7 +704,7 @@ func (s *Server) layout(ctx context.Context, nodes map[string]*nodeAcc, edges ma
 		}
 		key := conceptKeyOf(acc.node.ConceptID)
 		c := centers[key]
-		x, y := nodePosition(id, c[0], c[1])
+		x, y := nodePosition(leafIndex[key][id], leafCount[key], c[0], c[1])
 		outNodes = append(outNodes, Node{
 			ID:            acc.node.ID,
 			CanonicalName: acc.node.CanonicalName,

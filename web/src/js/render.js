@@ -5,6 +5,7 @@
 // 用"按坐标命中测试"补回点击与悬停，交互语义与 SVG 档保持一致。
 import { makeProjector } from './geometry.js';
 import { conceptColor } from './model.js';
+import { layoutLabels, clusterObstacles } from './labelLayouter.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -262,20 +263,46 @@ export function renderSVG(svg, scene, opts) {
       }));
     }
     gNodes.appendChild(g);
-
-    const text = el('text', {
-      x: p.x.toFixed(1),
-      y: (p.y + n.r + 11).toFixed(1),
-      'text-anchor': 'middle',
-      fill: STYLE.label,
-      'font-size': '10',
-      class: 'node-label',
-    });
-    text.textContent = n.canonical_name || n.id;
-    gLabels.appendChild(text);
   }
 
-  return { project, pos, clusterPos };
+  // 节点标签：确定性避让（labelLayouter.js），而不是"每个都画在正下方"。
+  // 团标签已经先画在图上，因此它们是障碍物：节点标签绕开团名与计数。
+  const labelItems = scene.nodes
+    .filter((n) => pos.has(n.id))
+    .map((n) => {
+      const p = pos.get(n.id);
+      return {
+        id: n.id,
+        x: p.x,
+        y: p.y,
+        r: n.r,
+        degree: n.degree,
+        text: n.canonical_name || n.id,
+      };
+    });
+  const placed = layoutLabels(labelItems, {
+    width,
+    height,
+    obstacles: clusterObstacles(scene, project),
+  });
+  for (const lab of placed.labels) {
+    const text = el('text', {
+      x: lab.x.toFixed(1),
+      y: lab.y.toFixed(1),
+      'text-anchor': lab.anchor === 'right' ? 'start' : lab.anchor === 'left' ? 'end' : 'middle',
+      fill: STYLE.label,
+      'font-size': '10',
+      'data-label-anchor': lab.anchor,
+      class: 'node-label',
+    });
+    text.textContent = lab.text;
+    gLabels.appendChild(text);
+  }
+  // 隐藏了哪些标签必须能被查出来（测试与排查都靠它，不能悄悄丢）。
+  svg.setAttribute('data-labels-shown', String(placed.shown));
+  svg.setAttribute('data-labels-hidden', String(placed.hidden.length));
+
+  return { project, pos, clusterPos, labels: placed };
 }
 
 function el(name, attrs) {

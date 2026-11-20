@@ -1,7 +1,6 @@
 package server
 
 import (
-	"hash/fnv"
 	"math"
 	"sort"
 )
@@ -11,20 +10,31 @@ import (
 //
 // # 为什么不建表缓存
 //
-// 坐标是 (nodeID, conceptID) 的确定性函数：同一输入必得同一输出。为它加一张
-// 缓存表（migration v10）只会引入"缓存过期/多实例不一致"这类新故障面，
-// 换来的仅仅是省掉一次 O(n) 的纯计算（n 已被 budget 约束在 2000 以内）。
-// 因此本卡**不新增任何 DB 表**：确定性由哈希保证，不依赖时间、随机数与进程状态。
+// 坐标是 (nodeID, conceptID, 节点在团内按 ID 排序的序号, 团内节点数) 的确定性
+// 函数：同一输入必得同一输出。为它加一张缓存表（migration v10）只会引入
+// "缓存过期/多实例不一致"这类新故障面，换来的仅仅是省掉一次 O(n) 的纯计算
+// （n 已被 budget 约束在 2000 以内）。
+// 因此本卡**不新增任何 DB 表**：确定性由排序序号 + 黄金角常量保证，
+// 不依赖时间、随机数与进程状态。
 //
-// # 布局形状
+// # 布局形状（v2：团间距与团内散布都改成格点）
 //
-// 概念团按黄金角螺旋排布（团心），团内节点绕团心做环形散布。
-// 团心只依赖"概念键在排序后的序号"，节点位置只依赖 nodeID 的哈希，
-// 因此删掉/新增一个节点不会让**其它**节点跳位（避免全图重排的视觉抖动）。
+//  1. 团心 = 黄金角螺旋 r_i = clusterBaseRadius * sqrt(i+0.5)（i 是概念键排序后的序号）。
+//     任意两团心的最小距离是 d(0,1) = 0.9*sqrt(1.5) ≈ 1.1023（数值验证见 layout_test.go）。
+//  2. 团内 = 叶序（向日葵）格点：第 j 个节点 r_j = R* sqrt(j/n)，theta_j = j*goldenAngle。
+//     相邻节点间距近似相等，不会出现"随机极坐标"必然产生的局部聚簇与空洞。
+//  3. 团半径 R 随节点数增长（R = 0.10 + 0.055*sqrt(n)），但**封顶**在 clusterRadiusMax：
+//     封顶是与团心间距联动的必要条件 —— 团心只依赖序号 i（新增概念不位移已有团心），
+//     所以不封顶就无法保证 "dist(ci,cj) > Ri + Rj + 间隙"。
+//
+// 为什么团内地址要用叶序而不是哈希随机角：
+// 随机（角度、半径）落在圆盘上的分布密度是 r² 相关的，30 个点里必然出现
+// 一堆点挤在一起 + 一块空地（实测最近邻距离最大/最小比 5~10 倍）。叶序把点
+// 按面积均匀铺开（同口径比值 ≈ 1.8），这才是"松散均匀"的来源。
 // ===========================================================================
 
 // goldenAngle 是黄金角（弧度）。按序号 × 黄金角取点，任何前缀都是均匀散布，
-// 因此团心分布不依赖总数——新增概念不会让已有团心位移。
+// 因此团心与团内叶序都不依赖总数——新增概念不会让已有团心位移。
 const goldenAngle = 2.399963229728653
 
 // unclusteredKey 是"节点没有 concept"时的聚簇键。
@@ -34,18 +44,18 @@ const unclusteredKey = "\x00unclustered"
 // unclusteredLabel 是该簇的展示名。
 const unclusteredLabel = "(未归属概念)"
 
-// hashUnit 返回 [0,1) 的确定性伪随机数。
-//
-// 输入只有 (salt, key)：**没有时间、没有随机源、没有全局状态**。
-// 因此同一 nodeID 在任何进程、任何时刻都得到同一坐标。
-func hashUnit(key string, salt byte) float64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte{salt})
-	_, _ = h.Write([]byte(key))
-	sum := h.Sum64()
-	// 取低 20 位映射到百万分之一，避免浮点在极端值上的平台差异。
-	return float64(sum%1000003) / 1000003
-}
+const (
+	// clusterBaseRadius 是团心螺旋的基准半径（不能低于 0.87：见 clusterGap 的推导）。
+	clusterBaseRadius = 0.9
+	// clusterRadiusBase / clusterRadiusPerNode 决定团内叶序半径 R(n)。
+	clusterRadiusBase    = 0.10
+	clusterRadiusPerNode = 0.055
+	// clusterRadiusMax 是 R 的上限。约束来自团心最小间距：
+	//   d_min ≈ 1.1023  >=  2*clusterRadiusMax + clusterGap = 0.88 + 0.12 = 1.00 ✓
+	clusterRadiusMax = 0.44
+	// clusterGap 是任意两团之间必须保留的最低间隙（世界坐标）。
+	clusterGap = 0.12
+)
 
 // roundCoord 把坐标固定到 1e-6。
 //
@@ -57,19 +67,51 @@ func roundCoord(v float64) float64 {
 }
 
 // clusterCenter 返回第 i 个概念团的团心坐标（i 是概念键排序后的序号）。
+//
+// 只依赖 i：新增/删除概念不会让已有团心位移（排序序号对已有概念不变，
+// 除非新概念插到它前面——那本来就是"概念键顺序变了"的语义变化）。
 func clusterCenter(i int) (float64, float64) {
 	if i == 0 {
 		return 0, 0
 	}
 	angle := float64(i) * goldenAngle
-	radius := 0.55 * math.Sqrt(float64(i)+0.5)
+	radius := clusterBaseRadius * math.Sqrt(float64(i)+0.5)
 	return roundCoord(radius * math.Cos(angle)), roundCoord(radius * math.Sin(angle))
 }
 
-// nodePosition 返回节点在其概念团内的坐标。
-func nodePosition(nodeID string, centerX, centerY float64) (float64, float64) {
-	angle := 2 * math.Pi * hashUnit(nodeID, 0x11)
-	radius := 0.12 + 0.22*math.Sqrt(hashUnit(nodeID, 0x22))
+// clusterRadius 返回团内叶序的散布半径 R(n)，随节点数增长并封顶。
+//
+// 为什么要随 n 增长：固定半径下 20 个节点的小圆会挤成一团（点距 ~R/n）；
+// 封顶是因为团心间距有上界，R 若继续长大就必然与邻团重叠。
+func clusterRadius(n int) float64 {
+	if n <= 0 {
+		return 0
+	}
+	r := clusterRadiusBase + clusterRadiusPerNode*math.Sqrt(float64(n))
+	if r > clusterRadiusMax {
+		r = clusterRadiusMax
+	}
+	return r
+}
+
+// nodePosition 返回团内第 index 个节点（共 count 个）的坐标。
+//
+// 纯函数：只吃 (index, count, center)。同一 nodeID 因为"团内按 ID 排序的序号"
+// 确定 ⇒ 每次请求都落在同一格点上。**没有随机数、没有时间、没有包级可变状态。**
+// r = R*sqrt(index/count)、theta = index*goldenAngle 是标准叶序（向日葵）格点：
+// 单位圆内前 k 个点的面积密度恒定，因此团内既不成簇也不留大洞。
+func nodePosition(index, count int, centerX, centerY float64) (float64, float64) {
+	if count <= 0 {
+		return centerX, centerY
+	}
+	if index < 0 {
+		index = 0
+	}
+	if index >= count {
+		index = count - 1
+	}
+	radius := clusterRadius(count) * math.Sqrt(float64(index)/float64(count))
+	angle := float64(index) * goldenAngle
 	return roundCoord(centerX + radius*math.Cos(angle)),
 		roundCoord(centerY + radius*math.Sin(angle))
 }
@@ -96,4 +138,28 @@ func conceptKeyOf(conceptID string) string {
 		return unclusteredKey
 	}
 	return conceptID
+}
+
+// leafOrder 给每个聚簇键分配"团内序号"与"团内节点数"。
+//
+// 输入 refs 已按节点 ID 排序（graph.go 的 ids 来自 sort.Strings），
+// 同一个键的出现顺序因此就是"团内按 ID 排序"，序号即叶序参数 j。
+// 返回的 index[k][id] 与 count[k] 都只由本次请求的节点集决定 ⇒ 不破坏确定性。
+//
+// 为什么序号用**全部**节点（含折叠掉的）而不是只数命中节点：
+// 折叠（budget 超出）时命中节点会保留为真实节点，如果序号改按"命中集合"重排，
+// 同一个实体在折叠前后的位置就会跳变——用全量序号让坐标与折叠无关。
+func leafOrder(refs []nodeRef) (map[string]map[string]int, map[string]int) {
+	index := make(map[string]map[string]int, 8)
+	count := make(map[string]int, 8)
+	for _, r := range refs {
+		m, ok := index[r.conceptKey]
+		if !ok {
+			m = make(map[string]int, 4)
+			index[r.conceptKey] = m
+		}
+		m[r.id] = count[r.conceptKey]
+		count[r.conceptKey]++
+	}
+	return index, count
 }

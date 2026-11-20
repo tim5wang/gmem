@@ -341,11 +341,30 @@ function bounds(scene) {
   }
   return { minX, minY, maxX, maxY };
 }
+function clusterPixelRadius(count) {
+  return 10 + Math.min(30, Math.sqrt(Math.max(1, count)) * 3.2);
+}
+function drawExtent(scene) {
+  let r = 0;
+  for (const n of scene.nodes) {
+    const nr = Number.isFinite(n.r) ? n.r : 5;
+    if (nr > r) r = nr;
+  }
+  for (const c2 of scene.clusters || []) {
+    const cr = clusterPixelRadius(c2.count);
+    if (cr > r) r = cr;
+  }
+  return r + 3;
+}
 function makeProjector(scene, width, height, padding = 48) {
   const b = bounds(scene);
-  const w = Math.max(1, width - padding * 2);
-  const h2 = Math.max(1, height - padding * 2);
-  const scale = Math.min(w / (b.maxX - b.minX), h2 / (b.maxY - b.minY));
+  const dx = b.maxX - b.minX;
+  const dy = b.maxY - b.minY;
+  const pad = Math.max(0, padding);
+  const ext = Math.min(drawExtent(scene), Math.min(width, height) / 4);
+  const w = Math.max(1, width - pad * 2 - ext * 2);
+  const h2 = Math.max(1, height - pad * 2 - ext * 2);
+  const scale = Math.min(w / dx, h2 / dy);
   const cx = (b.minX + b.maxX) / 2;
   const cy = (b.minY + b.maxY) / 2;
   const project = (x2, y2) => ({
@@ -357,6 +376,155 @@ function makeProjector(scene, width, height, padding = 48) {
 }
 function shouldUseCanvas(scene, maxSvg = 2e3) {
   return scene.nodes.length + scene.clusters.length > maxSvg;
+}
+
+// js/labelLayouter.js
+var LABEL = {
+  fontSize: 10,
+  lineHeight: 12,
+  // CJK / 全角字符按 1.75em 计（10px 字号 → 17.5px/字）；
+  latinWidth: 0.6,
+  cjkWidth: 1.75,
+  // 文本框之间额外留 2px，避免"刚好贴边"看起来仍像压叠。
+  gap: 2,
+  // 候选方位的外扩倍数：先贴近节点，贴不下再往外挪一档（仍是同样四个方位）。
+  rings: [1, 1.9]
+};
+function textWidth(text, fontSize = LABEL.fontSize) {
+  let w = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0);
+    w += (code > 11904 ? LABEL.cjkWidth : LABEL.latinWidth) * fontSize;
+  }
+  return w;
+}
+function candidate(item, anchor, ring, fontSize) {
+  const h2 = LABEL.lineHeight;
+  const ascent = fontSize * 0.8;
+  const descent = fontSize * 0.2;
+  const w = item.w;
+  const gapPx = (LABEL.gap + 2) * ring;
+  let x2;
+  let y2;
+  if (anchor === "below") {
+    x2 = item.x;
+    y2 = item.y + item.r + LABEL.fontSize * 0.9 + gapPx;
+  } else if (anchor === "above") {
+    x2 = item.x;
+    y2 = item.y - item.r - gapPx;
+  } else if (anchor === "right") {
+    x2 = item.x + item.r + gapPx + 2;
+    y2 = item.y + LABEL.fontSize * 0.35;
+  } else {
+    x2 = item.x - item.r - gapPx - 2;
+    y2 = item.y + LABEL.fontSize * 0.35;
+  }
+  let minX;
+  if (anchor === "below" || anchor === "above") {
+    minX = x2 - w / 2;
+  } else if (anchor === "right") {
+    minX = x2;
+  } else {
+    minX = x2 - w;
+  }
+  return {
+    x: x2,
+    y: y2,
+    anchor,
+    minX,
+    minY: y2 - ascent,
+    maxX: minX + w,
+    maxY: y2 - ascent + h2
+  };
+}
+function overlaps(a2, b, gap) {
+  return a2.minX - gap < b.maxX && b.minX - gap < a2.maxX && a2.minY - gap < b.maxY && b.minY - gap < a2.maxY;
+}
+var CELL = 64;
+function insert(grid, box) {
+  const x0 = Math.floor(box.minX / CELL);
+  const x1 = Math.floor(box.maxX / CELL);
+  const y0 = Math.floor(box.minY / CELL);
+  const y1 = Math.floor(box.maxY / CELL);
+  for (let gx = x0; gx <= x1; gx++) {
+    for (let gy = y0; gy <= y1; gy++) {
+      const k = `${gx},${gy}`;
+      let bucket = grid.get(k);
+      if (!bucket) {
+        bucket = [];
+        grid.set(k, bucket);
+      }
+      bucket.push(box);
+    }
+  }
+}
+function collides(grid, box, gap) {
+  const x0 = Math.floor((box.minX - gap) / CELL);
+  const x1 = Math.floor((box.maxX + gap) / CELL);
+  const y0 = Math.floor((box.minY - gap) / CELL);
+  const y1 = Math.floor((box.maxY + gap) / CELL);
+  for (let gx = x0; gx <= x1; gx++) {
+    for (let gy = y0; gy <= y1; gy++) {
+      const bucket = grid.get(`${gx},${gy}`);
+      if (!bucket) continue;
+      for (const other of bucket) {
+        if (overlaps(box, other, gap)) return true;
+      }
+    }
+  }
+  return false;
+}
+function clusterObstacles(scene, project, { fontSize = 11 } = {}) {
+  const out = [];
+  for (const c2 of scene.clusters || []) {
+    const p = project(c2.x, c2.y);
+    const r = 10 + Math.min(30, Math.sqrt(Math.max(1, c2.count)) * 3.2);
+    const text = `${c2.concept_name || c2.id || "(未归属概念)"} · ${c2.count}`;
+    const w = textWidth(text, fontSize);
+    const y2 = p.y + r + 13;
+    out.push({
+      minX: p.x - w / 2,
+      minY: y2 - fontSize * 0.8,
+      maxX: p.x + w / 2,
+      maxY: y2 - fontSize * 0.8 + LABEL.lineHeight
+    });
+  }
+  return out;
+}
+function layoutLabels(items, { width = 0, height = 0, fontSize = LABEL.fontSize, obstacles = [] } = {}) {
+  const grid = /* @__PURE__ */ new Map();
+  for (const o of obstacles) insert(grid, o);
+  const ordered = items.filter((it) => it && Number.isFinite(it.x) && Number.isFinite(it.y)).map((it) => ({
+    id: it.id,
+    x: it.x,
+    y: it.y,
+    r: Number.isFinite(it.r) ? it.r : 5,
+    degree: Number.isFinite(it.degree) ? it.degree : 0,
+    text: String(it.text ?? it.id ?? "")
+  })).map((it) => ({ ...it, w: textWidth(it.text, fontSize) })).sort((a2, b) => b.degree - a2.degree || (a2.id < b.id ? -1 : a2.id > b.id ? 1 : 0));
+  const labels = [];
+  const hidden = [];
+  for (const it of ordered) {
+    let placed = null;
+    for (const ring of LABEL.rings) {
+      for (const anchor of ["below", "above", "right", "left"]) {
+        const c2 = candidate(it, anchor, ring, fontSize);
+        if (width > 0 && (c2.minX < 1 || c2.maxX > width - 1)) continue;
+        if (height > 0 && (c2.minY < 1 || c2.maxY > height - 1)) continue;
+        if (collides(grid, c2, LABEL.gap)) continue;
+        placed = c2;
+        break;
+      }
+      if (placed) break;
+    }
+    if (!placed) {
+      hidden.push(it.id);
+      continue;
+    }
+    insert(grid, placed);
+    labels.push({ id: it.id, x: placed.x, y: placed.y, anchor: placed.anchor, text: it.text });
+  }
+  return { labels, hidden, shown: labels.length, total: ordered.length };
 }
 
 // js/render.js
@@ -558,18 +726,39 @@ function renderSVG(svg, scene, opts) {
       }));
     }
     gNodes.appendChild(g);
+  }
+  const labelItems = scene.nodes.filter((n) => pos.has(n.id)).map((n) => {
+    const p = pos.get(n.id);
+    return {
+      id: n.id,
+      x: p.x,
+      y: p.y,
+      r: n.r,
+      degree: n.degree,
+      text: n.canonical_name || n.id
+    };
+  });
+  const placed = layoutLabels(labelItems, {
+    width,
+    height,
+    obstacles: clusterObstacles(scene, project)
+  });
+  for (const lab of placed.labels) {
     const text = el("text", {
-      x: p.x.toFixed(1),
-      y: (p.y + n.r + 11).toFixed(1),
-      "text-anchor": "middle",
+      x: lab.x.toFixed(1),
+      y: lab.y.toFixed(1),
+      "text-anchor": lab.anchor === "right" ? "start" : lab.anchor === "left" ? "end" : "middle",
       fill: STYLE.label,
       "font-size": "10",
+      "data-label-anchor": lab.anchor,
       class: "node-label"
     });
-    text.textContent = n.canonical_name || n.id;
+    text.textContent = lab.text;
     gLabels.appendChild(text);
   }
-  return { project, pos, clusterPos };
+  svg.setAttribute("data-labels-shown", String(placed.shown));
+  svg.setAttribute("data-labels-hidden", String(placed.hidden.length));
+  return { project, pos, clusterPos, labels: placed };
 }
 function el(name, attrs) {
   const node = document.createElementNS(SVG_NS, name);
@@ -2194,9 +2383,9 @@ function flashBanner(kind, text) {
   flash(dom.banners, kind, text);
 }
 function drillIntoCluster(conceptId) {
-  const candidate = state.baseScene?.nodes.find((n) => (n.concept_id || "") === (conceptId || ""));
-  if (candidate) {
-    focusNode(candidate.id);
+  const candidate2 = state.baseScene?.nodes.find((n) => (n.concept_id || "") === (conceptId || ""));
+  if (candidate2) {
+    focusNode(candidate2.id);
     return;
   }
   flashBanner("info", `概念 ${conceptId || "(未归属概念)"} 在本次折叠里没有保留实体（折叠时只保留命中实体）；可提高 budget 或先搜索该概念下的实体。`);
