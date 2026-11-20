@@ -22,6 +22,10 @@
   </label>
 
   <span class="spacer"></span>
+  <nav class="nav" aria-label="页面导航">
+    <a href="/" aria-current="page">Graph</a>
+    <a href="/recall">Recall</a>
+  </nav>
   <span id="mode-badge" class="badge" title="入口：focus / search / overview">-</span>
   <button type="button" id="relayout-btn" title="仅在本地用 d3-force 重算坐标，不回写服务端">重新布局</button>
   <button type="button" id="copy-btn" title="把当前视图（focus/q/hops/budget/as_of）复制成链接">复制视图链接</button>
@@ -83,6 +87,33 @@
     </div>
   </div>
 </div>
+
+<!-- P6-1：Recall Inspector 页。
+
+     为什么写在 HTML 里而不是全由 JS 建：顶栏（搜索框/导航）是**常驻**结构，
+     页面重画只该换下面的 #recall-root；否则每次加载都会丢掉输入焦点。
+     这个容器默认 hidden，由客户端路由（js/router.js）在命中 /recall 时显形。 -->
+<div id="page-recall" class="page-recall" hidden>
+  <header class="recall-topbar">
+    <h1>Recall Inspector</h1>
+    <nav class="nav" aria-label="页面导航">
+      <a href="/">Graph</a>
+      <a href="/recall" aria-current="page">Recall</a>
+    </nav>
+    <form id="recall-search-form" class="search">
+      <input id="recall-q-input" type="search" placeholder="召回查询（写 ?q=）" autocomplete="off">
+      <button type="submit">召回</button>
+    </form>
+    <span class="spacer"></span>
+    <span id="recall-badge" class="badge">-</span>
+  </header>
+  <div id="recall-root" class="recall-root"></div>
+</div>
+
+<!-- 未实现页 / 404 视图的容器（客户端路由判定后填充）。
+     单独一个容器而不是复用 #page-recall：后者带着 Recall 专属的顶栏，
+     把“这一页还没做”塞进去会让人误以为 Recall 页坏了。 -->
+<div id="page-generic" class="page-generic" hidden></div>
 
 <script type="module" src="assets/app.js"></script>
 </body>

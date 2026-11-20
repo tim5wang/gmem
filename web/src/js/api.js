@@ -55,6 +55,14 @@ export function fetchEntity(fetchImpl, url) {
   return request(fetchImpl, url, { headers: { Accept: 'application/json' } });
 }
 
+// fetchRecall 请求 /api/recall（Recall Inspector 的唯一数据源）。
+//
+// 单独一个函数而不是直接把 URL 丢给 request：页面层的调用点因此只有一个，
+// "到底请求了哪个 URL"在代码里可被搜索到，而不是散在事件处理里拼串。
+export function fetchRecall(fetchImpl, url) {
+  return request(fetchImpl, url, { headers: { Accept: 'application/json' } });
+}
+
 // postReview 是**唯一**的写请求（POST /api/review）。
 //
 // confirmed 由调用方显式传 true —— UI 侧必须已经过二次确认弹窗。

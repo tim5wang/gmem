@@ -20,6 +20,9 @@ import { render, hitTest, hitTestCluster, isPendingReview } from './render.js';
 import { shouldUseCanvas } from './geometry.js';
 import { relayout, withLayout } from './layout.js';
 import { requestReview, reviewPrompt } from './reviewflow.js';
+// P6 前置 2：横幅逻辑已抽到 ui/banner.js（行为不变：同样的 class 名、
+// 同样经 textContent 写入）。这里只做 import，不再本地重复一份。
+import { bannerHTML, flash } from './ui/banner.js';
 
 const MAX_SVG = 2000;
 
@@ -207,42 +210,33 @@ function renderBanners() {
   const meta = state.scene?.meta || state.raw?.meta || {};
 
   for (const e of state.errors) {
-    parts.push(banner('error', `参数/请求错误${e.field ? `（${e.field}）` : ''}：${e.message}`));
+    parts.push(bannerHTML('error', `参数/请求错误${e.field ? `（${e.field}）` : ''}：${e.message}`));
   }
   if (Array.isArray(meta.degraded) && meta.degraded.length) {
-    parts.push(banner('warn', `降级（meta.degraded，共 ${meta.degraded.length} 条）：${meta.degraded.join('；')}`));
+    parts.push(bannerHTML('warn', `降级（meta.degraded，共 ${meta.degraded.length} 条）：${meta.degraded.join('；')}`));
   }
   if (meta.recall && Array.isArray(meta.recall.degraded) && meta.recall.degraded.length) {
-    parts.push(banner('warn', `召回降级（recall.degraded）：${meta.recall.degraded.join('；')}`));
+    parts.push(bannerHTML('warn', `召回降级（recall.degraded）：${meta.recall.degraded.join('；')}`));
   }
   if (meta.recall && meta.recall.status && meta.recall.status !== 'ok') {
-    parts.push(banner('info', `召回状态：${meta.recall.status}（coverage=${meta.recall.coverage ?? '?'}，items=${meta.recall.items ?? '?'}）`));
+    parts.push(bannerHTML('info', `召回状态：${meta.recall.status}（coverage=${meta.recall.coverage ?? '?'}，items=${meta.recall.items ?? '?'}）`));
   }
   if (meta.truncated) {
-    parts.push(banner('info',
+    parts.push(bannerHTML('info',
       `已折叠，未显示全部：node_count=${meta.node_count}，rendered_nodes=${meta.rendered_nodes}，` +
       `clusters=${meta.rendered_clusters ?? state.scene?.clusters.length ?? 0}，budget=${meta.budget}/${meta.budget_max}`));
   }
   const reviewed = state.reviewed.size
-    ? banner('ok', `本次已裁决 ${state.reviewed.size} 条 possiblySame 边（服务端为准，刷新后可见结果）`)
+    ? bannerHTML('ok', `本次已裁决 ${state.reviewed.size} 条 possiblySame 边（服务端为准，刷新后可见结果）`)
     : '';
   if (reviewed) parts.push(reviewed);
 
-  // 安全说明（F-5）：parts 里每一条都由 banner() 用 textContent 构造后再取
+  // 安全说明（F-5）：parts 里每一条都由 bannerHTML() 用 textContent 构造后再取
   // outerHTML —— 服务端可控字符串（meta.degraded / recall.degraded / ApiError.message）
   // 已经被 textContent 转义成 HTML 实体，永远不可能变成标签或事件属性。
   // 基线差分实测：恶意库只多出“尖括号被当文本”的元素，可执行元素 0 条。
   dom.banners.innerHTML = parts.join('');
   dom.modeBadge.textContent = meta.mode ? `${meta.mode} · hops=${meta.hops ?? '-'} · budget=${meta.budget ?? '-'}` : '-';
-}
-
-// banner 里的 text 全部经由 textContent 写入，所以下面取 outerHTML 时已是转义后的
-// 字符串（服务端值不会作为标签生效）。
-function banner(kind, text) {
-  const div = document.createElement('div');
-  div.className = `banner ${kind}`;
-  div.textContent = text;
-  return div.outerHTML;
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +445,20 @@ function renderEntityCard(card) {
   h.textContent = card.canonical_name || card.id;
   frag.appendChild(h);
 
+  // 双向连线（P6-1 验收「空态与双向连线」的反向那一半）：
+  // 从 Graph View 点节点能跳到 /recall?q=<节点名>。
+  // 用节点名而不是节点 ID 作为 q：Recall 的 align 按表面词命中，ID 不在词典里。
+  const recallName = card.canonical_name || card.id;
+  if (recallName) {
+    const link = document.createElement('p');
+    link.className = 'hint';
+    const a = document.createElement('a');
+    a.href = `/recall?q=${encodeURIComponent(recallName)}`;
+    a.textContent = `在 Recall Inspector 里查看「${recallName}」→`;
+    link.appendChild(a);
+    frag.appendChild(link);
+  }
+
   const meta = document.createElement('p');
   meta.className = 'hint';
   meta.textContent = `id=${card.id} · scope=${card.scope}` +
@@ -627,11 +635,8 @@ dom.copyBtn.addEventListener('click', async () => {
 });
 
 function flashBanner(kind, text) {
-  const div = document.createElement('div');
-  div.className = `banner ${kind}`;
-  div.textContent = text;
-  dom.banners.appendChild(div);
-  setTimeout(() => div.remove(), 8000);
+  // 8 秒自动消失的短时横幅（行为与迁移前一致），实现见 ui/banner.js。
+  flash(dom.banners, kind, text);
 }
 
 // 折叠团下钻：以该 concept 下的一个实体为焦点（服务端不支持按 concept 取邻域）。
@@ -799,23 +804,32 @@ function hideTooltip() {
 // 启动
 // ---------------------------------------------------------------------------
 
-window.addEventListener('popstate', () => {
-  const { view, errors } = parseView(location.search);
-  if (errors.length) {
-    state.errors = errors;
-    renderBanners();
-    return;
-  }
-  loadView(view);
-});
+// popstate / resize 只在 **Graph View 路由**下生效，因此它们不能挂在模块顶层。
+//
+// 为什么重要：六页共用一份 bundle（前置 1），模块顶层监听器在任何页面上都会
+// 注册。在 /recall 按后退时，这里会拿 recall 的 query string 去 parseView，
+// 把 q=acme 当成图搜索发出 /api/graph 请求 —— 覆盖 Recall 页的 state，
+// 表现为"后退之后页面自己变成了图"。改由 boot() 内注册，只在图的页面上存在。
+function bindGraphGlobalListeners() {
+  window.addEventListener('popstate', () => {
+    const { view, errors } = parseView(location.search);
+    if (errors.length) {
+      state.errors = errors;
+      renderBanners();
+      return;
+    }
+    loadView(view);
+  });
 
-let resizeTimer = null;
-window.addEventListener('resize', () => {
-  clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => draw(), 120);
-});
+  let resizeTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => draw(), 120);
+  });
+}
 
 export async function boot() {
+  bindGraphGlobalListeners();
   const { view, errors } = parseView(location.search);
   if (errors.length) {
     state.errors = errors;
@@ -832,6 +846,12 @@ export async function boot() {
 // 便于 node --test / e2e 复用的导出（不影响浏览器行为）。
 export { state, loadView, applyFiltersAndDraw, buildStageNote, openReview, confirmThenRun, submitReview, chooseVerdict };
 
-if (typeof document !== 'undefined' && document.getElementById('graph-svg')) {
-  boot();
-}
+// **不自启动**：bundle 的唯一入口是 entry.js（客户端路由分发）。
+//
+// 六页共用一份 index.html（前置 1），因此 #graph-svg 在**任何**页面上都存在。
+// 若本文件自己 boot()，那么：
+//   - 打开 /recall 时 Graph View 也会启动并请求 /api/graph（页面上看不见，但网络
+//     面板里多出无关请求）；
+//   - 打开 / 时则会被 boot 两次（本文件一次 + entry.js 分发一次），两次并发
+//     请求互相覆盖 state —— 这是加路由后实际发生过的缺陷。
+// 启动时机因此只归 entry.js 管，本文件只导出 boot()。

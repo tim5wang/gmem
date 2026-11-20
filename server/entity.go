@@ -54,7 +54,8 @@ func (s *Server) buildEntity(ctx context.Context, id string, asOf *int64) (Entit
 		Meta: Meta{
 			Mode: "entity", Scope: string(node.Scope), AsOf: asOf,
 			Budget: defaultBudget, BudgetMax: maxBudget,
-			Relations: relationLimits(newHopTable(s.recallerConfigRules())),
+			Relations:    relationLimits(newHopTable(s.recallerConfigRules())),
+			Capabilities: s.capabilities(),
 		},
 	}
 	var degraded []string

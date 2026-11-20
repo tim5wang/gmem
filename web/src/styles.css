@@ -1,6 +1,24 @@
-/* Graph View 样式（手写，不用框架）。
-   布局：顶栏 / 横幅 / 三栏（过滤 | 画布 | 实体卡）/ 时间轴。 */
+/* Gmem 前端样式（手写，不用框架）。
+   布局：顶栏 / 横幅 / 三栏（过滤 | 画布 | 实体卡）/ 时间轴。
+
+   ==========================================================================
+   Token 分层（P6 前置 3）
+
+   六页共用一套语义 token，分四组，**互不复用**：
+
+     面 / 线 / 字   布局层：surface-* · border-* · text-1..3
+     状态色         表达结果：ok / warn / danger / accent（+ 各自的底 -bg）
+     编码色         表达**数据语义**：enc-invalidated / enc-possibly-same / enc-matched
+     间距字号圆角   跨页节奏：s1..s7 · fs-1..fs-6 · r1..r3 · shadow-* · t-*
+
+   为什么编码色不与状态色合并：蓝边 = 待审（数据语义）与蓝 = 信息（状态语义）
+   若用同一个变量，改状态色就会悄悄改掉"这条边待审"的视觉含义。
+
+   兼容层：原有的 9 个变量名（--bg/--panel/--line/--text/--muted/--accent/
+   --danger/--ok/--warn）**全部保留且值不变**，Graph View 的既有规则一行未改，
+   因此视觉零变化；新页一律使用语义 token。 */
 :root {
+  /* ---- 兼容层（Graph View 在用，值不得变） ---- */
   --bg: #f7f8fa;
   --panel: #ffffff;
   --line: #d8dee8;
@@ -10,6 +28,64 @@
   --danger: #d32f2f;
   --ok: #2e7d32;
   --warn: #a15c00;
+
+  /* ---- 面 ---- */
+  --surface-0: var(--bg);
+  --surface-1: var(--panel);
+  --surface-2: #eef1f6;
+
+  /* ---- 线 ---- */
+  --border: var(--line);
+  --border-strong: #b6c0cf;
+
+  /* ---- 字（三级） ---- */
+  --text-1: var(--text);
+  --text-2: #4b5563;
+  --text-3: var(--muted);
+
+  /* ---- 状态色底（与状态色同色相、低饱和） ---- */
+  --accent-bg: #eaf2fd;
+  --ok-bg: #e8f4ea;
+  --warn-bg: #fdf3e3;
+  --danger-bg: #fdecec;
+
+  /* ---- 编码色（只用于描边/图形，不用于文字） ---- */
+  --enc-invalidated: #9aa5b4;
+  --enc-possibly-same: var(--accent);
+  --enc-matched: var(--danger);
+
+  /* ---- 间距（4px 栅格） ---- */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+  --s7: 48px;
+
+  /* ---- 字号（6 级） ---- */
+  --fs-1: 20px; /* 页面标题（每页唯一一处） */
+  --fs-2: 14px; /* 区块标题 */
+  --fs-3: 13px; /* 正文 */
+  --fs-4: 12px; /* 表格 / 紧凑 */
+  --fs-5: 11px; /* 标签 / 单位 */
+  --fs-6: 26px; /* 数字强调 */
+
+  /* ---- 圆角 ---- */
+  --r1: 4px;
+  --r2: 6px;
+  --r3: 10px;
+  --r-pill: 999px;
+
+  /* ---- 阴影 ---- */
+  --shadow-1: 0 1px 2px rgba(15, 23, 42, .08);
+  --shadow-2: 0 6px 18px rgba(15, 23, 42, .16);
+  --shadow-3: 0 12px 32px rgba(15, 23, 42, .25);
+
+  /* ---- 过渡 ---- */
+  --t-fast: 120ms;
+  --t-base: 180ms;
+  --ease: cubic-bezier(.2, .8, .2, 1);
 }
 
 * { box-sizing: border-box; }
@@ -191,3 +267,369 @@ label.num input { width: 72px; }
   .panel { border: none; border-bottom: 1px solid var(--line); max-height: 22vh; }
   .stage { min-height: 40vh; }
 }
+
+/* ==========================================================================
+   通用组件（ui/ 组件层的样式；六页共用）
+
+   这些规则只作用于新的组件类名，不改动 Graph View 的任何既有选择器。
+   ========================================================================== */
+
+/* ---- 空态 / 错误态：共同骨架（标题 + 原因 + 动作） ---- */
+.empty, .error-state {
+  display: grid;
+  gap: var(--s2);
+  padding: var(--s4);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--r3);
+  background: var(--surface-1);
+  color: var(--text-2);
+  font-size: var(--fs-4);
+}
+.error-state {
+  border-style: solid;
+  border-color: var(--danger);
+  background: var(--danger-bg);
+}
+.empty-title, .error-title {
+  margin: 0;
+  font-size: var(--fs-3);
+  font-weight: 600;
+  color: var(--text-1);
+}
+.error-title { color: var(--danger); }
+.empty-reason, .error-message { margin: 0; }
+.error-detail {
+  margin: 0;
+  font-size: var(--fs-5);
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.empty-actions, .error-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s2);
+}
+.empty-action, .error-action {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: var(--s1) var(--s3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r2);
+  background: var(--surface-2);
+  color: var(--text-1);
+  font-size: var(--fs-4);
+  text-decoration: none;
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease);
+}
+.empty-action:hover, .error-action:hover { background: var(--accent-bg); }
+
+/* ---- 骨架屏 ---- */
+.skeleton { display: grid; gap: var(--s2); padding: var(--s3) 0; }
+.skeleton-row {
+  height: 12px;
+  border-radius: var(--r1);
+  background: linear-gradient(90deg, var(--surface-2) 0%, #f6f8fb 50%, var(--surface-2) 100%);
+  background-size: 200% 100%;
+  animation: skeleton-sweep 1.2s linear infinite;
+}
+.skeleton-row:nth-child(even) { width: 72%; }
+@keyframes skeleton-sweep {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-row { animation: none; }
+}
+
+/* ---- 迷你图表 ---- */
+.spark, .bars { display: block; overflow: visible; }
+.spark-line { stroke: var(--accent); }
+.bar { fill: var(--accent); }
+
+/* ==========================================================================
+   页面路由（六页共用外壳）
+
+   body 仍是 Graph View 的四行网格；页面切换靠 hidden 属性 +
+   让 #page-recall 跨满所有行。Graph View 的元素与规则一行未改。
+   ========================================================================== */
+/* 非 Graph View 路由：body 收成单行 + 藏掉 Graph View 的四个直接子元素。
+   为什么要靠 body 上的 class 而不是给画布加 grid-row：Graph View 的
+   grid-template-rows: auto auto 1fr auto 与它的四个直接子元素一一对应，
+   任何改动都会动到它的版面。这里只在**别的路由**上加一个 class，
+   Graph View 运行时一条规则都不命中 —— 视觉零变化。 */
+body.route-recall { grid-template-rows: 1fr; }
+body.route-recall > .topbar,
+body.route-recall > .banners,
+body.route-recall > .layout,
+body.route-recall > .timeline { display: none; }
+
+.page-recall {
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  min-height: 0;
+  background: var(--surface-0);
+  overflow: hidden;
+}
+.page-recall[hidden] { display: none; }
+
+/* 未实现页 / 404 视图：同样占满整屏，与 Recall 页同一套 header 外观。 */
+body.route-generic { grid-template-rows: 1fr; }
+body.route-generic > .topbar,
+body.route-generic > .banners,
+body.route-generic > .layout,
+body.route-generic > .timeline { display: none; }
+
+.page-generic {
+  min-height: 0;
+  overflow: auto;
+  background: var(--surface-0);
+}
+.page-generic[hidden] { display: none; }
+
+.recall-topbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  flex-wrap: wrap;
+  padding: var(--s2) var(--s3);
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border);
+}
+.recall-topbar h1 {
+  margin: 0 var(--s2) 0 0;
+  font-size: var(--fs-2);
+  font-weight: 600;
+  letter-spacing: .01em;
+}
+.recall-topbar .search input[type="search"] { width: min(320px, 42vw); }
+
+.nav { display: flex; gap: var(--s1); }
+.nav a {
+  padding: 3px var(--s2);
+  border-radius: var(--r-pill);
+  color: var(--text-2);
+  font-size: var(--fs-4);
+  text-decoration: none;
+  transition: background var(--t-fast) var(--ease);
+}
+.nav a:hover { background: var(--surface-2); }
+.nav a[aria-current="page"] {
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* ---- as_of 横幅：**不可折叠**（没有关闭按钮，样式也强调） ---- */
+.asof-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  margin: var(--s2) var(--s3) 0;
+  padding: var(--s2) var(--s3);
+  border: 1px solid var(--warn);
+  border-radius: var(--r2);
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-size: var(--fs-4);
+  font-weight: 600;
+}
+.asof-banner button {
+  margin-left: auto;
+  border-color: var(--warn);
+  background: var(--surface-1);
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.recall-banners { display: grid; gap: var(--s1); padding: var(--s2) var(--s3) 0; }
+.recall-banners:empty { display: none; }
+
+/* ---- 主体：列表 + 详情并排（≥1024px），窄屏退抽屉 ---- */
+.recall-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 400px;
+  gap: var(--s3);
+  padding: var(--s3);
+  min-height: 0;
+  overflow: hidden;
+}
+.recall-list, .recall-detail {
+  min-height: 0;
+  overflow: auto;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r3);
+  padding: var(--s3);
+}
+.recall-detail[hidden] { display: none; }
+
+.recall-section { margin-bottom: var(--s4); }
+.recall-section:last-child { margin-bottom: 0; }
+.recall-section > h2 {
+  margin: 0 0 var(--s2);
+  font-size: var(--fs-2);
+  font-weight: 600;
+  letter-spacing: .01em;
+  color: var(--text-1);
+}
+.recall-section > h3 {
+  margin: var(--s3) 0 var(--s1);
+  font-size: var(--fs-4);
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+/* ---- 键值网格（plan 区块） ---- */
+.kv {
+  display: grid;
+  grid-template-columns: minmax(96px, auto) minmax(0, 1fr);
+  gap: var(--s1) var(--s3);
+  margin: 0;
+  font-size: var(--fs-4);
+}
+.kv dt { color: var(--text-3); }
+.kv dd {
+  margin: 0;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+  word-break: break-word;
+}
+.kv dd.num { font-weight: 600; }
+
+/* ---- 数据表 ---- */
+.table { width: 100%; border-collapse: collapse; font-size: var(--fs-4); }
+.table th, .table td {
+  padding: 3px var(--s2);
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.table th {
+  color: var(--text-3);
+  font-weight: 600;
+  font-size: var(--fs-5);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  white-space: nowrap;
+}
+.table td.num, .table th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.table tbody tr:hover { background: var(--surface-2); }
+.table .row-button {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+/* ---- lane 行：可展开该 lane 的 LaneHit[] ---- */
+.lane-row.open { background: var(--accent-bg); }
+.lane-detail td { background: var(--surface-2); }
+.lane-flag { font-variant-numeric: tabular-nums; }
+.flag-yes { color: var(--ok); font-weight: 600; }
+.flag-no { color: var(--text-3); }
+
+/* ---- 结果列表 ---- */
+.result-row.selected { background: var(--accent-bg); }
+.result-score {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--accent);
+}
+.result-content {
+  color: var(--text-2);
+  word-break: break-word;
+}
+.result-meta { color: var(--text-3); font-size: var(--fs-5); }
+
+/* ---- 分数分解 ---- */
+.score-box {
+  display: grid;
+  gap: var(--s2);
+  padding: var(--s3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r2);
+  background: var(--surface-2);
+}
+.score-formula {
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-4);
+  color: var(--text-1);
+  word-break: break-word;
+}
+.score-final {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s2);
+  font-size: var(--fs-6);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-1);
+}
+.score-final .unit { font-size: var(--fs-5); font-weight: 500; color: var(--text-3); }
+.score-check { font-size: var(--fs-5); }
+.score-check.ok { color: var(--ok); }
+.score-check.bad { color: var(--danger); font-weight: 600; }
+
+/* ---- 证据 / 调整明细列表 ---- */
+.plain-list { margin: 0; padding-left: var(--s4); font-size: var(--fs-4); color: var(--text-2); }
+.plain-list li { margin: 2px 0; word-break: break-word; }
+.plain-list .mono { font-variant-numeric: tabular-nums; }
+
+.chips { display: flex; flex-wrap: wrap; gap: var(--s1); }
+.chip {
+  padding: 1px var(--s2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface-1);
+  font-size: var(--fs-5);
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- 窄屏（<1024px）：详情退成底部抽屉 ---- */
+@media (max-width: 1023px) {
+  .recall-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(0, 1fr);
+    overflow: auto;
+  }
+  .recall-detail {
+    position: sticky;
+    bottom: 0;
+    z-index: 20;
+    max-height: 60vh;
+    border-radius: var(--r3) var(--r3) 0 0;
+    box-shadow: var(--shadow-2);
+  }
+  .recall-detail .drawer-head { display: flex; }
+}
+
+/* ---- 抽屉头（窄屏才有意义；宽屏隐藏） ---- */
+.drawer-head {
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s2);
+  margin: calc(-1 * var(--s3)) calc(-1 * var(--s3)) var(--s2);
+  padding: var(--s2) var(--s3);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-4);
+  font-weight: 600;
+}
+.drawer-head button { padding: 2px var(--s2); }
+
+/* ---- 404 页 ---- */
+.page-missing { padding: var(--s6) var(--s4); display: grid; gap: var(--s3); }
+.page-missing h1 { margin: 0; font-size: var(--fs-1); }
+.page-missing p { margin: 0; color: var(--text-2); font-size: var(--fs-3); }

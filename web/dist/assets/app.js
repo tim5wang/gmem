@@ -1,3 +1,40 @@
+// js/router.js
+var ROUTES = Object.freeze({
+  "/": "graph",
+  "/recall": "recall",
+  "/review": "review",
+  "/stream": "stream",
+  "/ontology": "ontology",
+  "/metrics": "metrics"
+});
+var PAGE_TITLES = Object.freeze({
+  graph: "Graph View",
+  recall: "Recall Inspector",
+  review: "Review Queue",
+  stream: "Memory Stream",
+  ontology: "Ontology Drift",
+  metrics: "Metrics",
+  missing: "页面不存在"
+});
+var IMPLEMENTED = Object.freeze(["graph", "recall"]);
+function normalizePath(pathname) {
+  const p = String(pathname || "/").trim() || "/";
+  if (p === "/") return "/";
+  return p.replace(/\/+$/, "") || "/";
+}
+function matchRoute(pathname) {
+  const path = normalizePath(pathname);
+  const page = ROUTES[path] || "missing";
+  return { page, path };
+}
+function isImplemented(page) {
+  return IMPLEMENTED.includes(page);
+}
+function notImplementedMessage(page) {
+  const title = PAGE_TITLES[page] || page;
+  return `「${title}」这一页还没实现（详见 TD §9 六页计划）。当前可用：Graph View 与 Recall Inspector。`;
+}
+
 // js/api.js
 var ApiError = class extends Error {
   constructor(message, { status = 0, code = "", field = "" } = {}) {
@@ -43,6 +80,9 @@ function fetchGraph(fetchImpl, url) {
 function fetchEntity(fetchImpl, url) {
   return request(fetchImpl, url, { headers: { Accept: "application/json" } });
 }
+function fetchRecall(fetchImpl, url) {
+  return request(fetchImpl, url, { headers: { Accept: "application/json" } });
+}
 function postReview(fetchImpl, { edgeId, verdict, confirmed }) {
   if (!confirmed) {
     return Promise.reject(new ApiError("未确认的裁决不会发出请求", { code: "not_confirmed" }));
@@ -64,11 +104,11 @@ function conceptKey(node) {
   return node.cluster || node.concept_id || "";
 }
 function hashCode(str) {
-  let h = 5381;
+  let h2 = 5381;
   for (let i = 0; i < str.length; i++) {
-    h = (h << 5) + h + str.charCodeAt(i) >>> 0;
+    h2 = (h2 << 5) + h2 + str.charCodeAt(i) >>> 0;
   }
-  return h >>> 0;
+  return h2 >>> 0;
 }
 function conceptHue(key) {
   if (!key) return 210;
@@ -304,8 +344,8 @@ function bounds(scene) {
 function makeProjector(scene, width, height, padding = 48) {
   const b = bounds(scene);
   const w = Math.max(1, width - padding * 2);
-  const h = Math.max(1, height - padding * 2);
-  const scale = Math.min(w / (b.maxX - b.minX), h / (b.maxY - b.minY));
+  const h2 = Math.max(1, height - padding * 2);
+  const scale = Math.min(w / (b.maxX - b.minX), h2 / (b.maxY - b.minY));
   const cx = (b.minX + b.maxX) / 2;
   const cy = (b.minY + b.maxY) / 2;
   const project = (x2, y2) => ({
@@ -1585,6 +1625,75 @@ function reviewPrompt(label, verdict) {
   };
 }
 
+// js/ui/dom.js
+function h(tag, props = {}, children = []) {
+  const el2 = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (v === null || v === void 0 || v === false) continue;
+    if (k === "className") {
+      el2.className = v;
+    } else if (k === "textContent") {
+      el2.textContent = String(v);
+    } else if (k === "dataset") {
+      for (const [dk, dv] of Object.entries(v)) el2.dataset[dk] = String(dv);
+    } else if (k.startsWith("on") && typeof v === "function") {
+      el2[k] = v;
+    } else if (k === "hidden") {
+      el2.hidden = Boolean(v);
+    } else if (k === "value") {
+      el2.value = String(v);
+    } else {
+      el2.setAttribute(k, String(v));
+    }
+  }
+  append(el2, children);
+  return el2;
+}
+function append(el2, children) {
+  const list = Array.isArray(children) ? children : [children];
+  for (const c2 of list) {
+    if (c2 === null || c2 === void 0 || c2 === false) continue;
+    if (Array.isArray(c2)) {
+      append(el2, c2);
+    } else if (typeof c2 === "string" || typeof c2 === "number") {
+      el2.appendChild(document.createTextNode(String(c2)));
+    } else {
+      el2.appendChild(c2);
+    }
+  }
+  return el2;
+}
+function fmt(n, digits = 3) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "—";
+  return v.toFixed(digits);
+}
+function fmtUnix(sec) {
+  const v = Number(sec);
+  if (!Number.isFinite(v)) return String(sec ?? "—");
+  const iso = new Date(v * 1e3).toISOString();
+  return iso.replace("T", " ").replace(".000Z", " UTC");
+}
+
+// js/ui/banner.js
+var BANNER_KINDS = Object.freeze(["error", "warn", "info", "ok"]);
+function banner(kind, text, { role = "status" } = {}) {
+  const k = BANNER_KINDS.includes(kind) ? kind : "info";
+  return h("div", { className: `banner ${k}`, role, textContent: String(text ?? "") });
+}
+function bannerHTML(kind, text) {
+  return banner(kind, text).outerHTML;
+}
+function flash(container2, kind, text, { ms = 8e3 } = {}) {
+  if (!container2) return null;
+  const el2 = banner(kind, text);
+  container2.appendChild(el2);
+  if (typeof setTimeout === "function" && ms > 0) {
+    setTimeout(() => el2.remove && el2.remove(), ms);
+  }
+  return el2;
+}
+
 // js/main.js
 var MAX_SVG = 2e3;
 var dom = {
@@ -1734,33 +1843,27 @@ function renderBanners() {
   const parts = [];
   const meta = state.scene?.meta || state.raw?.meta || {};
   for (const e of state.errors) {
-    parts.push(banner("error", `参数/请求错误${e.field ? `（${e.field}）` : ""}：${e.message}`));
+    parts.push(bannerHTML("error", `参数/请求错误${e.field ? `（${e.field}）` : ""}：${e.message}`));
   }
   if (Array.isArray(meta.degraded) && meta.degraded.length) {
-    parts.push(banner("warn", `降级（meta.degraded，共 ${meta.degraded.length} 条）：${meta.degraded.join("；")}`));
+    parts.push(bannerHTML("warn", `降级（meta.degraded，共 ${meta.degraded.length} 条）：${meta.degraded.join("；")}`));
   }
   if (meta.recall && Array.isArray(meta.recall.degraded) && meta.recall.degraded.length) {
-    parts.push(banner("warn", `召回降级（recall.degraded）：${meta.recall.degraded.join("；")}`));
+    parts.push(bannerHTML("warn", `召回降级（recall.degraded）：${meta.recall.degraded.join("；")}`));
   }
   if (meta.recall && meta.recall.status && meta.recall.status !== "ok") {
-    parts.push(banner("info", `召回状态：${meta.recall.status}（coverage=${meta.recall.coverage ?? "?"}，items=${meta.recall.items ?? "?"}）`));
+    parts.push(bannerHTML("info", `召回状态：${meta.recall.status}（coverage=${meta.recall.coverage ?? "?"}，items=${meta.recall.items ?? "?"}）`));
   }
   if (meta.truncated) {
-    parts.push(banner(
+    parts.push(bannerHTML(
       "info",
       `已折叠，未显示全部：node_count=${meta.node_count}，rendered_nodes=${meta.rendered_nodes}，clusters=${meta.rendered_clusters ?? state.scene?.clusters.length ?? 0}，budget=${meta.budget}/${meta.budget_max}`
     ));
   }
-  const reviewed = state.reviewed.size ? banner("ok", `本次已裁决 ${state.reviewed.size} 条 possiblySame 边（服务端为准，刷新后可见结果）`) : "";
+  const reviewed = state.reviewed.size ? bannerHTML("ok", `本次已裁决 ${state.reviewed.size} 条 possiblySame 边（服务端为准，刷新后可见结果）`) : "";
   if (reviewed) parts.push(reviewed);
   dom.banners.innerHTML = parts.join("");
   dom.modeBadge.textContent = meta.mode ? `${meta.mode} · hops=${meta.hops ?? "-"} · budget=${meta.budget ?? "-"}` : "-";
-}
-function banner(kind, text) {
-  const div = document.createElement("div");
-  div.className = `banner ${kind}`;
-  div.textContent = text;
-  return div.outerHTML;
 }
 function renderFilterPanel() {
   const scene = state.baseScene;
@@ -1933,9 +2036,19 @@ async function selectNode(id) {
 }
 function renderEntityCard(card) {
   const frag = document.createDocumentFragment();
-  const h = document.createElement("h3");
-  h.textContent = card.canonical_name || card.id;
-  frag.appendChild(h);
+  const h2 = document.createElement("h3");
+  h2.textContent = card.canonical_name || card.id;
+  frag.appendChild(h2);
+  const recallName = card.canonical_name || card.id;
+  if (recallName) {
+    const link2 = document.createElement("p");
+    link2.className = "hint";
+    const a2 = document.createElement("a");
+    a2.href = `/recall?q=${encodeURIComponent(recallName)}`;
+    a2.textContent = `在 Recall Inspector 里查看「${recallName}」→`;
+    link2.appendChild(a2);
+    frag.appendChild(link2);
+  }
   const meta = document.createElement("p");
   meta.className = "hint";
   meta.textContent = `id=${card.id} · scope=${card.scope}` + (card.concept ? ` · concept=${card.concept.name || card.concept.id}（${card.concept.status}）` : " · 无概念");
@@ -2078,11 +2191,7 @@ dom.copyBtn.addEventListener("click", async () => {
   }
 });
 function flashBanner(kind, text) {
-  const div = document.createElement("div");
-  div.className = `banner ${kind}`;
-  div.textContent = text;
-  dom.banners.appendChild(div);
-  setTimeout(() => div.remove(), 8e3);
+  flash(dom.banners, kind, text);
 }
 function drillIntoCluster(conceptId) {
   const candidate = state.baseScene?.nodes.find((n) => (n.concept_id || "") === (conceptId || ""));
@@ -2126,13 +2235,6 @@ function chooseVerdict(label, edgeId) {
   wrap.append(same, diff, cancel);
   dom.banners.appendChild(wrap);
   return wrap;
-}
-function confirmThenRun({ title, text, onConfirm }) {
-  dom.confirmTitle.textContent = title;
-  dom.confirmText.textContent = text;
-  openConfirmModal().then((ok) => {
-    if (ok === true) onConfirm();
-  });
 }
 async function submitReview(edgeId, verdict, label = edgeId) {
   try {
@@ -2206,21 +2308,24 @@ function hideTooltip() {
   dom.tooltip.hidden = true;
   dom.tooltipEdge = "";
 }
-window.addEventListener("popstate", () => {
-  const { view, errors } = parseView(location.search);
-  if (errors.length) {
-    state.errors = errors;
-    renderBanners();
-    return;
-  }
-  loadView(view);
-});
-var resizeTimer = null;
-window.addEventListener("resize", () => {
-  clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => draw(), 120);
-});
+function bindGraphGlobalListeners() {
+  window.addEventListener("popstate", () => {
+    const { view, errors } = parseView(location.search);
+    if (errors.length) {
+      state.errors = errors;
+      renderBanners();
+      return;
+    }
+    loadView(view);
+  });
+  let resizeTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => draw(), 120);
+  });
+}
 async function boot() {
+  bindGraphGlobalListeners();
   const { view, errors } = parseView(location.search);
   if (errors.length) {
     state.errors = errors;
@@ -2233,18 +2338,1062 @@ async function boot() {
   dom.qInput.value = view.q;
   await loadView(view);
 }
-if (typeof document !== "undefined" && document.getElementById("graph-svg")) {
-  boot();
+
+// js/ui/errorState.js
+var ERROR_KINDS = Object.freeze(["network", "request", "param"]);
+function classifyError(err) {
+  const status = Number(err && err.status ? err.status : 0);
+  const code = String(err && err.code || "");
+  const field = String(err && err.field || "");
+  if (field || code === "bad_request" || status === 400) return "param";
+  if (status >= 500 || status === 0) return "network";
+  if (code === "network") return "network";
+  return "request";
+}
+function errorState({ kind, message, detail = "", onRetry, onFix } = {}) {
+  const k = ERROR_KINDS.includes(kind) ? kind : "request";
+  const wrap = h("div", {
+    className: `error-state error-${k}`,
+    "data-error-kind": k,
+    role: "alert"
+  });
+  wrap.appendChild(h("p", { className: "error-title", textContent: titleFor(k) }));
+  wrap.appendChild(h("p", { className: "error-message", textContent: String(message || "未知错误") }));
+  if (detail) {
+    wrap.appendChild(h("p", { className: "error-detail", textContent: String(detail) }));
+  }
+  const actions = h("div", { className: "error-actions" });
+  if (k !== "param" && typeof onRetry === "function") {
+    actions.appendChild(h("button", {
+      type: "button",
+      className: "error-action",
+      onclick: onRetry,
+      textContent: "重试"
+    }));
+  }
+  if (typeof onFix === "function") {
+    actions.appendChild(h("button", {
+      type: "button",
+      className: "error-action",
+      onclick: onFix,
+      textContent: "修改参数"
+    }));
+  }
+  if (actions.children && actions.children.length) wrap.appendChild(actions);
+  return wrap;
+}
+function titleFor(kind) {
+  switch (kind) {
+    case "network":
+      return "连不上服务";
+    case "param":
+      return "参数有误";
+    default:
+      return "请求失败";
+  }
+}
+
+// js/recallstate.js
+var K_MAX = 50;
+var K_DEFAULT = 10;
+var SCOPES = Object.freeze(["user", "agent", "project", "global"]);
+var KINDS = Object.freeze(["semantic", "episodic", "procedural", "decision"]);
+var LANES = Object.freeze(["lexical", "vector", "graph"]);
+var INT_RE2 = /^-?\d+$/;
+function splitList(raw) {
+  return String(raw || "").split(",").map((s) => s.trim()).filter(Boolean);
+}
+function parseRecallView(search) {
+  const params = new URLSearchParams(String(search || "").replace(/^\?/, ""));
+  const errors = [];
+  const view = {
+    q: (params.get("q") || "").trim(),
+    scope: (params.get("scope") || "").trim(),
+    kinds: [],
+    lanes: [],
+    asOf: null,
+    k: K_DEFAULT,
+    item: (params.get("item") || "").trim()
+  };
+  if (view.scope && !SCOPES.includes(view.scope)) {
+    errors.push({
+      field: "scope",
+      message: `scope 必须是 ${SCOPES.join(" / ")} 之一，收到 ${JSON.stringify(view.scope)}`
+    });
+  }
+  for (const k of splitList(params.get("kinds"))) {
+    if (!KINDS.includes(k)) {
+      errors.push({
+        field: "kinds",
+        message: `kinds 只能是 ${KINDS.join(" / ")}，收到 ${JSON.stringify(k)}`
+      });
+      continue;
+    }
+    view.kinds.push(k);
+  }
+  for (const l of splitList(params.get("lanes"))) {
+    if (!LANES.includes(l)) {
+      errors.push({
+        field: "lanes",
+        message: `lanes 只能是 ${LANES.join(" / ")}，收到 ${JSON.stringify(l)}`
+      });
+      continue;
+    }
+    view.lanes.push(l);
+  }
+  const kRaw = params.get("k");
+  if (kRaw !== null && kRaw !== "") {
+    if (!INT_RE2.test(kRaw)) {
+      errors.push({ field: "k", message: `k 必须是整数，收到 ${JSON.stringify(kRaw)}` });
+    } else {
+      const n = Number(kRaw);
+      if (n < 1) {
+        errors.push({ field: "k", message: `k 必须 >= 1，收到 ${n}` });
+      } else if (n > K_MAX) {
+        errors.push({
+          field: "k",
+          message: `k 不能超过硬上限 ${K_MAX}，收到 ${n}（不会静默夹取）`
+        });
+      } else {
+        view.k = n;
+      }
+    }
+  }
+  const asOfRaw = params.get("as_of");
+  if (asOfRaw !== null && asOfRaw !== "") {
+    if (!INT_RE2.test(asOfRaw)) {
+      errors.push({
+        field: "as_of",
+        message: `as_of 必须是 unix 秒（整数），收到 ${JSON.stringify(asOfRaw)}`
+      });
+    } else {
+      view.asOf = Number(asOfRaw);
+    }
+  }
+  return { view, errors };
+}
+function toRecallQuery(view) {
+  const params = new URLSearchParams();
+  if (view?.q) params.set("q", view.q);
+  if (view?.scope) params.set("scope", view.scope);
+  if (view?.kinds?.length) params.set("kinds", view.kinds.join(","));
+  if (view?.lanes?.length) params.set("lanes", view.lanes.join(","));
+  if (view?.asOf !== null && view?.asOf !== void 0) params.set("as_of", String(view.asOf));
+  if (view?.k !== null && view?.k !== void 0 && view.k !== K_DEFAULT) {
+    params.set("k", String(view.k));
+  }
+  if (view?.item) params.set("item", view.item);
+  const qs = params.toString();
+  return qs ? `?${qs}` : "";
+}
+function toRecallURL(view) {
+  const apiView = { ...view, item: "" };
+  const qs = toRecallQuery(apiView);
+  return `/api/recall${qs}${qs ? "&" : "?"}explain=1`;
+}
+function toggleList(view, field, value) {
+  const cur = Array.isArray(view?.[field]) ? view[field] : [];
+  const next = cur.includes(value) ? cur.filter((v) => v !== value) : [...cur, value];
+  const order = field === "kinds" ? KINDS : LANES;
+  return { ...view, [field]: order.filter((v) => next.includes(v)), item: "" };
+}
+
+// js/ui/empty.js
+var EMPTY_KINDS = Object.freeze(["idle", "noData", "noCapability"]);
+function emptyState({ kind = "idle", title, reason = "", suggestions = [] } = {}) {
+  const k = EMPTY_KINDS.includes(kind) ? kind : "idle";
+  const wrap = h("div", { className: `empty empty-${k}`, "data-empty-kind": k, role: "status" });
+  wrap.appendChild(h("p", { className: "empty-title", textContent: title || "这里还没有内容" }));
+  if (reason) {
+    wrap.appendChild(h("p", { className: "empty-reason", textContent: reason }));
+  }
+  const actions = suggestions.filter((s) => s && s.label);
+  if (actions.length) {
+    const list = h("div", { className: "empty-actions" });
+    for (const s of actions) {
+      if (s.href) {
+        list.appendChild(h("a", {
+          className: "empty-action",
+          href: s.href,
+          // 站内链接不整页刷新：交给调用方的客户端路由处理。
+          onclick: typeof s.onClick === "function" ? s.onClick : void 0,
+          textContent: s.label
+        }));
+      } else {
+        list.appendChild(h("button", {
+          type: "button",
+          className: "empty-action",
+          onclick: typeof s.onClick === "function" ? s.onClick : void 0,
+          textContent: s.label
+        }));
+      }
+    }
+    wrap.appendChild(list);
+  }
+  return wrap;
+}
+var EXAMPLE_QUERIES = Object.freeze(["acme", "Alice", "deploy"]);
+function exampleSuggestions(onPick, queries = EXAMPLE_QUERIES) {
+  return queries.map((q) => ({
+    label: `试试「${q}」`,
+    onClick: () => {
+      if (typeof onPick === "function") onPick(q);
+    }
+  }));
+}
+
+// js/ui/skeleton.js
+function skeleton({ rows = 3, label = "正在加载", variant = "list" } = {}) {
+  const n = Math.max(1, Math.min(20, Number(rows) || 3));
+  const wrap = h("div", {
+    className: `skeleton skeleton-${variant}`,
+    "aria-busy": "true",
+    "aria-label": String(label || "正在加载"),
+    role: "status",
+    "data-skeleton-variant": variant
+  });
+  for (let i = 0; i < n; i += 1) {
+    wrap.appendChild(h("div", { className: "skeleton-row", "aria-hidden": "true" }));
+  }
+  return wrap;
+}
+
+// js/ui/chart.js
+function linePath(points) {
+  if (!Array.isArray(points) || points.length === 0) return "";
+  return points.map((p, i) => `${i === 0 ? "M" : "L"}${round2(p.x)} ${round2(p.y)}`).join(" ");
+}
+function round2(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Number(n.toFixed(2)) : 0;
+}
+function sparkline({
+  values = [],
+  width = 160,
+  height = 36,
+  label = "图表",
+  min,
+  max,
+  className = ""
+} = {}) {
+  const nums = (Array.isArray(values) ? values : []).map(Number).filter((v) => Number.isFinite(v));
+  const svg = h("svg", {
+    className: `spark ${className}`.trim(),
+    viewBox: `0 0 ${width} ${height}`,
+    width: String(width),
+    height: String(height),
+    role: "img",
+    "aria-label": String(label || "图表")
+  });
+  if (nums.length === 0) return svg;
+  const lo = Number.isFinite(min) ? Number(min) : Math.min(...nums);
+  const hi = Number.isFinite(max) ? Number(max) : Math.max(...nums);
+  const span = hi - lo || 1;
+  const pad = 2;
+  const innerW = width - pad * 2;
+  const innerH = height - pad * 2;
+  const pts = nums.map((v, i) => ({
+    x: pad + (nums.length === 1 ? innerW / 2 : i / (nums.length - 1) * innerW),
+    y: pad + innerH - (v - lo) / span * innerH
+  }));
+  svg.appendChild(h("path", {
+    className: "spark-line",
+    d: linePath(pts),
+    fill: "none",
+    "stroke-width": "1.5"
+  }));
+  return svg;
+}
+
+// js/recallpage.js
+var SCORE_EPS = 1e-3;
+function scoreBreakdown(item) {
+  const fusion = Number(item?.fusion_score);
+  const boost = Number(item?.concept_boost);
+  const recency = Number(item?.recency_factor);
+  const score = Number(item?.score);
+  const product = fusion * boost * recency;
+  const delta = Math.abs(product - score);
+  return {
+    fusion,
+    boost,
+    recency,
+    score,
+    product,
+    delta,
+    consistent: Number.isFinite(delta) && delta <= SCORE_EPS
+  };
+}
+function planSummary(resp) {
+  const plan = resp?.plan || {};
+  const hasPlan = resp?.plan !== null && resp?.plan !== void 0;
+  return {
+    query: plan.query ?? resp?.query ?? "",
+    shape: plan.shape ?? "",
+    shapeReason: plan.shape_reason ?? "",
+    coverage: Number(plan.coverage ?? resp?.coverage ?? NaN),
+    thetaCoverage: Number(plan.theta_coverage ?? resp?.theta_coverage ?? NaN),
+    hops: Number(plan.hops ?? 0),
+    anchors: Array.isArray(plan.anchors) ? plan.anchors : [],
+    matched: Array.isArray(plan.matched) ? plan.matched : [],
+    unmatched: Array.isArray(plan.unmatched) ? plan.unmatched : [],
+    relations: Array.isArray(plan.relations) ? plan.relations : [],
+    steps: Array.isArray(plan.steps) ? plan.steps : [],
+    fromPlan: hasPlan
+  };
+}
+function laneRows(resp) {
+  const lanes = Array.isArray(resp?.plan?.lanes) ? resp.plan.lanes : [];
+  const items = Array.isArray(resp?.items) ? resp.items : [];
+  return lanes.map((lp) => {
+    const hits = [];
+    for (const it of items) {
+      for (const c2 of it.contributions || []) {
+        if (c2.lane !== lp.lane) continue;
+        hits.push({
+          memoryId: it.id,
+          rank: Number(c2.rank),
+          weight: Number(c2.weight),
+          value: Number(c2.value)
+        });
+      }
+    }
+    hits.sort((a2, b) => a2.rank - b.rank || String(a2.memoryId).localeCompare(String(b.memoryId)));
+    return {
+      lane: lp.lane,
+      weight: Number(lp.weight),
+      budget: Number(lp.budget),
+      selected: Boolean(lp.selected),
+      executed: Boolean(lp.executed),
+      // reason 与 skip_reason 至少有一个要能显示（否则读者不知道它为何执行/被跳过）。
+      reason: lp.reason || "",
+      skipReason: lp.skip_reason || "",
+      hits
+    };
+  });
+}
+function droppedRows(resp) {
+  const list = Array.isArray(resp?.plan?.dropped) ? resp.plan.dropped : Array.isArray(resp?.dropped) ? resp.dropped : [];
+  return list.map((d) => ({
+    id: d.id || "",
+    reason: d.reason || "",
+    score: Number(d.score)
+  }));
+}
+function degradedLines(resp) {
+  const out = [];
+  const push = (v) => {
+    const s = String(v ?? "").trim();
+    if (s) out.push(s);
+  };
+  for (const d of resp?.degraded || []) push(d);
+  for (const d of resp?.meta?.degraded || []) push(d);
+  return out;
+}
+function asOfBanner(resp, view) {
+  const asOf = resp?.as_of ?? view?.asOf ?? null;
+  if (asOf === null || asOf === void 0) return null;
+  return `你正在看 ${fmtUnix(asOf)}（as_of=${asOf}）的历史视角，不是当前状态`;
+}
+function isEmptyQuery(view) {
+  return !String(view?.q || "").trim();
+}
+function noCapabilityReason(resp) {
+  const caps = resp?.meta?.capabilities;
+  if (!caps) return null;
+  if (caps.recall_plan) return null;
+  const reasons = Array.isArray(caps.reasons) ? caps.reasons : [];
+  const hit = reasons.find((r) => String(r).startsWith("recall_plan"));
+  return hit || "recall_plan 能力不可用";
+}
+var COVERAGE_RANGE = Object.freeze({ min: 0, max: 1 });
+function kv(pairs) {
+  const dl = h("dl", { className: "kv" });
+  for (const [k, v, num] of pairs) {
+    dl.appendChild(h("dt", { textContent: k }));
+    dl.appendChild(h("dd", { className: num ? "num" : "", textContent: String(v ?? "—") }));
+  }
+  return dl;
+}
+function renderPlanSection(resp) {
+  const p = planSummary(resp);
+  const section = h("section", { className: "recall-section", "data-section": "plan" });
+  section.appendChild(h("h2", { textContent: "plan（召回规划）" }));
+  const cov = h("div", { className: "chips" });
+  cov.appendChild(h("span", { className: "chip", textContent: `coverage ${fmt(p.coverage)}` }));
+  cov.appendChild(h("span", { className: "chip", textContent: `θ ${fmt(p.thetaCoverage)}` }));
+  cov.appendChild(sparkline({
+    values: [p.coverage, p.thetaCoverage],
+    width: 120,
+    height: 22,
+    min: COVERAGE_RANGE.min,
+    max: COVERAGE_RANGE.max,
+    label: `coverage ${fmt(p.coverage)}，门槛 ${fmt(p.thetaCoverage)}`
+  }));
+  section.appendChild(kv([
+    ["query", p.query || "—"],
+    ["shape", p.shape || "—"],
+    ["shape_reason", p.shapeReason || "—"],
+    ["coverage", fmt(p.coverage), true],
+    ["theta_coverage", fmt(p.thetaCoverage), true],
+    ["hops", String(p.hops)],
+    ["anchors", p.anchors.length ? p.anchors.join(", ") : "（无实体锚点）"],
+    ["matched", String(p.matched.length), true],
+    ["unmatched", String(p.unmatched.length), true]
+  ]));
+  if (!p.fromPlan) {
+    section.appendChild(h("p", { className: "hint", textContent: "注意：响应里没有 plan 对象，上面取自顶层字段。" }));
+  }
+  section.appendChild(h("h3", { textContent: `未对齐槽位（${p.unmatched.length}）` }));
+  if (p.unmatched.length === 0) {
+    section.appendChild(h("p", { className: "hint", textContent: "全部槽位都已对齐。" }));
+  } else {
+    const table = h("table", { className: "table", "data-table": "unmatched" });
+    const head = h("tr", {});
+    for (const [label, cls] of [["kind", ""], ["text", ""], ["required", "num"], ["weight", "num"]]) {
+      head.appendChild(h("th", { className: cls, textContent: label }));
+    }
+    table.appendChild(h("thead", {}, [head]));
+    const body = h("tbody", {});
+    for (const s of p.unmatched) {
+      body.appendChild(h("tr", {}, [
+        h("td", { textContent: s.kind || "" }),
+        h("td", { textContent: s.text || "" }),
+        h("td", { className: "num", textContent: s.required ? "必需" : "可选" }),
+        h("td", { className: "num", textContent: fmt(s.weight) })
+      ]));
+    }
+    table.appendChild(body);
+    section.appendChild(table);
+  }
+  if (p.relations.length) {
+    section.appendChild(h("h3", { textContent: `关系跳数（${p.relations.length}）` }));
+    const table = h("table", { className: "table", "data-table": "relations" });
+    const head = h("tr", {});
+    for (const [label, cls] of [["relation", ""], ["transitive", ""], ["max_hops", "num"], ["weight", "num"], ["origin", ""]]) {
+      head.appendChild(h("th", { className: cls, textContent: label }));
+    }
+    table.appendChild(h("thead", {}, [head]));
+    const body = h("tbody", {});
+    for (const r of p.relations) {
+      body.appendChild(h("tr", {}, [
+        h("td", { textContent: r.relation || "" }),
+        h("td", { textContent: r.transitive ? "传递" : "非传递" }),
+        h("td", { className: "num", textContent: String(r.max_hops ?? "") }),
+        h("td", { className: "num", textContent: fmt(r.weight) }),
+        h("td", { textContent: r.origin || "" })
+      ]));
+    }
+    table.appendChild(body);
+    section.appendChild(table);
+  }
+  return section;
+}
+function renderLaneSection(resp, { onToggle } = {}) {
+  const rows = laneRows(resp);
+  const section = h("section", { className: "recall-section", "data-section": "lanes" });
+  section.appendChild(h("h2", { textContent: `lane（${rows.length} 条通道的规划与贡献）` }));
+  if (rows.length === 0) {
+    section.appendChild(h("p", { className: "hint", textContent: "响应里没有 lane 规划。" }));
+    return section;
+  }
+  const table = h("table", { className: "table", "data-table": "lanes" });
+  const head = h("tr", {});
+  for (const [label, cls] of [
+    ["lane", ""],
+    ["weight", "num"],
+    ["budget", "num"],
+    ["selected", "num"],
+    ["executed", "num"],
+    ["reason / skip_reason", ""]
+  ]) {
+    head.appendChild(h("th", { className: cls, textContent: label }));
+  }
+  table.appendChild(h("thead", {}, [head]));
+  const body = h("tbody", {});
+  for (const r of rows) {
+    const tr = h("tr", { className: "lane-row", "data-lane": r.lane });
+    const btn = h("button", {
+      type: "button",
+      className: "row-button",
+      "aria-expanded": "false",
+      textContent: r.lane
+    });
+    tr.appendChild(h("td", {}, [btn]));
+    tr.appendChild(h("td", { className: "num", textContent: fmt(r.weight) }));
+    tr.appendChild(h("td", { className: "num", textContent: String(r.budget) }));
+    tr.appendChild(h("td", { className: `num lane-flag ${r.selected ? "flag-yes" : "flag-no"}`, textContent: r.selected ? "是" : "否" }));
+    tr.appendChild(h("td", { className: `num lane-flag ${r.executed ? "flag-yes" : "flag-no"}`, textContent: r.executed ? "是" : "否" }));
+    tr.appendChild(h("td", { textContent: r.reason || (r.skipReason ? `跳过：${r.skipReason}` : "—") }));
+    body.appendChild(tr);
+    const detail = h("tr", { className: "lane-detail", hidden: true, "data-lane-hits": r.lane });
+    const cell = h("td", { colspan: "6" });
+    if (r.hits.length === 0) {
+      cell.appendChild(h("p", {
+        className: "hint",
+        textContent: r.executed ? "这一路被执行，但对最终结果没有贡献（没有条目在它上面得分）。" : "这一路没有执行，因此没有贡献。"
+      }));
+    } else {
+      const hitTable = h("table", { className: "table", "data-table": "lane-hits" });
+      const hh = h("tr", {});
+      for (const [label, cls] of [["memory", ""], ["rank", "num"], ["weight", "num"], ["value", "num"]]) {
+        hh.appendChild(h("th", { className: cls, textContent: label }));
+      }
+      hitTable.appendChild(h("thead", {}, [hh]));
+      const hb = h("tbody", {});
+      for (const hit of r.hits) {
+        hb.appendChild(h("tr", {}, [
+          h("td", { textContent: hit.memoryId }),
+          h("td", { className: "num", textContent: String(hit.rank) }),
+          h("td", { className: "num", textContent: fmt(hit.weight) }),
+          h("td", { className: "num", textContent: fmt(hit.value) })
+        ]));
+      }
+      hitTable.appendChild(hb);
+      cell.appendChild(hitTable);
+    }
+    detail.appendChild(cell);
+    body.appendChild(detail);
+    const toggle = () => {
+      const open = detail.hidden !== false;
+      detail.hidden = !open;
+      tr.classList.toggle("open", open);
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+      if (typeof onToggle === "function") onToggle(r.lane, open);
+    };
+    btn.onclick = toggle;
+  }
+  table.appendChild(body);
+  section.appendChild(table);
+  return section;
+}
+function renderDetail(resp, itemId, { onClose } = {}) {
+  const wrap = h("div", { className: "recall-detail", "data-section": "detail" });
+  const head = h("div", { className: "drawer-head" });
+  head.appendChild(h("span", { textContent: "分数分解" }));
+  if (typeof onClose === "function") {
+    head.appendChild(h("button", { type: "button", onclick: onClose, textContent: "关闭" }));
+  }
+  wrap.appendChild(head);
+  const item = (resp?.items || []).find((it) => it.id === itemId);
+  if (!item) {
+    wrap.appendChild(h("p", {
+      className: "hint",
+      textContent: itemId ? `结果 ${itemId} 不在本次响应里（可能已被预算切断）。` : "点左侧任意一条结果，这里显示它的分数分解。"
+    }));
+    return wrap;
+  }
+  const b = scoreBreakdown(item);
+  wrap.appendChild(h("h2", { textContent: item.id }));
+  const box = h("div", { className: "score-box", "data-section": "score" });
+  const formula = h("p", {
+    className: "score-formula",
+    textContent: `score = fusion_score × concept_boost × recency_factor = ${fmt(b.fusion)} × ${fmt(b.boost)} × ${fmt(b.recency)} = ${fmt(b.product)}`
+  });
+  box.appendChild(formula);
+  const finalRow = h("div", { className: "score-final" });
+  finalRow.appendChild(h("span", { textContent: fmt(b.score) }));
+  finalRow.appendChild(h("span", { className: "unit", textContent: "score（后端）" }));
+  finalRow.appendChild(h("span", {
+    className: `score-check ${b.consistent ? "ok" : "bad"}`,
+    "data-consistent": b.consistent ? "true" : "false",
+    textContent: b.consistent ? `✓ 三因子相乘与 score 一致（差 ${fmt(b.delta)} ≤ ${SCORE_EPS}）` : `✗ 三因子相乘 = ${fmt(b.product)}，与 score = ${fmt(b.score)} 差 ${fmt(b.delta)}（> ${SCORE_EPS}）`
+  }));
+  box.appendChild(finalRow);
+  box.appendChild(kv([
+    ["fusion_score", fmt(b.fusion), true],
+    ["concept_boost", fmt(b.boost), true],
+    ["recency_factor", fmt(b.recency), true],
+    ["三因子相乘", fmt(b.product), true]
+  ]));
+  wrap.appendChild(box);
+  const adj = Array.isArray(item.adjustments) ? item.adjustments : [];
+  wrap.appendChild(h("h3", { textContent: `调整明细（${adj.length}）` }));
+  if (adj.length === 0) {
+    wrap.appendChild(h("p", { className: "hint", textContent: "没有调整记录。" }));
+  } else {
+    const ul = h("ul", { className: "plain-list", "data-list": "adjustments" });
+    for (const a2 of adj) {
+      ul.appendChild(h("li", {
+        textContent: `${a2.kind} ×${fmt(a2.factor)} — ${a2.reason || "（无说明）"}`
+      }));
+    }
+    wrap.appendChild(ul);
+  }
+  const contrib = Array.isArray(item.contributions) ? item.contributions : [];
+  wrap.appendChild(h("h3", { textContent: `分通道贡献（${contrib.length}）` }));
+  if (contrib.length === 0) {
+    wrap.appendChild(h("p", { className: "hint", textContent: "没有通道贡献记录。" }));
+  } else {
+    const table = h("table", { className: "table", "data-table": "contributions" });
+    const hh = h("tr", {});
+    for (const [label, cls] of [["lane", ""], ["rank", "num"], ["weight", "num"], ["value", "num"]]) {
+      hh.appendChild(h("th", { className: cls, textContent: label }));
+    }
+    table.appendChild(h("thead", {}, [hh]));
+    const tb = h("tbody", {});
+    for (const c2 of contrib) {
+      tb.appendChild(h("tr", {}, [
+        h("td", { textContent: c2.lane || "" }),
+        h("td", { className: "num", textContent: String(c2.rank ?? "") }),
+        h("td", { className: "num", textContent: fmt(c2.weight) }),
+        h("td", { className: "num", textContent: fmt(c2.value) })
+      ]));
+    }
+    table.appendChild(tb);
+    wrap.appendChild(table);
+  }
+  const ev = Array.isArray(item.graph_evidence) ? item.graph_evidence : [];
+  wrap.appendChild(h("h3", { textContent: `图证据（${ev.length}）` }));
+  if (ev.length === 0) {
+    wrap.appendChild(h("p", { className: "hint", textContent: "这条结果不是经由 graph lane 召回的，没有边证据。" }));
+  } else {
+    const ul = h("ul", { className: "plain-list", "data-list": "graph-evidence" });
+    for (const e of ev) {
+      ul.appendChild(h("li", {
+        textContent: `${e.from} -[${e.relation}]-> ${e.to}（anchor=${e.anchor}，depth=${e.depth}，linked_by=${e.linked_by}，edge=${e.edge_id}）`
+      }));
+    }
+    wrap.appendChild(ul);
+  }
+  wrap.appendChild(h("h3", { textContent: "记忆正文" }));
+  wrap.appendChild(h("p", { className: "result-content", textContent: item.content || "（空）" }));
+  return wrap;
+}
+function renderResultList(resp, { selectedId, onSelect } = {}) {
+  const items = Array.isArray(resp?.items) ? resp.items : [];
+  const section = h("section", { className: "recall-section", "data-section": "items" });
+  section.appendChild(h("h2", { textContent: `结果（${items.length}）` }));
+  if (items.length === 0) {
+    section.appendChild(h("p", {
+      className: "hint",
+      textContent: "本次召回没有返回条目：见上方 plan 的 unmatched / missing 与降级横幅。"
+    }));
+    return section;
+  }
+  const table = h("table", { className: "table", "data-table": "items" });
+  const head = h("tr", {});
+  for (const [label, cls] of [["score", "num"], ["记忆", ""], ["kind", ""], ["概念", ""]]) {
+    head.appendChild(h("th", { className: cls, textContent: label }));
+  }
+  table.appendChild(h("thead", {}, [head]));
+  const body = h("tbody", {});
+  for (const it of items) {
+    const tr = h("tr", {
+      className: `result-row${it.id === selectedId ? " selected" : ""}`,
+      "data-item-id": it.id
+    });
+    const btn = h("button", {
+      type: "button",
+      className: "row-button",
+      textContent: fmt(it.score)
+    });
+    btn.onclick = () => {
+      if (typeof onSelect === "function") onSelect(it.id);
+    };
+    tr.appendChild(h("td", { className: "num" }, [h("span", { className: "result-score" }, [btn])]));
+    tr.appendChild(h("td", {}, [
+      h("div", { className: "result-content", textContent: it.content || "（空）" }),
+      h("div", {
+        className: "result-meta",
+        textContent: `id=${it.id} · v${it.version} · scope=${it.scope}` + (it.source_episode ? ` · src=${it.source_episode}` : "")
+      })
+    ]));
+    tr.appendChild(h("td", { textContent: it.kind || "" }));
+    tr.appendChild(h("td", { textContent: it.concept_id || "—" }));
+    body.appendChild(tr);
+  }
+  table.appendChild(body);
+  section.appendChild(table);
+  return section;
+}
+function renderDroppedSection(resp) {
+  const rows = droppedRows(resp);
+  const section = h("section", { className: "recall-section", "data-section": "dropped" });
+  section.appendChild(h("h2", { textContent: `被拦候选（${rows.length}）` }));
+  if (rows.length === 0) {
+    section.appendChild(h("p", { className: "hint", textContent: "没有被拦截的候选。" }));
+    return section;
+  }
+  const table = h("table", { className: "table", "data-table": "dropped" });
+  const head = h("tr", {});
+  for (const [label, cls] of [["id", ""], ["reason", ""], ["score", "num"]]) {
+    head.appendChild(h("th", { className: cls, textContent: label }));
+  }
+  table.appendChild(h("thead", {}, [head]));
+  const body = h("tbody", {});
+  for (const d of rows) {
+    body.appendChild(h("tr", {}, [
+      h("td", { textContent: d.id }),
+      h("td", { textContent: d.reason }),
+      h("td", { className: "num", textContent: fmt(d.score) })
+    ]));
+  }
+  table.appendChild(body);
+  section.appendChild(table);
+  return section;
+}
+function renderMissingSection(resp) {
+  const missing = Array.isArray(resp?.missing) ? resp.missing : [];
+  if (missing.length === 0) return null;
+  const section = h("section", { className: "recall-section", "data-section": "missing" });
+  section.appendChild(h("h2", { textContent: `缺什么（${missing.length}）` }));
+  const ul = h("ul", { className: "plain-list", "data-list": "missing" });
+  for (const m2 of missing) {
+    ul.appendChild(h("li", {
+      textContent: `[${m2.kind}] ${m2.text}：${m2.reason}` + (m2.suggestion ? `（建议：${m2.suggestion}）` : "")
+    }));
+  }
+  section.appendChild(ul);
+  return section;
+}
+function renderDegradedBanners(resp) {
+  const lines = degradedLines(resp);
+  if (lines.length === 0) return [];
+  return [banner("warn", `降级（共 ${lines.length} 条，本次召回结果不完整）：${lines.join("；")}`)];
+}
+function renderAsOfBanner(resp, view, { onBackToNow } = {}) {
+  const text = asOfBanner(resp, view);
+  if (!text) return null;
+  const el2 = h("div", { className: "asof-banner", role: "status", "data-section": "asof" });
+  el2.appendChild(h("span", { textContent: text }));
+  el2.appendChild(h("button", {
+    type: "button",
+    onclick: () => {
+      if (typeof onBackToNow === "function") onBackToNow();
+    },
+    textContent: "回到现在"
+  }));
+  return el2;
+}
+function renderEmptyState({ onPick } = {}) {
+  return emptyState({
+    kind: "idle",
+    title: "还没有查询",
+    reason: "Recall Inspector 需要一个问题：输入关键词后，这里会给出召回规划、每条结果的分数分解，以及被拦下的候选。",
+    suggestions: exampleSuggestions(onPick)
+  });
+}
+function renderNoCapability(reason) {
+  return emptyState({
+    kind: "noCapability",
+    title: "这个后端不支持召回解释",
+    reason: reason || "meta.capabilities.recall_plan = false",
+    suggestions: []
+  });
+}
+function renderLoading() {
+  return skeleton({ rows: 6, label: "正在加载召回解释" });
+}
+function renderError({ kind, message, detail, onRetry, onFix }) {
+  return errorState({ kind, message, detail, onRetry, onFix });
+}
+function renderFilters(view, { onChange } = {}) {
+  const wrap = h("div", { className: "chips", "data-section": "filters" });
+  const fire = (next) => {
+    if (typeof onChange === "function") onChange(next);
+  };
+  const scope = h("select", { "aria-label": "scope" });
+  scope.appendChild(h("option", { value: "", textContent: "scope：默认（user）" }));
+  for (const s of SCOPES) {
+    scope.appendChild(h("option", { value: s, textContent: s, selected: view.scope === s ? "selected" : false }));
+  }
+  scope.onchange = () => fire({ ...view, scope: scope.value, item: "" });
+  wrap.appendChild(scope);
+  for (const kind of KINDS) {
+    const on = (view.kinds || []).includes(kind);
+    wrap.appendChild(h("button", {
+      type: "button",
+      className: on ? "chip on" : "chip",
+      "aria-pressed": on ? "true" : "false",
+      textContent: kind,
+      onclick: () => fire(toggleList(view, "kinds", kind))
+    }));
+  }
+  for (const lane of LANES) {
+    const on = (view.lanes || []).includes(lane);
+    wrap.appendChild(h("button", {
+      type: "button",
+      className: on ? "chip on" : "chip",
+      "aria-pressed": on ? "true" : "false",
+      textContent: `lane:${lane}`,
+      onclick: () => fire(toggleList(view, "lanes", lane))
+    }));
+  }
+  const k = h("input", {
+    type: "number",
+    min: "1",
+    max: String(K_MAX),
+    step: "1",
+    value: String(view.k ?? ""),
+    "aria-label": "k（返回条数）"
+  });
+  k.onchange = () => {
+    const n = Number(k.value);
+    fire({ ...view, k: Number.isFinite(n) ? n : k.value, item: "" });
+  };
+  wrap.appendChild(k);
+  return wrap;
+}
+function renderRecallPageView(snapshot, handlers = {}) {
+  const { view = {}, status = "idle", resp = null, errors = [], error = null } = snapshot || {};
+  const root = h("div", { className: "recall-body", "data-status": status });
+  const asof = renderAsOfBanner(resp, view, handlers);
+  if (asof) root.appendChild(asof);
+  const banners = h("div", { className: "recall-banners" });
+  for (const e of errors) {
+    banners.appendChild(banner("error", `参数错误（${e.field}）：${e.message}`));
+  }
+  if (resp) {
+    for (const b of renderDegradedBanners(resp)) banners.appendChild(b);
+    const st = resp.status;
+    if (st && st !== "ok") {
+      banners.appendChild(banner("info", `召回状态：${st}（coverage=${fmt(resp.coverage)}）`));
+    }
+  }
+  root.appendChild(banners);
+  if (status === "loading") {
+    root.appendChild(renderLoading());
+    return root;
+  }
+  if (errors.length) {
+    root.appendChild(renderError({
+      kind: "param",
+      message: errors.map((e) => e.message).join("；"),
+      detail: `出错参数：${errors.map((e) => e.field).join(", ")}`,
+      onFix: handlers.onFixParams
+    }));
+    return root;
+  }
+  if (status === "error") {
+    root.appendChild(renderError({
+      kind: error?.kind || "request",
+      message: error?.message || "未知错误",
+      detail: error?.detail || "",
+      onRetry: handlers.onRetry
+    }));
+    return root;
+  }
+  if (isEmptyQuery(view)) {
+    root.appendChild(renderEmptyState({ onPick: (q) => {
+      if (typeof handlers.onQuery === "function") handlers.onQuery(q);
+    } }));
+    return root;
+  }
+  const noCap = noCapabilityReason(resp);
+  if (noCap) {
+    root.appendChild(renderNoCapability(noCap));
+    return root;
+  }
+  if (!resp) {
+    root.appendChild(renderLoading());
+    return root;
+  }
+  root.appendChild(renderFilters(view, { onChange: handlers.onViewChange }));
+  const layout = h("div", { className: "recall-layout" });
+  const list = h("div", { className: "recall-list" });
+  list.appendChild(renderPlanSection(resp));
+  list.appendChild(renderLaneSection(resp));
+  const missing = renderMissingSection(resp);
+  if (missing) list.appendChild(missing);
+  list.appendChild(renderResultList(resp, {
+    selectedId: view.item || "",
+    onSelect: (id) => {
+      if (typeof handlers.onSelectItem === "function") handlers.onSelectItem(id);
+    }
+  }));
+  list.appendChild(renderDroppedSection(resp));
+  layout.appendChild(list);
+  const detail = renderDetail(resp, view.item || "", {
+    onClose: () => {
+      if (typeof handlers.onSelectItem === "function") handlers.onSelectItem("");
+    }
+  });
+  layout.appendChild(detail);
+  root.appendChild(layout);
+  return root;
+}
+
+// js/recallmain.js
+var recallState = {
+  view: { q: "", scope: "", kinds: [], lanes: [], asOf: null, k: 10, item: "" },
+  status: "idle",
+  // idle | loading | ready | error
+  resp: null,
+  errors: [],
+  error: null,
+  // 请求序号：并发请求（快速连打）时只有最新一次的结果能落到页面上，
+  // 否则慢请求后到会覆盖快请求的新结果 —— 表现为"页面显示的是上一次的答案"。
+  seq: 0
+};
+var container = null;
+function mountRecallPage(el2) {
+  container = el2;
+  return container;
+}
+function currentFetchImpl2() {
+  return globalThis.fetch.bind(globalThis);
+}
+function syncRecallURL(view, { replace = false } = {}) {
+  const qs = toRecallQuery(view);
+  const url = `/recall${qs}`;
+  if (replace) history.replaceState({ view }, "", url);
+  else history.pushState({ view }, "", url);
+}
+function render2() {
+  if (!container) return;
+  container.textContent = "";
+  container.appendChild(renderRecallPageView({
+    view: recallState.view,
+    status: recallState.status,
+    resp: recallState.resp,
+    errors: recallState.errors,
+    error: recallState.error
+  }, {
+    onSelectItem: (id) => {
+      const next = { ...recallState.view, item: id || "" };
+      recallState.view = next;
+      syncRecallURL(next, { replace: true });
+      render2();
+    },
+    onViewChange: (next) => {
+      loadRecall(next);
+    },
+    onQuery: (q) => {
+      loadRecall({ ...recallState.view, q, item: "" });
+    },
+    onBackToNow: () => {
+      loadRecall({ ...recallState.view, asOf: null, item: "" });
+    },
+    onRetry: () => {
+      loadRecall(recallState.view);
+    },
+    onFixParams: () => {
+      loadRecall({ q: recallState.view.q, scope: "", kinds: [], lanes: [], asOf: null, k: 10, item: "" });
+    }
+  }));
+}
+async function loadRecall(view) {
+  const { view: parsed, errors } = parseRecallView(toRecallQuery(view));
+  recallState.view = parsed;
+  recallState.errors = errors;
+  recallState.error = null;
+  syncRecallURL(parsed, { replace: false });
+  if (errors.length) {
+    recallState.status = "ready";
+    recallState.resp = null;
+    render2();
+    return;
+  }
+  if (!parsed.q) {
+    recallState.status = "idle";
+    recallState.resp = null;
+    render2();
+    return;
+  }
+  recallState.status = "loading";
+  render2();
+  const mySeq = ++recallState.seq;
+  let resp;
+  try {
+    resp = await fetchRecall(currentFetchImpl2(), toRecallURL(parsed));
+  } catch (err) {
+    if (mySeq !== recallState.seq) return;
+    recallState.status = "error";
+    recallState.resp = null;
+    recallState.error = {
+      kind: classifyError(err),
+      message: err instanceof ApiError ? err.message : String(err),
+      detail: err?.field ? `出错参数：${err.field}` : ""
+    };
+    render2();
+    return;
+  }
+  if (mySeq !== recallState.seq) return;
+  recallState.resp = resp;
+  recallState.status = "ready";
+  render2();
+}
+async function bootRecall(el2) {
+  mountRecallPage(el2);
+  document.body.classList.add("route-recall");
+  const { view, errors } = parseRecallView(location.search);
+  if (errors.length) {
+    recallState.view = view;
+    recallState.errors = errors;
+    recallState.status = "ready";
+    render2();
+    return;
+  }
+  await loadRecall(view);
+}
+
+// js/entry.js
+function hideAllPages() {
+  for (const id of ["page-recall", "page-generic"]) {
+    const el2 = document.getElementById(id);
+    if (el2) el2.hidden = true;
+  }
+  document.body.classList.remove("route-recall", "route-generic");
+}
+function renderGeneric(container2, { page, path }) {
+  if (!container2) return;
+  container2.textContent = "";
+  const wrap = h("div", { className: "page-missing" });
+  if (page === "missing") {
+    wrap.appendChild(h("h1", { textContent: "页面不存在" }));
+    wrap.appendChild(h("p", { textContent: `地址 ${path} 没有对应的页面。` }));
+  } else {
+    wrap.appendChild(h("h1", { textContent: PAGE_TITLES[page] || page }));
+    wrap.appendChild(h("p", { textContent: notImplementedMessage(page) }));
+  }
+  const nav = h("div", { className: "chips" });
+  nav.appendChild(h("a", { className: "empty-action", href: "/", textContent: "← Graph View" }));
+  nav.appendChild(h("a", { className: "empty-action", href: "/recall?q=acme", textContent: "Recall Inspector →" }));
+  wrap.appendChild(nav);
+  container2.appendChild(wrap);
+  container2.hidden = false;
+  document.body.classList.add("route-generic");
+}
+async function dispatch2(pathname) {
+  const { page, path } = matchRoute(pathname);
+  hideAllPages();
+  if (page === "graph") {
+    document.title = "Gmem · Graph View";
+    await boot();
+    return { page, path };
+  }
+  if (page === "recall") {
+    document.title = "Gmem · Recall Inspector";
+    const el2 = document.getElementById("page-recall");
+    if (el2) el2.hidden = false;
+    await bootRecall(document.getElementById("recall-root"));
+    return { page, path };
+  }
+  renderGeneric(document.getElementById("page-generic"), { page, path });
+  if (!isImplemented(page)) {
+    document.title = `Gmem · ${PAGE_TITLES[page] || page}`;
+  }
+  return { page, path };
+}
+if (typeof document !== "undefined" && typeof location !== "undefined") {
+  dispatch2(location.pathname);
+  window.addEventListener("popstate", () => {
+    dispatch2(location.pathname);
+  });
+  document.addEventListener("click", (ev) => {
+    if (ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+    const a2 = ev.target && ev.target.closest ? ev.target.closest("a[href]") : null;
+    if (!a2) return;
+    const href = a2.getAttribute("href");
+    if (!href || !href.startsWith("/") || href.startsWith("//")) return;
+    if (a2.target && a2.target !== "_self") return;
+    ev.preventDefault();
+    history.pushState({}, "", href);
+    dispatch2(location.pathname);
+  });
 }
 export {
-  applyFiltersAndDraw,
-  boot,
-  buildStageNote,
-  chooseVerdict,
-  confirmThenRun,
-  loadView,
-  openReview,
-  state,
-  submitReview
+  dispatch2 as dispatch
 };
 //# sourceMappingURL=app.js.map

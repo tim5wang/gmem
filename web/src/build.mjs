@@ -28,7 +28,9 @@ async function main() {
 
   await build({
     absWorkingDir: srcDir,
-    entryPoints: [path.join(srcDir, 'js', 'main.js')],
+    // 入口是 entry.js（客户端路由分发），不是 main.js：六页共用一份产物，
+    // 打开哪个 URL 由 router.js 在前端判定，只启动命中那一页。
+    entryPoints: [path.join(srcDir, 'js', 'entry.js')],
     outfile: path.join(outDir, 'assets', 'app.js'),
     bundle: true,
     format: 'esm',

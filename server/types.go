@@ -67,6 +67,29 @@ type Meta struct {
 	Degraded []string `json:"degraded,omitempty"`
 	// Recall 只在 search 模式出现（q 命中的依据）。
 	Recall *RecallMeta `json:"recall,omitempty"`
+	// Capabilities 告诉前端「这个能力到底有没有」，用于区分
+	// 「没数据」与「后端没这个能力」——两者在 UI 上必须是不同的话术。
+	Capabilities Capabilities `json:"capabilities"`
+}
+
+// Capabilities 是后端能力位（TD §9 六页共用；调研 §8.3 的跨页前置）。
+//
+// 为什么要它：六页里有的页依赖可选端口（本体的 OntologyReader、维护面的
+// Maintainer、存储健康的 HealthReader）。缺端口时如果只是「返回空列表」，
+// 页面会显示「暂无数据」——把「答不了」伪装成「没有」。因此每个能力位
+// **必须**显式给出 false，并在 Reasons 里写清原因（不得静默）。
+type Capabilities struct {
+	// RecallPlan 表示 /api/recall 可用（依赖 recall.Recaller）。
+	RecallPlan bool `json:"recall_plan"`
+	// Audit 表示审计/台账可读（依赖 ops.Maintainer）。
+	Audit bool `json:"audit"`
+	// Health 表示库级健康快照可读（依赖 store.HealthReader 可选端口）。
+	Health bool `json:"health"`
+	// Ontology 表示本体可枚举（依赖 store.OntologyReader 可选端口）。
+	Ontology bool `json:"ontology"`
+	// Reasons 逐条说明 false 的原因（格式 "<能力>: <原因>"）。
+	// 为 true 的能力不写条目，避免把「正常」也变成噪音。
+	Reasons []string `json:"reasons,omitempty"`
 }
 
 // RelationLimit 是一行关系跳数上限（来自 recall 的声明式表）。

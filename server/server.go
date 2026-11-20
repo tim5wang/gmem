@@ -104,6 +104,7 @@ func (s *Server) Routes() []Route {
 	return []Route{
 		{Method: http.MethodGet, Pattern: "/api/graph"},
 		{Method: http.MethodGet, Pattern: "/api/entity/"},
+		{Method: http.MethodGet, Pattern: "/api/recall"},
 		{Method: http.MethodPost, Pattern: "/api/review"},
 	}
 }
@@ -114,6 +115,9 @@ func (s *Server) Routes() []Route {
 // 但"只读优先"同样适用，因此单独申报并单独守卫。
 func (s *Server) StaticRoutes() []Route {
 	return []Route{
+		// "/" 是**页面路由的通配**：任何非 /api/ 非 /assets/ 的 GET 都返回同一份
+		// index.html（SPA 客户端路由）。六页（TD §9）共用一份产物，服务端不需要
+		// 认识每个页面名，否则新增一页就要改一次服务端。
 		{Method: http.MethodGet, Pattern: "/"},
 		{Method: http.MethodGet, Pattern: "/assets/"},
 	}
@@ -124,6 +128,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/graph", s.guardMethod(http.MethodGet, s.handleGraph))
 	mux.HandleFunc("/api/entity/", s.guardMethod(http.MethodGet, s.handleEntity))
+	mux.HandleFunc("/api/recall", s.guardMethod(http.MethodGet, s.handleRecall))
 	mux.HandleFunc("/api/review", s.guardMethod(http.MethodPost, s.handleReview))
 	// GET /assets/* 返回 //go:embed 进来的 web/dist 产物（只读）。
 	mux.HandleFunc("/assets/", s.guardMethod(http.MethodGet, s.handleAsset))
@@ -147,24 +152,40 @@ func (s *Server) guardMethod(method string, h http.HandlerFunc) http.HandlerFunc
 	}
 }
 
-// handleRoot 返回内嵌的 Graph View 页面（GET /）。
+// handleRoot 返回内嵌的前端页面（GET / 与所有非 /api/ 非 /assets/ 的 GET）。
 //
-// 本卡起，GET / **不再**返回"服务说明 JSON"，而是直接给 web/dist/index.html：
-// 前端产物已 //go:embed 进二进制，`gmem serve` 起来就能用，不需要另跑前端服务
-// （TD §9「运行时依然零外部依赖」）。这是本卡唯一允许替换的既有行为。
+// P6 起这里是**页面路由的通配**：六页（TD §9 的 Graph View / Recall Inspector /
+// Memory Stream / Ontology Drift / Review Queue / Metrics）共用同一份
+// web/dist/index.html，页面选择由前端读 location.pathname 决定（客户端路由）。
+// 理由：路由表若逐页登记，新增一页就要改 Go 代码并重新编译；而页面清单是前端
+// 资产，属于前端。服务端只需要保证"刷新 /recall 也能拿到入口"。
 //
-// 其它路径仍回 JSON 404：视图状态全部在 query string 里，不需要 SPA 回退路由，
-// 静默返回 index.html 只会把"URL 打错"伪装成"页面能开"。
+// 两条边界仍然严格：
+//
+//	/api/*   —— 服务端契约，未知路径**必须**回 JSON 404（否则调用方的拼写错误
+//	            会变成"200 加一坨 HTML"，且 JSON 客户端解析失败的信息毫无指向性）
+//	/assets/* —— 由 handleAsset 处理，未知文件 404（不得静默回 index.html）
+//	带扩展名的路径（/server.go、/x.png）同样 404：它们不可能是"页面"，
+//	            回 index.html 只会把"文件不存在"伪装成"页面能开"。
+//	            （ServeMux 会把 /assets/../server.go 规范化成 /server.go，
+//	            这条规则正是斜杠穿越后不泄漏、也不误报的那道闸。）
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		s.writeError(w, &apiError{
 			status: http.StatusMethodNotAllowed, code: "method_not_allowed",
-			message: "GET / 只接受 GET",
+			message: r.URL.Path + " 只接受 GET",
 		})
 		return
 	}
-	if r.URL.Path != "/" {
+	// /api/* 未知路径仍是 JSON 404：这是服务端契约面，不是页面面。
+	// （已知的 /api/* 已被更具体的 mux 模式接走，走到这里就说明路径不存在。）
+	if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" {
+		s.writeError(w, notFound("接口 "+r.URL.Path+" 不存在"))
+		return
+	}
+	// 带扩展名的路径不是页面（见函数头第三条边界）。
+	if path.Ext(r.URL.Path) != "" {
 		s.writeError(w, notFound("路径 "+r.URL.Path+" 不存在"))
 		return
 	}

@@ -92,23 +92,72 @@ func TestAssetsUnknown404(t *testing.T) {
 	}
 }
 
-// TestRootUnknownPath404 非 / 的路径仍回 JSON 404（不做 SPA 回退）。
+// TestRootUnknownPath404 API 面的未知路径仍回 JSON 404。
+//
+// P6-1 把页面路由改成了通配（六页共用一份 index.html），因此原来那条
+// "GET /graph 必须 404" 的断言被**换成新契约**：页面路径回 HTML，
+// 而 **API 面**（/api/*）与**带扩展名的文件**仍必顶 404。
+// 旧断言的意图（"URL 打错不得被伪装成能开"）在这里逐条保留。
 func TestRootUnknownPath404(t *testing.T) {
 	h := newHarness(t)
-	status, body := h.get("/graph")
-	if status != http.StatusNotFound {
-		t.Fatalf("GET /graph status=%d, want 404 (body=%s)", status, body)
-	}
-	if !strings.Contains(string(body), `"error"`) {
-		t.Errorf("404 未返回 JSON 错误体：%s", truncate(string(body), 200))
+	for _, p := range []string{"/api/nope", "/api", "/server.go", "/assets-nope.png"} {
+		status, body := h.get(p)
+		if status != http.StatusNotFound {
+			t.Fatalf("GET %s status=%d, want 404 (body=%s)", p, status, truncate(string(body), 200))
+		}
+		if !strings.Contains(string(body), `"error"`) {
+			t.Errorf("GET %s 的 404 未返回 JSON 错误体：%s", p, truncate(string(body), 200))
+		}
 	}
 }
 
-// TestRootRejectsNonGet GET / 之外的方法 405。
+// TestPageRoutesReturnIndex 页面路由通配：/、/recall 与任意页面路径回同一份 HTML。
+//
+// 这是六页的基石（前置 1）：刷新 /recall?q=acme 必须能拿到前端入口，
+// 而不是 404。
+func TestPageRoutesReturnIndex(t *testing.T) {
+	h := newHarness(t)
+	_, rootBody := h.get("/")
+	for _, p := range []string{"/recall", "/recall?q=acme", "/review", "/metrics", "/nope-page"} {
+		status, body := h.get(p)
+		if status != http.StatusOK {
+			t.Errorf("GET %s status=%d, want 200 (body=%s)", p, status, truncate(string(body), 200))
+			continue
+		}
+		// 必须是**同一份** index.html：页面选择由前端客户端路由决定。
+		if string(body) != string(rootBody) {
+			t.Errorf("GET %s 返回的 HTML 与 GET / 不一致（页面路由必须是同一份产物）", p)
+		}
+		if !strings.Contains(string(body), "assets/app.js") {
+			t.Errorf("GET %s 未返回前端入口：%s", p, truncate(string(body), 200))
+		}
+	}
+}
+
+// TestPageRouteContentTypeIsHTML 页面路由必须 text/html（否则浏览器当纯文本显示源码）。
+func TestPageRouteContentTypeIsHTML(t *testing.T) {
+	h := newHarness(t)
+	resp, err := http.Get(h.http.URL + "/recall?q=acme")
+	if err != nil {
+		t.Fatalf("GET /recall: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /recall status=%d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("GET /recall Content-Type=%q, want text/html", ct)
+	}
+}
+
+// TestRootRejectsNonGet 非 GET 方法 405（页面路由与静态资源都不接受写方法）。
 func TestRootRejectsNonGet(t *testing.T) {
 	h := newHarness(t)
 	if status, _ := h.postJSON("/", `{}`); status != http.StatusMethodNotAllowed {
 		t.Errorf("POST / status=%d, want 405", status)
+	}
+	if status, _ := h.postJSON("/recall", `{}`); status != http.StatusMethodNotAllowed {
+		t.Errorf("POST /recall status=%d, want 405", status)
 	}
 	if status, _ := h.postJSON("/assets/app.js", `{}`); status != http.StatusMethodNotAllowed {
 		t.Errorf("POST /assets/app.js status=%d, want 405", status)

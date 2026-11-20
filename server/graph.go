@@ -180,7 +180,8 @@ func (s *Server) buildGraph(ctx context.Context, p graphParams) (GraphResponse, 
 	meta := Meta{
 		Scope: string(p.scope), Hops: p.hops, AsOf: p.asOf,
 		Budget: p.budget, BudgetMax: maxBudget,
-		Relations: relationLimits(table),
+		Relations:    relationLimits(table),
+		Capabilities: s.capabilities(),
 	}
 
 	nodes := map[string]*nodeAcc{}
