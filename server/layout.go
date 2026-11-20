@@ -21,10 +21,10 @@ import (
 //
 //  1. 团心 = 黄金角螺旋 r_i = clusterBaseRadius * sqrt(i+0.5)（i 是概念键排序后的序号）。
 //     任意两团心的最小距离是 d(0,1) = 0.9*sqrt(1.5) ≈ 1.1023（数值验证见 layout_test.go）。
-//  2. 团内 = 叶序（向日葵）格点：第 j 个节点 r_j = R* sqrt((j+0.5)/n)，theta_j = j*goldenAngle。
-//     相邻节点间距近似相等，不会出现"随机极坐标"必然产生的局部聚簇与空洞。
-//     离心项 +0.5 保证最内圈也离团心 R*sqrt(0.5/n) > 0（旧的 j/n 让 j=0 落在团心，
-//     正好被前端画在团心的团标签压住）。
+//  2. 团内 = 离心叶序格点：第 j 个节点 r_j = leafStep*sqrt(j+0.5)（封顶 clusterRadiusMax），
+//     theta_j = j*goldenAngle。相邻节点间距近似相等，不会出现"随机极坐标"必然产生的
+//     局部聚簇与空洞。离心项 +0.5 保证最内圈也离团心 leafStep*sqrt(0.5) > 0（旧的 j/n
+//     让 j=0 落在团心，正好被前端画在团心的团标签压住）；r_j 只依赖 j，不依赖 n。
 //  3. 团半径 R 随节点数增长（R = 0.10 + 0.055*sqrt(n)），但**封顶**在 clusterRadiusMax：
 //     封顶是与团心间距联动的必要条件 —— 团心只依赖序号 i（新增概念不位移已有团心），
 //     所以不封顶就无法保证 "dist(ci,cj) > Ri + Rj + 间隙"。
@@ -49,12 +49,20 @@ const unclusteredLabel = "(未归属概念)"
 const (
 	// clusterBaseRadius 是团心螺旋的基准半径（不能低于 0.87：见 clusterGap 的推导）。
 	clusterBaseRadius = 0.9
-	// clusterRadiusBase / clusterRadiusPerNode 决定团内叶序半径 R(n)。
+	// clusterRadiusBase / clusterRadiusPerNode 决定团内叶序的**名义**半径 R(n)。
+	// 注意：节点落点已不再乘 R(n)（见 nodePosition：落点必须与 count 无关），
+	// R(n) 现在只作为“团容量/间距校准”的参考量，被布局不变量用例钉死。
 	clusterRadiusBase    = 0.10
 	clusterRadiusPerNode = 0.055
-	// clusterRadiusMax 是 R 的上限。约束来自团心最小间距：
+	// clusterRadiusMax 是团外沿的上限。约束来自团心最小间距：
 	//   d_min ≈ 1.1023  >=  2*clusterRadiusMax + clusterGap = 0.88 + 0.12 = 1.00 ✓
 	clusterRadiusMax = 0.44
+	// leafStep 是叶序半径的步长（世界坐标）。第 j 个节点的半径是
+	//   r_j = leafStep * sqrt(j+0.5)，**只依赖团内序号 j，不依赖团内节点数**。
+	// 为什么必须与 count 无关：否则团里新增一个实体，已有节点全部跟着位移
+	// （TestCoordsDependOnlyOnNodeID 守的正是这条：不能“加一条记忆就整图重排”）。
+	// 取值 0.08：r_0 = 0.0566 > 0（不落团心）；封顶前 n=30 时 r_max = 0.4345 < 0.44。
+	leafStep = 0.08
 	// clusterGap 是任意两团之间必须保留的最低间隙（世界坐标）。
 	clusterGap = 0.12
 )
@@ -81,10 +89,12 @@ func clusterCenter(i int) (float64, float64) {
 	return roundCoord(radius * math.Cos(angle)), roundCoord(radius * math.Sin(angle))
 }
 
-// clusterRadius 返回团内叶序的散布半径 R(n)，随节点数增长并封顶。
+// clusterRadius 返回团内叶序的**名义**散布半径 R(n)，随节点数增长并封顶。
 //
-// 为什么要随 n 增长：固定半径下 20 个节点的小圆会挤成一团（点距 ~R/n）；
-// 封顶是因为团心间距有上界，R 若继续长大就必然与邻团重叠。
+// 保留理由：它是“一个 n 个节点的团大约占多大”的校准量，布局不变量用例
+// （团心间距 / 半径随 n 增长）与基准测试仍用它陈述约束。
+// 但**节点落点不乘它**（见 nodePosition）：落点必须只依赖团内序号，
+// 否则团内新增一个节点会让已有节点全部位移。
 func clusterRadius(n int) float64 {
 	if n <= 0 {
 		return 0
@@ -100,15 +110,21 @@ func clusterRadius(n int) float64 {
 //
 // 纯函数：只吃 (index, count, center)。同一 nodeID 因为"团内按 ID 排序的序号"
 // 确定 ⇒ 每次请求都落在同一格点上。**没有随机数、没有时间、没有包级可变状态。**
-// r = R*sqrt((index+0.5)/count)、theta = index*goldenAngle 是标准叶序（向日葵）格点：
-// 单位圆内前 k 个点的面积密度恒定，因此团内既不成簇也不留大洞。
+// r = min(leafStep*sqrt(index+0.5), clusterRadiusMax)、theta = index*goldenAngle
+// 是离心叶序（向日葵）格点：任意前缀都是均匀散布，相邻点距近似相等。
 //
-// 为什么半径带 +0.5 的离心项（历史缺陷回归）：
-// 旧式 r = R*sqrt(index/count) 在 index=0 时恒为 0 ⇒ 团内第一个节点**必然落在团心**。
-// 而前端把团标签圆盘也画在团心（render.js 的 translate(p.x,p.y)），于是那个节点
-// 永远被团圆压住（demo 数据三个团全部命中）。改成 (index+0.5)/count 后每个叶序
-// 环带的中点都落在各自环带的中心，最近的一圈也离团心 R*sqrt(0.5/n) > 0。
-// 这仍然是纯函数：不引入第二个入参，也不改变"坐标与折叠无关"这条性质。
+// # 两个必须同时成立的性质
+//
+//  1. **不落团心**：旧式 r = R*sqrt(index/count) 在 index=0 时恒为 0 ⇒ 团内第一个
+//     节点**必然**落在团心，而前端把团编圆盘也画在团心（render.js 的 translate），
+//     于是那个节点永远被团徽盖住（demo 数据三个团全部命中）。离心项 +0.5 让
+//     最近一环也离团心 leafStep*sqrt(0.5) > 0。
+//  2. **与 count 无关**：r 只看 index，不看 count。旧式乘 sqrt(1/count) 使同一个
+//     节点在团里多一个实体时就会位移（"加一条记忆就整图重排"）。
+//
+// 封顶用常量 clusterRadiusMax（而不是 clusterRadius(count)）：后者会重新引入
+// count 依赖。代价是很难达到的、单团超过约 30 个节点时外圈会挤在R=0.44 的环上，
+// 那部分残余重叠由前端的确定性碰撞松弛处理。
 func nodePosition(index, count int, centerX, centerY float64) (float64, float64) {
 	if count <= 0 {
 		return centerX, centerY
@@ -119,7 +135,10 @@ func nodePosition(index, count int, centerX, centerY float64) (float64, float64)
 	if index >= count {
 		index = count - 1
 	}
-	radius := clusterRadius(count) * math.Sqrt((float64(index)+0.5)/float64(count))
+	radius := leafStep * math.Sqrt(float64(index)+0.5)
+	if radius > clusterRadiusMax {
+		radius = clusterRadiusMax
+	}
 	angle := float64(index) * goldenAngle
 	return roundCoord(centerX + radius*math.Cos(angle)),
 		roundCoord(centerY + radius*math.Sin(angle))

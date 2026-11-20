@@ -362,19 +362,44 @@ func TestNoNodeFallsOnClusterCenter(t *testing.T) {
 	}
 }
 
-// TestFirstLeafKeepsClearance 团内第一个节点至少离团心 R*sqrt(0.5/n)。
+// TestFirstLeafKeepsClearance 团内第一个节点必须离团心 leafStep*sqrt(0.5)。
 //
-// 这是离心项的**定量**下界，不是"只要 > 0"：R*sqrt(0.5/n) 是第 0 个环带半径，
+// 这是离心项的**定量**下界，不是"只要 > 0"：r_0 = leafStep*sqrt(0.5) ≈ 0.0566，
 // 小于它就说明离心项没生效（或被人改回 index/count）。
+// 同时钉死**与 count 无关**：r_0 对所有 n 必须完全相等（roundCoord 后逐字节一致）。
 func TestFirstLeafKeepsClearance(t *testing.T) {
+	need := leafStep * math.Sqrt(0.5)
 	for _, n := range []int{1, 2, 3, 6, 9, 19, 30, 40} {
 		cx, cy := clusterCenter(0)
 		x, y := nodePosition(0, n, cx, cy)
 		d := math.Hypot(x-cx, y-cy)
-		need := clusterRadius(n) * math.Sqrt(0.5/float64(n))
 		// roundCoord 固定到 1e-6，x/y 各自最多引入 5e-7 误差。
 		if d < need-1e-6 {
-			t.Fatalf("n=%d 的第一个节点离团心 %.6f < R*sqrt(0.5/n)=%.6f", n, d, need)
+			t.Fatalf("n=%d 的第一个节点离团心 %.6f < leafStep*sqrt(0.5)=%.6f", n, d, need)
+		}
+		// 与 count 无关：n 变化不得改变第 0 个节点的落点（否则“加一条记忆就整图重排”）。
+		x1, y1 := nodePosition(0, 1, cx, cy)
+		if x != x1 || y != y1 {
+			t.Fatalf("n=%d 时第 0 个节点落在 %.6f,%.6f，而 n=1 时为 %.6f,%.6f（落点依赖了 count）",
+				n, x, y, x1, y1)
+		}
+	}
+}
+
+// TestNodePositionIndependentOfCount 任意序号 j 的落点都不得随 count 变化。
+//
+// 这是“URL 即视图 / 不因数据增减整图重排”的地基：团内多一个实体，
+// 已有节点必须留在原地（TestCoordsDependOnlyOnNodeID 从 HTTP 层守同一件事）。
+func TestNodePositionIndependentOfCount(t *testing.T) {
+	cx, cy := clusterCenter(2)
+	for j := 0; j < 12; j++ {
+		bx, by := nodePosition(j, 12, cx, cy)
+		for _, n := range []int{j + 1, 13, 30, 200} {
+			x, y := nodePosition(j, n, cx, cy)
+			if x != bx || y != by {
+				t.Fatalf("序号 %d 在 count=%d 时落在 %.6f,%.6f，count=12 时为 %.6f,%.6f（落点依赖 count）",
+					j, n, x, y, bx, by)
+			}
 		}
 	}
 }
@@ -384,13 +409,19 @@ func TestFirstLeafKeepsClearance(t *testing.T) {
 // 价值同上：证明上面两条断言真的能抓住这个缺陷，而不是恒真。
 func TestCenterHuggingFormulaWouldFail(t *testing.T) {
 	const n = 6
-	// 旧式：r = R*sqrt(index/count)，index=0 ⇒ r=0。
+	// 旧式：r = R*sqrt(index/count)，index=0 ⇒ r=0（落回团心）。
 	oldR := clusterRadius(n) * math.Sqrt(0.0/float64(n))
 	if oldR != 0 {
 		t.Fatalf("对照组失效：旧式 index=0 的半径应为 0，实际 %.6f", oldR)
 	}
-	newR := clusterRadius(n) * math.Sqrt(0.5/float64(n))
-	if newR <= 0 {
+	// 旧式的第二个缺陷：r 依赖 count —— 同一个 index 在不同 n 下不同。
+	rAt2 := clusterRadius(2) * math.Sqrt(1.0/2.0)
+	rAt3 := clusterRadius(3) * math.Sqrt(1.0/3.0)
+	if rAt2 == rAt3 {
+		t.Fatalf("对照组失效：旧式在 count 变化时应位移，实际 %.6f == %.6f", rAt2, rAt3)
+	}
+	// 新式：index=0 的半径 > 0，且与 count 无关。
+	if newR := leafStep * math.Sqrt(0.5); newR <= 0 {
 		t.Fatalf("新式 index=0 的半径必须 > 0，实际 %.6f", newR)
 	}
 }

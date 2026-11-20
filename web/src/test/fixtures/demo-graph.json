@@ -70,7 +70,7 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-org",
-   "x": 0.067758,
+   "x": 0.056569,
    "y": 0
   },
   {
@@ -85,7 +85,7 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-person",
-   "x": -0.750319,
+   "x": -0.756211,
    "y": 0.744573
   },
   {
@@ -100,8 +100,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-person",
-   "x": -0.892553,
-   "y": 0.817651
+   "x": -0.885027,
+   "y": 0.810757
   },
   {
    "id": "n-demo-atlas",
@@ -115,8 +115,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-org",
-   "x": -0.086538,
-   "y": 0.079276
+   "x": -0.072247,
+   "y": 0.066184
   },
   {
    "id": "n-demo-beta",
@@ -129,8 +129,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-org",
-   "x": 0.013246,
-   "y": -0.150932
+   "x": 0.011059,
+   "y": -0.126007
   },
   {
    "id": "n-demo-bob",
@@ -144,8 +144,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-person",
-   "x": -0.800569,
-   "y": 0.605441
+   "x": -0.801721,
+   "y": 0.618566
   },
   {
    "id": "n-demo-borealis",
@@ -159,8 +159,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-org",
-   "x": 0.109076,
-   "y": 0.14227
+   "x": 0.091063,
+   "y": 0.118775
   },
   {
    "id": "n-demo-carol",
@@ -174,8 +174,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-person",
-   "x": -0.712232,
-   "y": 0.875721
+   "x": -0.721717,
+   "y": 0.863348
   },
   {
    "id": "n-demo-dave",
@@ -189,8 +189,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-person",
-   "x": -0.997299,
-   "y": 0.711934
+   "x": -0.979891,
+   "y": 0.715013
   },
   {
    "id": "n-demo-designdoc",
@@ -204,8 +204,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-org",
-   "x": -0.200168,
-   "y": -0.035407
+   "x": -0.167111,
+   "y": -0.02956
   },
   {
    "id": "n-demo-employee",
@@ -218,8 +218,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-person",
-   "x": -0.637988,
-   "y": 0.633384
+   "x": -0.654477,
+   "y": 0.643874
   },
   {
    "id": "n-demo-engineer",
@@ -232,8 +232,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-person",
-   "x": -0.871245,
-   "y": 0.962059
+   "x": -0.865729,
+   "y": 0.941541
   },
   {
    "id": "n-demo-go",
@@ -248,7 +248,7 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-tool",
-   "x": 0.198655,
+   "x": 0.180978,
    "y": -1.417576
   },
   {
@@ -262,8 +262,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-person",
-   "x": -0.924278,
-   "y": 0.52989
+   "x": -0.91376,
+   "y": 0.550143
   },
   {
    "id": "n-demo-person",
@@ -276,8 +276,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-person",
-   "x": -0.570873,
-   "y": 0.832917
+   "x": -0.593695,
+   "y": 0.824583
   },
   {
    "id": "n-demo-postgres",
@@ -292,8 +292,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-tool",
-   "x": 0.029585,
-   "y": -1.330709
+   "x": 0.052162,
+   "y": -1.351392
   },
   {
    "id": "n-demo-redis",
@@ -308,8 +308,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-tool",
-   "x": 0.138923,
-   "y": -1.58296
+   "x": 0.135468,
+   "y": -1.543583
   },
   {
    "id": "n-demo-roadmap",
@@ -323,8 +323,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-org",
-   "x": 0.189616,
-   "y": -0.120618
+   "x": 0.158303,
+   "y": -0.100699
   },
   {
    "id": "n-demo-sqlite",
@@ -339,8 +339,8 @@
    "depth": 0,
    "matched": false,
    "cluster": "c-tool",
-   "x": 0.243929,
-   "y": -1.261683
+   "x": 0.215472,
+   "y": -1.298801
   }
  ],
  "edges": [
