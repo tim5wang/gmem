@@ -367,14 +367,21 @@ function makeProjector(scene, width, height, padding = 48) {
   const ext = Math.min(drawExtent(scene), Math.min(width, height) / 4);
   const w = Math.max(1, width - pad * 2 - ext * 2);
   const h2 = Math.max(1, height - pad * 2 - ext * 2);
-  const scale = Math.min(w / dx, h2 / dy);
+  const scale0 = Math.min(w / dx, h2 / dy);
+  const scale90 = Math.min(w / dy, h2 / dx);
+  const rotated = scale90 > scale0 * 1.25;
+  const scale = rotated ? scale90 : scale0;
   const cx = (b.minX + b.maxX) / 2;
   const cy = (b.minY + b.maxY) / 2;
-  const project = (x2, y2) => ({
+  const project = rotated ? (x2, y2) => ({
+    x: width / 2 + (y2 - cy) * scale,
+    y: height / 2 - (x2 - cx) * scale
+  }) : (x2, y2) => ({
     x: width / 2 + (x2 - cx) * scale,
     y: height / 2 + (y2 - cy) * scale
   });
   project.scale = scale;
+  project.rotated = rotated;
   return project;
 }
 var COLLIDE = {

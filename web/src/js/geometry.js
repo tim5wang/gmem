@@ -64,8 +64,23 @@ export function drawExtent(scene) {
 //     因此边缘图元整个落在画布内 —— 左右/上下留白自然对称。
 //
 // 为什么不拉伸到"填满视口"：非等比缩放会把圆压成椭圆、把团心几何关系改掉，
-// 视觉编码（大小 = degree）随之失真。宽视口下圆形内容两侧必然留白，这是
-// 等比映射的代价，不是缺陷；能改进的是"别把内容顶到边上、别一侧紧一侧空"。
+// 视觉编码（大小 = degree）随之失真。
+//
+// # 朝向选择：0° 或 90° 刚性旋转（不是拉伸）
+//
+// 但"留白"里有一块是可消除的。黄金角螺旋生成的团心布局，其长宽比随概念数变化，
+// 而绘图区通常宽扁（左侧过滤面板 + 右侧实体卡之后，舞台约 1090×590 ≈ 1.85:1）。
+// 实测 3 个概念时团心包围盒为 0.937×2.162（0.43:1，高窄），等比缩放取 min 后
+// **只用到 18% 宽度**，左右各约 40% 是空白——这正是用户截图里"挤成一条竖列"。
+//
+// 解法：把内容**刚性旋转 90°**，让它的长轴对上视口的长轴。
+//  - 旋转保距：圆仍是圆、团心几何关系不变、大小编码不失真，等比约束不破；
+//  - 仍只有一个 scale，不引入非等比拉伸；
+//  - 行列式 > 0（t = [[0,s],[-s,0]]），是旋转不是镜像；
+//  - 确定性：朝向只由 (dx, dy, 可用宽高) 决定，无随机、无时间。
+//
+// 附带收益：scale 变大后，节点间距按同一比例放大，原本 900×700 下会重叠的
+// 节点对也随之分开（详见 makeProjector 的选择规则）。
 export function makeProjector(scene, width, height, padding = 48) {
   const b = bounds(scene);
   const dx = b.maxX - b.minX;
@@ -75,14 +90,29 @@ export function makeProjector(scene, width, height, padding = 48) {
   const ext = Math.min(drawExtent(scene), Math.min(width, height) / 4);
   const w = Math.max(1, width - pad * 2 - ext * 2);
   const h = Math.max(1, height - pad * 2 - ext * 2);
-  const scale = Math.min(w / dx, h / dy);
+  const scale0 = Math.min(w / dx, h / dy);
+  const scale90 = Math.min(w / dy, h / dx);
+  // 只在**显著**改善时才切朝向（1.25x 阈值）。
+  //
+  // 必要性：朝向是纯函数地由 (dx,dy,可用宽高) 决定的，没有记忆。若阈值取 1.0，
+  // 当两者接近时，用户轻微拖动窗口就会让整图在 0°/90° 之间反复翻转——比留白更难接受。
+  // 取 1.25 后，只有“竖条 vs 横条”这种真量级差异才触发旋转。
+  const rotated = scale90 > scale0 * 1.25;
+  const scale = rotated ? scale90 : scale0;
   const cx = (b.minX + b.maxX) / 2;
   const cy = (b.minY + b.maxY) / 2;
-  const project = (x, y) => ({
-    x: width / 2 + (x - cx) * scale,
-    y: height / 2 + (y - cy) * scale,
-  });
+  // 90° 旋转以包围盒中心为轴，用相对量写避免大坐标下的精度损失。
+  const project = rotated
+    ? (x, y) => ({
+        x: width / 2 + (y - cy) * scale,
+        y: height / 2 - (x - cx) * scale,
+      })
+    : (x, y) => ({
+        x: width / 2 + (x - cx) * scale,
+        y: height / 2 + (y - cy) * scale,
+      });
   project.scale = scale;
+  project.rotated = rotated;
   return project;
 }
 

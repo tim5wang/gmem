@@ -195,17 +195,32 @@ test('【定量 D】1400×1200 与 800×1200：内容居中，左右留白差 �
   }
 });
 
-test('【定量 D】投影等比（不变形）：横竖同比例，且方向保持', () => {
+test('【定量 D】投影等比（不变形）且不镜像（允许 90° 朝向切换）', () => {
+  // 旧断言要求“方向保持（x 更大 → 屏幕 x 更大）”，那等价于“禁止旋转”。
+  // 但方向保持不是 TD §9 的要求（视觉编码只有颜色/大小/线型/描边，没有方位语义），
+  // 而团心螺旋在概念数少时天然高窄，遇上宽扁绘图区会只用到 18% 宽度。
+  // 因此这里把断言换成**更强且不限制朝向**的两条真不变量：
+  //   (1) 任意两点的屏幕距离 == 世界距离 × scale（各向同性，这是“等比”的最强表述）；
+  //   (2) det > 0（旋转允许，**镜像不允许** —— 镜像会让“左/右”关系错乱）。
   const scene = demoScene();
-  const project = makeProjector(scene, 1400, 1200);
-  // 世界坐标里一个正方形，投到屏幕上必须还是正方形（边长相等）。
-  const a = project(0, 0);
-  const b = project(0.1, 0);
-  const c = project(0, 0.1);
-  const dx = Math.abs(b.x - a.x);
-  const dy = Math.abs(c.y - a.y);
-  assert.ok(Math.abs(dx - dy) < 1e-9, `投影非等比：dx=${dx} dy=${dy}`);
-  assert.ok(b.x > a.x && c.y > a.y, '投影必须保持方向（x 更大 → 屏幕 x 更大）');
+  for (const [W, H] of [[1400, 1200], [1090, 590], [900, 700]]) {
+    const project = makeProjector(scene, W, H);
+    const o = project(0, 0);
+    const ex = project(1, 0);
+    const ey = project(0, 1);
+    const u = { x: ex.x - o.x, y: ex.y - o.y };
+    const v = { x: ey.x - o.x, y: ey.y - o.y };
+    const lenU = Math.hypot(u.x, u.y);
+    const lenV = Math.hypot(v.x, v.y);
+    assert.ok(
+      Math.abs(lenU - project.scale) < 1e-9 && Math.abs(lenV - project.scale) < 1e-9,
+      `${W}x${H}: 非等比 |u|=${lenU} |v|=${lenV} scale=${project.scale}`,
+    );
+    // 正交：两基向量点积为 0（保证正方形仍是正方形，不是菱形）。
+    assert.ok(Math.abs(u.x * v.x + u.y * v.y) < 1e-9, `${W}x${H}: 两轴不正交`);
+    const det = u.x * v.y - u.y * v.x;
+    assert.ok(det > 0, `${W}x${H}: 投影含镜像（det=${det} ≤ 0）`);
+  }
 });
 
 test('【定量 D】内容宽高比越接近视口，填充率越高（宽视口下圆形内容两侧留白更大）', () => {
