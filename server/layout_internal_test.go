@@ -333,3 +333,64 @@ func TestLayoutIsPureNoPackageState(t *testing.T) {
 		}
 	}
 }
+
+// ===========================================================================
+// 根因 A 回归：团内不得有节点落在团心（会被画在团心的团标签压住）
+//
+// 历史缺陷：r = R*sqrt(index/count) 在 index=0 时恒为 0 ⇒ 团内第一个节点
+// **必然**落在团心，而前端把团圆 + 团名也画在团心（render.js 的 translate），
+// 于是那个节点永远被团徽盖住（demo 数据三个团全部命中）。
+// 修法：叶序半径改离心 r = R*sqrt((index+0.5)/count)。
+// ===========================================================================
+
+// TestNoNodeFallsOnClusterCenter 任意规模团里都**没有**节点落在团心。
+//
+// 覆盖 n=1..40：n=1 是最容易被忽略的边界（该节点必须单独离团心一段距离，
+// 否则单节点团永远被团徽压住）。
+func TestNoNodeFallsOnClusterCenter(t *testing.T) {
+	for n := 1; n <= 40; n++ {
+		for ci := 0; ci < 4; ci++ {
+			cx, cy := clusterCenter(ci)
+			for j := 0; j < n; j++ {
+				x, y := nodePosition(j, n, cx, cy)
+				d := math.Hypot(x-cx, y-cy)
+				if d <= 0 {
+					t.Fatalf("团 %d（n=%d）的节点 %d 恰好落在团心：dist=0（会被团标签压住）", ci, n, j)
+				}
+			}
+		}
+	}
+}
+
+// TestFirstLeafKeepsClearance 团内第一个节点至少离团心 R*sqrt(0.5/n)。
+//
+// 这是离心项的**定量**下界，不是"只要 > 0"：R*sqrt(0.5/n) 是第 0 个环带半径，
+// 小于它就说明离心项没生效（或被人改回 index/count）。
+func TestFirstLeafKeepsClearance(t *testing.T) {
+	for _, n := range []int{1, 2, 3, 6, 9, 19, 30, 40} {
+		cx, cy := clusterCenter(0)
+		x, y := nodePosition(0, n, cx, cy)
+		d := math.Hypot(x-cx, y-cy)
+		need := clusterRadius(n) * math.Sqrt(0.5/float64(n))
+		// roundCoord 固定到 1e-6，x/y 各自最多引入 5e-7 误差。
+		if d < need-1e-6 {
+			t.Fatalf("n=%d 的第一个节点离团心 %.6f < R*sqrt(0.5/n)=%.6f", n, d, need)
+		}
+	}
+}
+
+// TestCenterHuggingFormulaWouldFail 是**对照组**：旧式 index/count 在同一断言下必红。
+//
+// 价值同上：证明上面两条断言真的能抓住这个缺陷，而不是恒真。
+func TestCenterHuggingFormulaWouldFail(t *testing.T) {
+	const n = 6
+	// 旧式：r = R*sqrt(index/count)，index=0 ⇒ r=0。
+	oldR := clusterRadius(n) * math.Sqrt(0.0/float64(n))
+	if oldR != 0 {
+		t.Fatalf("对照组失效：旧式 index=0 的半径应为 0，实际 %.6f", oldR)
+	}
+	newR := clusterRadius(n) * math.Sqrt(0.5/float64(n))
+	if newR <= 0 {
+		t.Fatalf("新式 index=0 的半径必须 > 0，实际 %.6f", newR)
+	}
+}

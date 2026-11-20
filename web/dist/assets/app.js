@@ -377,6 +377,264 @@ function makeProjector(scene, width, height, padding = 48) {
   project.scale = scale;
   return project;
 }
+var COLLIDE = {
+  // gap：两圆之间额外留的像素（=0 也保证不叠，留 4px 免得看起来"贴边"）。
+  gap: 4,
+  // iterations：固定迭代轮数上限（验收要求 ≤30）。
+  iterations: 12,
+  // maxGrowth：内容包围盒允许的最大增长（验收要求 ≤15%）。
+  // 超过就回到"上一轮仍在预算内"的状态 —— 宁可留一点重叠，也不要把图"推开成一条"。
+  maxGrowth: 0.15,
+  // passes：松弛会让包围盒略涨 ⇒ 缩放略降 ⇒ 像素间距再缩水一丁点，
+  // 所以按新尺寸再松一轮。固定 2 轮（不是自适应循环，保持可预测）。
+  passes: 2
+};
+function roundWorld(v) {
+  return Math.round(v * 1e6) / 1e6;
+}
+function gridKey(gx, gy) {
+  return gx + "," + gy;
+}
+function centerBBox(list) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const p of list) {
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+  return { minX, minY, maxX, maxY };
+}
+function bboxGrowth(base, cur) {
+  const w0 = base.maxX - base.minX;
+  const h0 = base.maxY - base.minY;
+  const w = cur.maxX - cur.minX;
+  const h2 = cur.maxY - cur.minY;
+  const gw = w0 > 1e-12 ? (w - w0) / w0 : 0;
+  const gh = h0 > 1e-12 ? (h2 - h0) / h0 : 0;
+  return Math.max(gw, gh);
+}
+function collideOnce(items, cell, budget, iterations) {
+  const start = items.map((it) => ({ x: it.x, y: it.y }));
+  let accepted = items.map((it) => ({ x: it.x, y: it.y }));
+  let acceptedGrowth = budget ? bboxGrowth(budget.base, centerBBox(items)) : 0;
+  for (let iter = 0; iter < iterations; iter++) {
+    const grid = /* @__PURE__ */ new Map();
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const k = gridKey(Math.floor(it.x / cell), Math.floor(it.y / cell));
+      const bucket = grid.get(k);
+      if (bucket) bucket.push(i);
+      else grid.set(k, [i]);
+    }
+    let passMoved = false;
+    for (let i = 0; i < items.length; i++) {
+      const a2 = items[i];
+      const gx = Math.floor(a2.x / cell);
+      const gy = Math.floor(a2.y / cell);
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oy = -1; oy <= 1; oy++) {
+          const bucket = grid.get(gridKey(gx + ox, gy + oy));
+          if (!bucket) continue;
+          for (const j of bucket) {
+            if (j <= i) continue;
+            const b = items[j];
+            let dx = b.x - a2.x;
+            let dy = b.y - a2.y;
+            let d = Math.hypot(dx, dy);
+            const need = a2.r + b.r;
+            if (d >= need) continue;
+            if (d < 1e-12) {
+              const ang = (i + 1) * 2.399963229728653 + j;
+              dx = Math.cos(ang);
+              dy = Math.sin(ang);
+              d = 1;
+            }
+            const push = (need - d) / 2;
+            const ux = dx / d * push;
+            const uy = dy / d * push;
+            a2.x -= ux;
+            a2.y -= uy;
+            b.x += ux;
+            b.y += uy;
+            passMoved = true;
+          }
+        }
+      }
+    }
+    if (!passMoved) break;
+    if (!budget) {
+      accepted = items.map((it) => ({ x: it.x, y: it.y }));
+      continue;
+    }
+    const g = bboxGrowth(budget.base, centerBBox(items));
+    if (g > budget.maxGrowth + 1e-12) {
+      const span = g - acceptedGrowth;
+      const f = span > 1e-12 ? (budget.maxGrowth - acceptedGrowth) / span : 0;
+      const t = Math.max(0, Math.min(1, f));
+      for (let i = 0; i < items.length; i++) {
+        items[i].x = accepted[i].x + (items[i].x - accepted[i].x) * t;
+        items[i].y = accepted[i].y + (items[i].y - accepted[i].y) * t;
+      }
+      break;
+    }
+    accepted = items.map((it) => ({ x: it.x, y: it.y }));
+    acceptedGrowth = g;
+  }
+  for (let i = 0; i < items.length; i++) {
+    if (Math.abs(items[i].x - start[i].x) > 1e-12 || Math.abs(items[i].y - start[i].y) > 1e-12) return true;
+  }
+  return false;
+}
+function fitScene(scene, width, height, opts = {}) {
+  const nodes = scene && Array.isArray(scene.nodes) ? scene.nodes : [];
+  if (nodes.length < 2) return scene;
+  const gap = Number.isFinite(opts.gap) ? opts.gap : COLLIDE.gap;
+  const iterations = Number.isFinite(opts.iterations) ? opts.iterations : COLLIDE.iterations;
+  const maxGrowth = Number.isFinite(opts.maxGrowth) ? opts.maxGrowth : COLLIDE.maxGrowth;
+  const passes = Number.isFinite(opts.passes) ? opts.passes : COLLIDE.passes;
+  const finite = nodes.filter((n) => Number.isFinite(n.x) && Number.isFinite(n.y));
+  if (finite.length < 2) return scene;
+  const baseBox = centerBBox(finite);
+  let cur = scene;
+  let changed = false;
+  for (let p = 0; p < passes; p++) {
+    const scale = makeProjector(cur, width, height).scale;
+    if (!(scale > 0) || !Number.isFinite(scale)) break;
+    const items = cur.nodes.filter((n) => Number.isFinite(n.x) && Number.isFinite(n.y)).map((n) => ({
+      id: String(n.id),
+      x: n.x,
+      y: n.y,
+      r: ((Number.isFinite(n.r) ? n.r : 5) + gap / 2) / scale
+    })).sort((a2, b) => a2.id < b.id ? -1 : a2.id > b.id ? 1 : 0);
+    if (items.length < 2) break;
+    let maxR = 0;
+    for (const it of items) if (it.r > maxR) maxR = it.r;
+    const cell = Math.max(2 * maxR, 1e-6);
+    if (!collideOnce(items, cell, { base: baseBox, maxGrowth }, iterations)) break;
+    const byId = new Map(items.map((it) => [it.id, it]));
+    cur = {
+      ...cur,
+      nodes: cur.nodes.map((n) => {
+        const it = byId.get(String(n.id));
+        if (!it) return n;
+        const x2 = roundWorld(it.x);
+        const y2 = roundWorld(it.y);
+        return x2 === n.x && y2 === n.y ? n : { ...n, x: x2, y: y2 };
+      })
+    };
+    changed = true;
+  }
+  return changed ? cur : scene;
+}
+var BADGE_DIRECTIONS = [-90, -50, -130, -10, -170, 30, 210, 90, 10, 170, 50, 130];
+function placeClusterBadges(scene, project, { width = 0, height = 0, gap = 6 } = {}) {
+  const out = /* @__PURE__ */ new Map();
+  const clusters = scene && scene.clusters || [];
+  if (!clusters.length) return out;
+  const nodes = scene && scene.nodes || [];
+  const pts = [];
+  let maxNodeR = 0;
+  for (const n of nodes) {
+    const p = project(n.x, n.y);
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+    const r = Number.isFinite(n.r) ? n.r : 5;
+    if (r > maxNodeR) maxNodeR = r;
+    pts.push({ x: p.x, y: p.y, r, key: n.key });
+  }
+  const cell = Math.max(2 * (maxNodeR + gap), 16);
+  const grid = /* @__PURE__ */ new Map();
+  for (const q of pts) {
+    const k = gridKey(Math.floor(q.x / cell), Math.floor(q.y / cell));
+    const bucket = grid.get(k);
+    if (bucket) bucket.push(q);
+    else grid.set(k, [q]);
+  }
+  const clear = (x2, y2, r) => {
+    const gx = Math.floor(x2 / cell);
+    const gy = Math.floor(y2 / cell);
+    for (let ox = -1; ox <= 1; ox++) {
+      for (let oy = -1; oy <= 1; oy++) {
+        const bucket = grid.get(gridKey(gx + ox, gy + oy));
+        if (!bucket) continue;
+        for (const q of bucket) {
+          if (Math.hypot(q.x - x2, q.y - y2) < r + q.r + 2) return false;
+        }
+      }
+    }
+    return true;
+  };
+  const placed = [];
+  for (const c2 of clusters) {
+    const key = c2.id || c2.concept_id || "";
+    const cp = project(c2.x, c2.y);
+    const r = clusterPixelRadius(c2.count);
+    let cloudR = 0;
+    for (const q of pts) {
+      if (q.key !== key) continue;
+      const d = Math.hypot(q.x - cp.x, q.y - cp.y) + q.r;
+      if (d > cloudR) cloudR = d;
+    }
+    if (cloudR <= 0) {
+      out.set(key, { x: cp.x, y: cp.y, r, labelY: cp.y + r + 13, above: false });
+      placed.push({ x: cp.x, y: cp.y, r });
+      continue;
+    }
+    let best = null;
+    for (let ring = 0; ring <= 4 && !best; ring++) {
+      const dist = cloudR + r + gap + ring * (r + gap);
+      for (const deg of BADGE_DIRECTIONS) {
+        const ang = deg * Math.PI / 180;
+        const x2 = cp.x + Math.cos(ang) * dist;
+        const y2 = cp.y + Math.sin(ang) * dist;
+        if (width > 0 && (x2 - r < 0 || x2 + r > width)) continue;
+        if (height > 0 && (y2 - r < 0 || y2 + r > height)) continue;
+        if (!clear(x2, y2, r)) continue;
+        let clash = false;
+        for (const q of placed) {
+          if (Math.hypot(q.x - x2, q.y - y2) < r + q.r + gap) {
+            clash = true;
+            break;
+          }
+        }
+        if (clash) continue;
+        best = { x: x2, y: y2 };
+        break;
+      }
+    }
+    if (!best) {
+      let bestScore = -Infinity;
+      for (const deg of BADGE_DIRECTIONS) {
+        const ang = deg * Math.PI / 180;
+        const x2 = cp.x + Math.cos(ang) * (cloudR + r + gap);
+        const y2 = cp.y + Math.sin(ang) * (cloudR + r + gap);
+        let clearance = Infinity;
+        for (const q of pts) {
+          clearance = Math.min(clearance, Math.hypot(q.x - x2, q.y - y2) - (r + q.r));
+        }
+        const score = Number.isFinite(clearance) ? clearance : 0;
+        if (score > bestScore) {
+          bestScore = score;
+          best = { x: x2, y: y2 };
+        }
+      }
+      if (!best) best = { x: cp.x, y: cp.y };
+    }
+    const above = best.y <= cp.y;
+    out.set(key, {
+      x: best.x,
+      y: best.y,
+      r,
+      labelY: above ? best.y - r - 6 : best.y + r + 13,
+      above
+    });
+    placed.push({ x: best.x, y: best.y, r });
+  }
+  return out;
+}
 function shouldUseCanvas(scene, maxSvg = 2e3) {
   return scene.nodes.length + scene.clusters.length > maxSvg;
 }
@@ -477,19 +735,26 @@ function collides(grid, box, gap) {
   }
   return false;
 }
-function clusterObstacles(scene, project, { fontSize = 11 } = {}) {
+function clusterObstacles(scene, project, { fontSize = 11, width = 0, height = 0 } = {}) {
+  const badges = placeClusterBadges(scene, project, { width, height });
   const out = [];
   for (const c2 of scene.clusters || []) {
-    const p = project(c2.x, c2.y);
-    const r = 10 + Math.min(30, Math.sqrt(Math.max(1, c2.count)) * 3.2);
+    const key = c2.id || c2.concept_id || "";
+    const b = badges.get(key);
+    if (!b) continue;
     const text = `${c2.concept_name || c2.id || "(未归属概念)"} · ${c2.count}`;
     const w = textWidth(text, fontSize);
-    const y2 = p.y + r + 13;
     out.push({
-      minX: p.x - w / 2,
-      minY: y2 - fontSize * 0.8,
-      maxX: p.x + w / 2,
-      maxY: y2 - fontSize * 0.8 + LABEL.lineHeight
+      minX: b.x - w / 2,
+      minY: b.labelY - fontSize * 0.8,
+      maxX: b.x + w / 2,
+      maxY: b.labelY - fontSize * 0.8 + LABEL.lineHeight
+    });
+    out.push({
+      minX: b.x - b.r,
+      minY: b.y - b.r,
+      maxX: b.x + b.r,
+      maxY: b.y + b.r
     });
   }
   return out;
@@ -611,6 +876,7 @@ function renderSVG(svg, scene, opts) {
     const key = c2.id || c2.concept_id || "";
     clusterPos.set(key, p);
   }
+  const clusterBadges = placeClusterBadges(scene, project, { width, height });
   const pos = /* @__PURE__ */ new Map();
   for (const n of scene.nodes) pos.set(n.id, project(n.x, n.y));
   const nodeRadius2 = /* @__PURE__ */ new Map();
@@ -648,15 +914,17 @@ function renderSVG(svg, scene, opts) {
   }
   const drillable = Boolean(scene.meta?.truncated);
   for (const c2 of scene.clusters) {
-    const p = clusterPos.get(c2.id || c2.concept_id || "");
+    const key = c2.id || c2.concept_id || "";
+    const p = clusterPos.get(key);
     if (!p) continue;
     const r = 10 + Math.min(30, Math.sqrt(Math.max(1, c2.count)) * 3.2);
+    const badge = clusterBadges.get(key) || { x: p.x, y: p.y, r, labelY: p.y + r + 13 };
     const g = el("g", {
       class: `cluster${drillable ? " drillable" : ""}`,
       "data-cluster-id": c2.concept_id || "",
       "data-cluster-name": c2.concept_name || c2.id || "",
       "data-count": String(c2.count),
-      transform: `translate(${p.x.toFixed(1)},${p.y.toFixed(1)})`
+      transform: `translate(${badge.x.toFixed(1)},${badge.y.toFixed(1)})`
     });
     if (drillable) {
       g.appendChild(el("circle", {
@@ -677,7 +945,7 @@ function renderSVG(svg, scene, opts) {
     }));
     const label = el("text", {
       "text-anchor": "middle",
-      y: String(r + 13),
+      y: String(Math.round((badge.labelY - badge.y) * 10) / 10),
       fill: STYLE.label,
       "font-size": "11",
       class: "cluster-label"
@@ -744,7 +1012,8 @@ function renderSVG(svg, scene, opts) {
   const placed = layoutLabels(labelItems, {
     width,
     height,
-    obstacles: clusterObstacles(scene, project)
+    // 障碍框按**实际画出去**的团徽位置算（含让位后的偏移与画布尺寸）。
+    obstacles: clusterObstacles(scene, project, { width, height })
   });
   for (const lab of placed.labels) {
     const text = el("text", {
@@ -823,12 +1092,16 @@ function renderCanvas(canvas, scene, opts) {
     ctx.stroke();
     ctx.restore();
   }
+  const clusterBadges = placeClusterBadges(scene, project, { width, height });
   for (const c2 of scene.clusters) {
-    const p = project(c2.x, c2.y);
+    const key = c2.id || c2.concept_id || "";
+    const cp = clusterPos.get(key);
+    if (!cp) continue;
     const r = 10 + Math.min(30, Math.sqrt(Math.max(1, c2.count)) * 3.2);
+    const badge = clusterBadges.get(key) || { x: cp.x, y: cp.y, r, labelY: cp.y + r + 13 };
     ctx.save();
     ctx.beginPath();
-    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.arc(badge.x, badge.y, r, 0, Math.PI * 2);
     ctx.fillStyle = STYLE.clusterFill;
     ctx.fill();
     ctx.strokeStyle = c2.matched ? STYLE.matchedStroke : STYLE.clusterStroke;
@@ -837,7 +1110,7 @@ function renderCanvas(canvas, scene, opts) {
     ctx.fillStyle = STYLE.label;
     ctx.font = "11px system-ui, sans-serif";
     ctx.textAlign = "center";
-    ctx.fillText(`${c2.concept_name || c2.id || "(未归属概念)"} · ${c2.count}`, p.x, p.y + r + 13);
+    ctx.fillText(`${c2.concept_name || c2.id || "(未归属概念)"} · ${c2.count}`, badge.x, badge.labelY);
     ctx.restore();
   }
   for (const n of scene.nodes) {
@@ -1974,6 +2247,11 @@ var state = {
   // 服务端原始响应
   scene: null,
   // 渲染用场景（过滤后）
+  // fitBase 是**未松弛**的源场景（服务端坐标 / 手动重排后的坐标）。
+  // 碰撞松弛按当前视口尺寸在 draw() 里重算，且永远从 fitBase 出发 ——
+  // 否则每画一次就再推一次，resize 会累积漂移（也破坏确定性）。
+  fitBase: null,
+  fitCache: null,
   baseScene: null,
   // 未过滤场景（过滤选项的来源）
   conceptFilter: /* @__PURE__ */ new Set(),
@@ -2000,7 +2278,7 @@ async function loadView(view) {
   const { view: parsed, errors } = parseView(toQuery(view));
   if (errors.length) {
     state.errors = errors;
-    state.scene = null;
+    setScene(null);
     state.baseScene = null;
     renderBanners();
     renderStageNote("参数错误：" + errors.map((e) => e.message).join("；"));
@@ -2015,7 +2293,7 @@ async function loadView(view) {
   try {
     resp = await fetchGraph(currentFetchImpl(), toGraphURL(parsed));
   } catch (err) {
-    state.scene = null;
+    setScene(null);
     state.baseScene = null;
     const msg = err instanceof ApiError ? err.message : String(err);
     state.errors = [{ field: err?.field || "", message: msg }];
@@ -2036,8 +2314,22 @@ function applyFiltersAndDraw() {
     concepts: state.conceptFilter,
     relations: state.relationFilter
   });
-  state.scene = filtered;
+  setScene(filtered);
   draw();
+}
+function setScene(scene) {
+  state.scene = scene;
+  state.fitBase = scene;
+  state.fitCache = null;
+}
+function fittedScene(width, height) {
+  const src = state.fitBase;
+  if (!src) return null;
+  const c2 = state.fitCache;
+  if (c2 && c2.nodes === src.nodes && c2.width === width && c2.height === height) return c2.scene;
+  const scene = fitScene(src, width, height);
+  state.fitCache = { nodes: src.nodes, width, height, scene };
+  return scene;
 }
 function stageSize() {
   const rect = dom.stage.getBoundingClientRect();
@@ -2048,12 +2340,14 @@ function stageSize() {
   };
 }
 function draw() {
-  if (!state.scene) return;
-  const useCanvas = shouldUseCanvas(state.scene, MAX_SVG);
+  if (!state.fitBase) return;
   const host = { svg: dom.svg, canvas: dom.canvas };
   let size = stageSize();
   let result = null;
+  let useCanvas = false;
   for (let i = 0; i < 3; i++) {
+    state.scene = fittedScene(size.width, size.height);
+    useCanvas = shouldUseCanvas(state.scene, MAX_SVG);
     result = render(host, state.scene, { ...size, useCanvas });
     const again = stageSize();
     if (again.width === size.width && again.height === size.height) break;
@@ -2401,10 +2695,10 @@ dom.asOfRange.addEventListener("input", () => {
   const n = Number(dom.asOfRange.value);
   state.view = { ...state.view, asOf: n };
   state.baseScene = applyAsOf({ ...state.baseScene, layoutVersion: state.baseScene.layoutVersion }, n);
-  state.scene = filterScene(state.baseScene, {
+  setScene(filterScene(state.baseScene, {
     concepts: state.conceptFilter,
     relations: state.relationFilter
-  });
+  }));
   dom.asOfLabel.textContent = new Date(n * 1e3).toISOString();
   draw();
   syncURL(state.view, { replace: true });
@@ -2417,7 +2711,8 @@ dom.asOfReset.addEventListener("click", () => {
 dom.relayoutBtn.addEventListener("click", () => {
   if (!state.scene) return;
   const coords = relayout(state.scene.nodes, state.scene.edges);
-  state.scene = withLayout(state.scene, coords);
+  const next = withLayout(state.scene, coords);
+  setScene(next);
   state.baseScene = withLayout(state.baseScene, coords);
   draw();
   renderStageNote(`${buildStageNote()}（本地重排：坐标仅在本页生效，不写服务端）`.trim());

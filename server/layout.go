@@ -21,8 +21,10 @@ import (
 //
 //  1. 团心 = 黄金角螺旋 r_i = clusterBaseRadius * sqrt(i+0.5)（i 是概念键排序后的序号）。
 //     任意两团心的最小距离是 d(0,1) = 0.9*sqrt(1.5) ≈ 1.1023（数值验证见 layout_test.go）。
-//  2. 团内 = 叶序（向日葵）格点：第 j 个节点 r_j = R* sqrt(j/n)，theta_j = j*goldenAngle。
+//  2. 团内 = 叶序（向日葵）格点：第 j 个节点 r_j = R* sqrt((j+0.5)/n)，theta_j = j*goldenAngle。
 //     相邻节点间距近似相等，不会出现"随机极坐标"必然产生的局部聚簇与空洞。
+//     离心项 +0.5 保证最内圈也离团心 R*sqrt(0.5/n) > 0（旧的 j/n 让 j=0 落在团心，
+//     正好被前端画在团心的团标签压住）。
 //  3. 团半径 R 随节点数增长（R = 0.10 + 0.055*sqrt(n)），但**封顶**在 clusterRadiusMax：
 //     封顶是与团心间距联动的必要条件 —— 团心只依赖序号 i（新增概念不位移已有团心），
 //     所以不封顶就无法保证 "dist(ci,cj) > Ri + Rj + 间隙"。
@@ -98,8 +100,15 @@ func clusterRadius(n int) float64 {
 //
 // 纯函数：只吃 (index, count, center)。同一 nodeID 因为"团内按 ID 排序的序号"
 // 确定 ⇒ 每次请求都落在同一格点上。**没有随机数、没有时间、没有包级可变状态。**
-// r = R*sqrt(index/count)、theta = index*goldenAngle 是标准叶序（向日葵）格点：
+// r = R*sqrt((index+0.5)/count)、theta = index*goldenAngle 是标准叶序（向日葵）格点：
 // 单位圆内前 k 个点的面积密度恒定，因此团内既不成簇也不留大洞。
+//
+// 为什么半径带 +0.5 的离心项（历史缺陷回归）：
+// 旧式 r = R*sqrt(index/count) 在 index=0 时恒为 0 ⇒ 团内第一个节点**必然落在团心**。
+// 而前端把团标签圆盘也画在团心（render.js 的 translate(p.x,p.y)），于是那个节点
+// 永远被团圆压住（demo 数据三个团全部命中）。改成 (index+0.5)/count 后每个叶序
+// 环带的中点都落在各自环带的中心，最近的一圈也离团心 R*sqrt(0.5/n) > 0。
+// 这仍然是纯函数：不引入第二个入参，也不改变"坐标与折叠无关"这条性质。
 func nodePosition(index, count int, centerX, centerY float64) (float64, float64) {
 	if count <= 0 {
 		return centerX, centerY
@@ -110,7 +119,7 @@ func nodePosition(index, count int, centerX, centerY float64) (float64, float64)
 	if index >= count {
 		index = count - 1
 	}
-	radius := clusterRadius(count) * math.Sqrt(float64(index)/float64(count))
+	radius := clusterRadius(count) * math.Sqrt((float64(index)+0.5)/float64(count))
 	angle := float64(index) * goldenAngle
 	return roundCoord(centerX + radius*math.Cos(angle)),
 		roundCoord(centerY + radius*math.Sin(angle))

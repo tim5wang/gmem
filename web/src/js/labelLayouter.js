@@ -19,6 +19,10 @@
 // 输入只有"节点屏幕坐标 + 半径 + 文本 + 画布尺寸"，输出只有坐标列表。
 // 没有 Math.random、没有 DOM 测量、没有时间 —— 同一份数据每次画出来完全一致，
 // 这样 node --test 才能把"标签不重叠"变成断言而不是靠肉眼。
+//
+// 只有团徽位置例外地来自 geometry.js：那里是"团徽让位"的同一份确定性实现，
+// 障碍框必须按**实际画出来的位置**算，否则节点标签会去压真正画出去的那行团名。
+import { placeClusterBadges } from './geometry.js';
 
 // LABEL 是与 render.js 共用的字号/估算常量。
 //
@@ -153,19 +157,31 @@ function collides(grid, box, gap) {
 //
 // 团标签是团名 + 计数，比单个节点名更重要（折叠视图里它是唯一的解释），
 // 因此先占位、节点标签绕开它。
-export function clusterObstacles(scene, project, { fontSize = 11 } = {}) {
+//
+// 位置必须与 render.js 实际画的位置**同口径**：团徽在概览下会被让位到节点云外侧
+// （placeClusterBadges），如果障碍框仍按"团心 + 圆下 13px"估算，节点标签就会去压
+// 真正画出来的那行字。所以这里直接复用同一个布置函数。
+export function clusterObstacles(scene, project, { fontSize = 11, width = 0, height = 0 } = {}) {
+  const badges = placeClusterBadges(scene, project, { width, height });
   const out = [];
   for (const c of scene.clusters || []) {
-    const p = project(c.x, c.y);
-    const r = 10 + Math.min(30, Math.sqrt(Math.max(1, c.count)) * 3.2);
+    const key = c.id || c.concept_id || '';
+    const b = badges.get(key);
+    if (!b) continue;
     const text = `${c.concept_name || c.id || '(未归属概念)'} · ${c.count}`;
     const w = textWidth(text, fontSize);
-    const y = p.y + r + 13;
     out.push({
-      minX: p.x - w / 2,
-      minY: y - fontSize * 0.8,
-      maxX: p.x + w / 2,
-      maxY: y - fontSize * 0.8 + LABEL.lineHeight,
+      minX: b.x - w / 2,
+      minY: b.labelY - fontSize * 0.8,
+      maxX: b.x + w / 2,
+      maxY: b.labelY - fontSize * 0.8 + LABEL.lineHeight,
+    });
+    // 团徽圆盘本身也是障碍：节点标签压在圆盘上同样读不出。
+    out.push({
+      minX: b.x - b.r,
+      minY: b.y - b.r,
+      maxX: b.x + b.r,
+      maxY: b.y + b.r,
     });
   }
   return out;

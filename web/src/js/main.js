@@ -17,7 +17,7 @@ import {
 } from './model.js';
 import { parseView, toQuery, toGraphURL, toEntityURL, overviewView, focusView, searchView, BUDGET_MAX } from './urlstate.js';
 import { render, hitTest, hitTestCluster, isPendingReview } from './render.js';
-import { shouldUseCanvas } from './geometry.js';
+import { shouldUseCanvas, fitScene } from './geometry.js';
 import { relayout, withLayout } from './layout.js';
 import { requestReview, reviewPrompt } from './reviewflow.js';
 // P6 前置 2：横幅逻辑已抽到 ui/banner.js（行为不变：同样的 class 名、
@@ -58,6 +58,11 @@ const state = {
   view: { focus: '', q: '', scope: '', hops: 1, budget: 200, asOf: null },
   raw: null, // 服务端原始响应
   scene: null, // 渲染用场景（过滤后）
+  // fitBase 是**未松弛**的源场景（服务端坐标 / 手动重排后的坐标）。
+  // 碰撞松弛按当前视口尺寸在 draw() 里重算，且永远从 fitBase 出发 ——
+  // 否则每画一次就再推一次，resize 会累积漂移（也破坏确定性）。
+  fitBase: null,
+  fitCache: null,
   baseScene: null, // 未过滤场景（过滤选项的来源）
   conceptFilter: new Set(),
   relationFilter: new Set(),
@@ -96,7 +101,7 @@ async function loadView(view) {
   const { view: parsed, errors } = parseView(toQuery(view));
   if (errors.length) {
     state.errors = errors;
-    state.scene = null;
+    setScene(null);
     state.baseScene = null;
     renderBanners();
     renderStageNote('参数错误：' + errors.map((e) => e.message).join('；'));
@@ -112,7 +117,7 @@ async function loadView(view) {
   try {
     resp = await fetchGraph(currentFetchImpl(), toGraphURL(parsed));
   } catch (err) {
-    state.scene = null;
+    setScene(null);
     state.baseScene = null;
     const msg = err instanceof ApiError ? err.message : String(err);
     state.errors = [{ field: err?.field || '', message: msg }];
@@ -139,8 +144,29 @@ function applyFiltersAndDraw() {
     relations: state.relationFilter,
   });
   // 过滤不改变坐标：filterScene 只做筛选，节点对象与其 x/y 原样带过来。
-  state.scene = filtered;
+  setScene(filtered);
   draw();
+}
+
+// setScene 同时记下"未松弛的源场景"：draw() 会从它重新算一次碰撞松弛。
+function setScene(scene) {
+  state.scene = scene;
+  state.fitBase = scene;
+  state.fitCache = null;
+}
+
+// fittedScene 返回当前视口下松弛后的场景（带缓存：源坐标 + 尺寸没变就不重算）。
+//
+// 为什么按 nodes 引用判缓存命中：时间轴滑动只换边样式（applyAsOf 保持 nodes 同一
+// 引用，见 model.js），松弛只依赖节点坐标 —— 拖一下就重算 2000 个节点的碰撞纯属白做。
+function fittedScene(width, height) {
+  const src = state.fitBase;
+  if (!src) return null;
+  const c = state.fitCache;
+  if (c && c.nodes === src.nodes && c.width === width && c.height === height) return c.scene;
+  const scene = fitScene(src, width, height);
+  state.fitCache = { nodes: src.nodes, width, height, scene };
+  return scene;
 }
 
 function stageSize() {
@@ -153,8 +179,7 @@ function stageSize() {
 }
 
 function draw() {
-  if (!state.scene) return;
-  const useCanvas = shouldUseCanvas(state.scene, MAX_SVG);
+  if (!state.fitBase) return;
   const host = { svg: dom.svg, canvas: dom.canvas };
   // 首帧陈旧投影的根治：量一次 → 画 → 再量；尺寸变了就重画。
   //
@@ -165,7 +190,13 @@ function draw() {
   // 时序；render 只画在绝对定位的 svg/canvas 上，不会反过来把容器撑大。
   let size = stageSize();
   let result = null;
+  let useCanvas = false;
   for (let i = 0; i < 3; i++) {
+    // 碰撞松弛按**当前**视口重算：节点半径是像素，窗口一小间距就不够。
+    // 每次都从 fitBase（未松弛）出发，所以多次 draw 不会累积位移。
+    state.scene = fittedScene(size.width, size.height);
+    // 分档判定必须用松弛后的场景（节点/团数量不变，但取值顺序不能猜）。
+    useCanvas = shouldUseCanvas(state.scene, MAX_SVG);
     result = render(host, state.scene, { ...size, useCanvas });
     const again = stageSize();
     if (again.width === size.width && again.height === size.height) break;
@@ -591,10 +622,12 @@ dom.asOfRange.addEventListener('input', () => {
   state.view = { ...state.view, asOf: n };
   // 只有边样式变化：节点坐标与 layoutVersion 都不动。
   state.baseScene = applyAsOf({ ...state.baseScene, layoutVersion: state.baseScene.layoutVersion }, n);
-  state.scene = filterScene(state.baseScene, {
+  // 只换边样式：节点坐标与 layoutVersion 都不动（fitBase 也随之不变，
+  // 松弛结果按 nodes 引用缓存命中，不会因拖时间轴重算）。
+  setScene(filterScene(state.baseScene, {
     concepts: state.conceptFilter,
     relations: state.relationFilter,
-  });
+  }));
   dom.asOfLabel.textContent = new Date(n * 1000).toISOString();
   draw();
   // URL 同步但不重拉：拖拽过程中不打断手感（松手后 URL 已是最新）。
@@ -611,8 +644,12 @@ dom.asOfReset.addEventListener('click', () => {
 dom.relayoutBtn.addEventListener('click', () => {
   if (!state.scene) return;
   const coords = relayout(state.scene.nodes, state.scene.edges);
-  state.scene = withLayout(state.scene, coords);
+  const next = withLayout(state.scene, coords);
+  // 手动重排是新的"源坐标"：之后的碰撞松弛从它出发（否则下一次 draw 会
+  // 把用户刚排好的坐标丢掉，重新按服务端坐标算）。
+  setScene(next);
   state.baseScene = withLayout(state.baseScene, coords);
+
   draw();
   renderStageNote(`${buildStageNote()}（本地重排：坐标仅在本页生效，不写服务端）`.trim());
 });

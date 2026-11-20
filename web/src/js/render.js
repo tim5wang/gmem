@@ -3,7 +3,7 @@
 // 分档的意义（TD §9「渲染上限」）：SVG 每个节点都是 DOM，2k 以上浏览器会被
 // 样式重算拖死；Canvas 一次 drawImage 画完，但失去逐元素事件——因此大图档
 // 用"按坐标命中测试"补回点击与悬停，交互语义与 SVG 档保持一致。
-import { makeProjector } from './geometry.js';
+import { makeProjector, placeClusterBadges } from './geometry.js';
 import { conceptColor } from './model.js';
 import { layoutLabels, clusterObstacles } from './labelLayouter.js';
 
@@ -119,6 +119,10 @@ export function renderSVG(svg, scene, opts) {
     const key = c.id || c.concept_id || '';
     clusterPos.set(key, p);
   }
+  // 团徽位置（圆盘 + 团名）可能与团心不同：概览下要让位到节点云外侧，
+  // 否则团名会压住团心那个节点（demo 三个团全部命中）。
+  // 折叠视图（团里没有可见节点）仍然画在团心，行为不变。
+  const clusterBadges = placeClusterBadges(scene, project, { width, height });
 
   const pos = new Map();
   for (const n of scene.nodes) pos.set(n.id, project(n.x, n.y));
@@ -175,15 +179,17 @@ export function renderSVG(svg, scene, opts) {
   // 语义上它是交互层而不是视觉层，删/改视觉不会顺手把点击弄没。
   const drillable = Boolean(scene.meta?.truncated);
   for (const c of scene.clusters) {
-    const p = clusterPos.get(c.id || c.concept_id || '');
+    const key = c.id || c.concept_id || '';
+    const p = clusterPos.get(key);
     if (!p) continue;
     const r = 10 + Math.min(30, Math.sqrt(Math.max(1, c.count)) * 3.2);
+    const badge = clusterBadges.get(key) || { x: p.x, y: p.y, r, labelY: p.y + r + 13 };
     const g = el('g', {
       class: `cluster${drillable ? ' drillable' : ''}`,
       'data-cluster-id': c.concept_id || '',
       'data-cluster-name': c.concept_name || c.id || '',
       'data-count': String(c.count),
-      transform: `translate(${p.x.toFixed(1)},${p.y.toFixed(1)})`,
+      transform: `translate(${badge.x.toFixed(1)},${badge.y.toFixed(1)})`,
     });
     if (drillable) {
       // 命中层：透明、只负责任事件（下钻），不参与视觉。
@@ -204,9 +210,10 @@ export function renderSVG(svg, scene, opts) {
       'pointer-events': 'none',
     }));
     // 团标签：名字 + 计数（点了才能下钻，所以计数必须直接读得出来）。
+    // y 是相对团徽中心的偏移（团徽可能已经被让位到云外）。
     const label = el('text', {
       'text-anchor': 'middle',
-      y: String(r + 13),
+      y: String(Math.round((badge.labelY - badge.y) * 10) / 10),
       fill: STYLE.label,
       'font-size': '11',
       class: 'cluster-label',
@@ -283,7 +290,8 @@ export function renderSVG(svg, scene, opts) {
   const placed = layoutLabels(labelItems, {
     width,
     height,
-    obstacles: clusterObstacles(scene, project),
+    // 障碍框按**实际画出去**的团徽位置算（含让位后的偏移与画布尺寸）。
+    obstacles: clusterObstacles(scene, project, { width, height }),
   });
   for (const lab of placed.labels) {
     const text = el('text', {
@@ -382,12 +390,17 @@ export function renderCanvas(canvas, scene, opts) {
     ctx.restore();
   }
 
+  // 与 SVG 档同一份团徽位置（含概览下的让位），避免两档画在不同位置。
+  const clusterBadges = placeClusterBadges(scene, project, { width, height });
   for (const c of scene.clusters) {
-    const p = project(c.x, c.y);
+    const key = c.id || c.concept_id || '';
+    const cp = clusterPos.get(key);
+    if (!cp) continue;
     const r = 10 + Math.min(30, Math.sqrt(Math.max(1, c.count)) * 3.2);
+    const badge = clusterBadges.get(key) || { x: cp.x, y: cp.y, r, labelY: cp.y + r + 13 };
     ctx.save();
     ctx.beginPath();
-    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.arc(badge.x, badge.y, r, 0, Math.PI * 2);
     ctx.fillStyle = STYLE.clusterFill;
     ctx.fill();
     ctx.strokeStyle = c.matched ? STYLE.matchedStroke : STYLE.clusterStroke;
@@ -396,7 +409,7 @@ export function renderCanvas(canvas, scene, opts) {
     ctx.fillStyle = STYLE.label;
     ctx.font = '11px system-ui, sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText(`${c.concept_name || c.id || '(未归属概念)'} · ${c.count}`, p.x, p.y + r + 13);
+    ctx.fillText(`${c.concept_name || c.id || '(未归属概念)'} · ${c.count}`, badge.x, badge.labelY);
     ctx.restore();
   }
 

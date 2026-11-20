@@ -679,7 +679,7 @@ func (s *Server) layout(ctx context.Context, nodes map[string]*nodeAcc, edges ma
 		x, y := clusterCenter(i)
 		centers[k] = [2]float64{x, y}
 	}
-	// 团内序号 + 团内节点数：叶序格点 (r = R*sqrt(j/n), theta = j*goldenAngle) 的两个参数。
+	// 团内序号 + 团内节点数：叶序格点 (r = R*sqrt((j+0.5)/n), theta = j*goldenAngle) 的两个参数。
 	// 两者都只由本次请求的节点集（已按 ID 排序）决定，因此仍是纯函数。
 	leafIndex, leafCount := leafOrder(refs)
 

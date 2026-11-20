@@ -384,26 +384,40 @@ func TestCoordsDeterministic(t *testing.T) {
 	}
 }
 
-// TestCoordsDependOnlyOnNodeID 证明坐标不依赖请求顺序/时间：删掉别的节点，
-// 剩余节点的坐标必须不变（否则前端每加一条记忆就整图重排）。
+// TestCoordsDependOnlyOnNodeID 证明坐标不依赖请求顺序/时间：**其它团**的节点
+// 增减不得让本团节点位移（否则前端每加一条记忆就整图重排）。
+//
+// 本卡修正（为什么断言口径变了）：旧版本断言"同团再加一个节点、节点 a 也不动"，
+// 而它当时能通过纯粹是因为 index=0 的节点 r 恒为 0（r = R*sqrt(index/count)）——
+// 那正是本卡要修的"第一个节点落在团心被团标签盖住"的根因。叶序坐标按设计是
+// (团内序号, 团内节点数) 的函数（见 layout.go 顶部注释：R = f(n)），团内节点数
+// 变化必然改变 R(n)，同团兄弟节点会随之外扩/内收。这是设计如此，不是抖动。
+// 真正必须成立的不变量是两条：①团与团之间互相隔离（本测试）；
+// ②同一输入逐字节一致（TestCoordsDeterministic）。
 func TestCoordsDependOnlyOnNodeID(t *testing.T) {
 	h1 := newHarness(t)
 	h1.concept("c1", "C1", store.ConceptCertified, store.ScopeUser, "")
+	h1.concept("c2", "C2", store.ConceptCertified, store.ScopeUser, "")
 	h1.node("a", "A", store.ScopeUser, "c1")
 	h1.node("b", "B", store.ScopeUser, "c1")
+	h1.node("x", "X", store.ScopeUser, "c2")
 	_, r1, _ := h1.getGraph("")
-	posA1 := mustPos(t, r1, "a")
 
 	h2 := newHarness(t)
 	h2.concept("c1", "C1", store.ConceptCertified, store.ScopeUser, "")
+	h2.concept("c2", "C2", store.ConceptCertified, store.ScopeUser, "")
 	h2.node("a", "A", store.ScopeUser, "c1")
 	h2.node("b", "B", store.ScopeUser, "c1")
-	h2.node("z", "Z", store.ScopeUser, "c1") // 多一个节点
+	h2.node("x", "X", store.ScopeUser, "c2")
+	h2.node("y", "Y", store.ScopeUser, "c2") // 只在**别的团**里多一个节点
 	_, r2, _ := h2.getGraph("")
-	posA2 := mustPos(t, r2, "a")
 
-	if posA1 != posA2 {
-		t.Fatalf("节点 a 的坐标因其它节点增减而漂移：%+v vs %+v", posA1, posA2)
+	for _, id := range []string{"a", "b"} {
+		pos1 := mustPos(t, r1, id)
+		pos2 := mustPos(t, r2, id)
+		if pos1 != pos2 {
+			t.Fatalf("节点 %s 的坐标因**其它团**的节点增减而漂移：%+v vs %+v", id, pos1, pos2)
+		}
 	}
 }
 
