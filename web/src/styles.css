@@ -365,6 +365,60 @@ body.route-recall > .banners,
 body.route-recall > .layout,
 body.route-recall > .timeline { display: none; }
 
+/* Review Queue（P6-2）：与 Recall 页同一套"非 Graph 路由"手法，
+   Graph View 的规则一行未改。 */
+body.route-review { grid-template-rows: 1fr; }
+body.route-review > .topbar,
+body.route-review > .banners,
+body.route-review > .layout,
+body.route-review > .timeline { display: none; }
+
+.page-review {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-height: 0;
+  background: var(--surface-0);
+  overflow: hidden;
+}
+.page-review[hidden] { display: none; }
+
+.review-root {
+  min-height: 0;
+  overflow: auto;
+  padding: var(--s3);
+}
+
+.review-body { display: grid; gap: var(--s3); }
+.review-banners:empty { display: none; }
+.review-banners { display: grid; gap: var(--s2); }
+
+.review-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  flex-wrap: wrap;
+  padding: var(--s2) var(--s3);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r2);
+}
+.review-count { font-weight: 600; color: var(--text-1); font-variant-numeric: tabular-nums; }
+.review-scope { color: var(--text-3); font-size: var(--fs-5); }
+.review-actions { display: flex; gap: var(--s2); flex-wrap: wrap; }
+
+.review-table-wrap { overflow: auto; background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r2); }
+.review-table { background: transparent; }
+.review-table td.review-edge { font-family: var(--mono, ui-monospace, SFMono-Regular, monospace); }
+.review-table td.review-reason { color: var(--text-2); max-width: 28ch; }
+.review-check { width: 2rem; text-align: center; }
+.review-row-actions { display: flex; gap: var(--s1); align-items: center; white-space: nowrap; }
+.review-row-locked { opacity: .7; }
+.review-locked { color: var(--text-3); }
+.review-jump { color: var(--accent); }
+.review-failed-list { margin: var(--s1) 0 0; padding-left: var(--s4); }
+.review-result-links { color: var(--text-2); }
+.review-pair { max-width: 30ch; }
+
 .page-recall {
   display: grid;
   grid-template-rows: auto auto 1fr;

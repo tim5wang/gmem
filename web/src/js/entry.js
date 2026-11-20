@@ -10,15 +10,16 @@
 import { matchRoute, isImplemented, notImplementedMessage, PAGE_TITLES } from './router.js';
 import { boot as bootGraph } from './main.js';
 import { bootRecall } from './recallmain.js';
+import { bootReview } from './reviewmain.js';
 import { h } from './ui/dom.js';
 
-// hideAllPages 把两页的容器都藏起来（分发前归一，避免上一页残留）。
+// hideAllPages 把几页的容器都藏起来（分发前归一，避免上一页残留）。
 function hideAllPages() {
-  for (const id of ['page-recall', 'page-generic']) {
+  for (const id of ['page-recall', 'page-review', 'page-generic']) {
     const el = document.getElementById(id);
     if (el) el.hidden = true;
   }
-  document.body.classList.remove('route-recall', 'route-generic');
+  document.body.classList.remove('route-recall', 'route-review', 'route-generic');
 }
 
 // renderGeneric 渲染"未实现 / 404"视图。
@@ -60,6 +61,13 @@ export async function dispatch(pathname) {
     const el = document.getElementById('page-recall');
     if (el) el.hidden = false;
     await bootRecall(document.getElementById('recall-root'));
+    return { page, path };
+  }
+  if (page === 'review') {
+    document.title = 'Gmem · Review Queue';
+    const el = document.getElementById('page-review');
+    if (el) el.hidden = false;
+    await bootReview(document.getElementById('review-root'));
     return { page, path };
   }
   renderGeneric(document.getElementById('page-generic'), { page, path });

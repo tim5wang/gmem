@@ -25,6 +25,7 @@
   <nav class="nav" aria-label="页面导航">
     <a href="/" aria-current="page">Graph</a>
     <a href="/recall">Recall</a>
+    <a href="/review">Review</a>
   </nav>
   <span id="mode-badge" class="badge" title="入口：focus / search / overview">-</span>
   <button type="button" id="relayout-btn" title="仅在本地用 d3-force 重算坐标，不回写服务端">重新布局</button>
@@ -53,6 +54,8 @@
       <li><span class="sw matched"></span>红描边 = 本次召回命中（matched）</li>
       <li>边标签只在悬停时出现</li>
     </ul>
+    <!-- 双向连线（P6-2）：Graph View 的蓝边是单条裁决入口，这里是“全部待审”的入口。 -->
+    <p class="hint"><a id="review-all-link" href="/review">查看全部待审 →</a></p>
   </aside>
 
   <section id="stage" class="stage">
@@ -99,6 +102,7 @@
     <nav class="nav" aria-label="页面导航">
       <a href="/">Graph</a>
       <a href="/recall" aria-current="page">Recall</a>
+      <a href="/review">Review</a>
     </nav>
     <form id="recall-search-form" class="search">
       <input id="recall-q-input" type="search" placeholder="召回查询（写 ?q=）" autocomplete="off">
@@ -108,6 +112,34 @@
     <span id="recall-badge" class="badge">-</span>
   </header>
   <div id="recall-root" class="recall-root"></div>
+</div>
+
+<!-- P6-2：Review Queue 页（待审池全貌）。
+     与 #page-recall 同一手法：常驻顶栏写在 HTML 里，页面重画只换 #review-root。 -->
+<div id="page-review" class="page-review" hidden>
+  <header class="recall-topbar">
+    <h1>Review Queue</h1>
+    <nav class="nav" aria-label="页面导航">
+      <a href="/">Graph</a>
+      <a href="/recall">Recall</a>
+      <a href="/review" aria-current="page">Review</a>
+    </nav>
+    <form id="review-scope-form" class="search">
+      <label class="num">scope
+        <select id="review-scope-input">
+          <option value="">全部</option>
+          <option value="user">user</option>
+          <option value="agent">agent</option>
+          <option value="project">project</option>
+          <option value="global">global</option>
+        </select>
+      </label>
+      <button type="submit">应用</button>
+    </form>
+    <span class="spacer"></span>
+    <span id="review-badge" class="badge">-</span>
+  </header>
+  <div id="review-root" class="review-root"></div>
 </div>
 
 <!-- 未实现页 / 404 视图的容器（客户端路由判定后填充）。

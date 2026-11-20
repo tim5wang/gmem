@@ -63,6 +63,16 @@ export function fetchRecall(fetchImpl, url) {
   return request(fetchImpl, url, { headers: { Accept: 'application/json' } });
 }
 
+// fetchReviewPending 请求 GET /api/review/pending（Review Queue 的唯一数据源）。
+//
+// 与 fetchRecall 同一手法：页面层的调用点只有一个，"到底请求了哪个 URL"
+// 在代码里可被搜索到，而不是散在事件处理里拼串。
+//
+// url 必须由调用方用 reviewstate.toReviewURL 生成（非法 scope 在发请求前就被拦下）。
+export function fetchReviewPending(fetchImpl, url) {
+  return request(fetchImpl, url, { headers: { Accept: 'application/json' } });
+}
+
 // postReview 是**唯一**的写请求（POST /api/review）。
 //
 // confirmed 由调用方显式传 true —— UI 侧必须已经过二次确认弹窗。

@@ -5,7 +5,7 @@
 //
 //   /            → graph      （Graph View，P4 已完成）
 //   /recall      → recall     （Recall Inspector，P6-1）
-//   /review      → review     （P6-2，尚未实现 → 显示"未实现"视图）
+//   /review      → review     （Review Queue，P6-2）
 //   /stream      → stream     （P6-3）
 //   /ontology    → ontology   （P6-5）
 //   /metrics     → metrics    （P6-4）
@@ -40,7 +40,7 @@ export const PAGE_TITLES = Object.freeze({
 // 与 ROUTES 分开：ROUTES 表达"这个 URL 属于哪一页"（长期稳定），
 // IMPLEMENTED 表达"这一页做完了没有"（随卡推进）。混成一个表会让
 // "新增一页"和"做完一页"两件事互相牵连。
-export const IMPLEMENTED = Object.freeze(['graph', 'recall']);
+export const IMPLEMENTED = Object.freeze(['graph', 'recall', 'review']);
 
 // normalizePath 去掉末尾斜杠（/recall/ 与 /recall 是同一页）。
 export function normalizePath(pathname) {
@@ -68,5 +68,5 @@ export function isImplemented(page) {
 export function notImplementedMessage(page) {
   const title = PAGE_TITLES[page] || page;
   return `「${title}」这一页还没实现（详见 TD §9 六页计划）。` +
-    `当前可用：Graph View 与 Recall Inspector。`;
+    `当前可用：Graph View、Recall Inspector 与 Review Queue。`;
 }

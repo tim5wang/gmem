@@ -105,6 +105,9 @@ func (s *Server) Routes() []Route {
 		{Method: http.MethodGet, Pattern: "/api/graph"},
 		{Method: http.MethodGet, Pattern: "/api/entity/"},
 		{Method: http.MethodGet, Pattern: "/api/recall"},
+		// 待审池（P6-2）：只读，且与 POST /api/review 是**不同路径**，
+		// 因此不会被后者的 method guard 误伤（guard 按路径精确匹配）。
+		{Method: http.MethodGet, Pattern: "/api/review/pending"},
 		{Method: http.MethodPost, Pattern: "/api/review"},
 	}
 }
@@ -129,6 +132,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/graph", s.guardMethod(http.MethodGet, s.handleGraph))
 	mux.HandleFunc("/api/entity/", s.guardMethod(http.MethodGet, s.handleEntity))
 	mux.HandleFunc("/api/recall", s.guardMethod(http.MethodGet, s.handleRecall))
+	// 注意注册顺序无关：net/http 的 ServeMux 按**最长模式**匹配，
+	// "/api/review/pending" 比 "/api/review" 更具体，因此 GET 待审池不会落到
+	// 只接受 POST 的 handleReview 上（这一点由 review_pending_test.go 钉死）。
+	mux.HandleFunc("/api/review/pending", s.guardMethod(http.MethodGet, s.handleReviewPending))
 	mux.HandleFunc("/api/review", s.guardMethod(http.MethodPost, s.handleReview))
 	// GET /assets/* 返回 //go:embed 进来的 web/dist 产物（只读）。
 	mux.HandleFunc("/assets/", s.guardMethod(http.MethodGet, s.handleAsset))
