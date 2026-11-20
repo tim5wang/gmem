@@ -66,9 +66,14 @@ func TestNoLLMSDKImports(t *testing.T) {
 			return err
 		}
 		if info.IsDir() {
-			// 跳过版本控制与测试/工具目录
+			// 跳过版本控制与测试/工具目录。
+			//
+			// .godex 是本仓的 agent 暂存目录（已 gitignore）：调研卡会往里克隆
+			// **第三方参考源码**。若在这里不跳过，那些外部库的 net/http / LLM SDK
+			// import 会被当成本仓生产代码，让本用例凭空变红——那不是真实缺陷，
+			// 却会让全量测试不可信。因此与 .git 同待遇。
 			switch info.Name() {
-			case ".git", "testdata", "node_modules":
+			case ".git", "testdata", "node_modules", ".godex":
 				return filepath.SkipDir
 			}
 			return nil
@@ -157,7 +162,8 @@ func TestServePackagesMakeNoOutboundHTTP(t *testing.T) {
 			return err
 		}
 		if info.IsDir() {
-			if info.Name() == ".git" {
+			// .godex 同 .git：只放 agent 暂存与第三方参考源码，不是本仓产物。
+			if info.Name() == ".git" || info.Name() == ".godex" {
 				return filepath.SkipDir
 			}
 			return nil
@@ -287,7 +293,8 @@ func TestNoCGOImport(t *testing.T) {
 			return err
 		}
 		if info.IsDir() {
-			if info.Name() == ".git" {
+			// .godex 同 .git：agent 暂存与第三方参考源码都在这里，不是本仓产物。
+			if info.Name() == ".git" || info.Name() == ".godex" {
 				return filepath.SkipDir
 			}
 			return nil
