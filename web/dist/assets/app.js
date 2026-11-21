@@ -1828,12 +1828,6 @@ function lcg() {
   let s = 1;
   return () => (s = (a * s + c) % m) / m;
 }
-function x$1(d) {
-  return d.x;
-}
-function y$1(d) {
-  return d.y;
-}
 var initialRadius = 10;
 var initialAngle = Math.PI * (3 - Math.sqrt(5));
 function simulation(nodes) {
@@ -1935,83 +1929,6 @@ function simulation(nodes) {
     }
   };
 }
-function manyBody() {
-  var nodes, node, random, alpha, strength = constant(-30), strengths, distanceMin2 = 1, distanceMax2 = Infinity, theta2 = 0.81;
-  function force(_) {
-    var i, n = nodes.length, tree = quadtree(nodes, x$1, y$1).visitAfter(accumulate);
-    for (alpha = _, i = 0; i < n; ++i) node = nodes[i], tree.visit(apply);
-  }
-  function initialize() {
-    if (!nodes) return;
-    var i, n = nodes.length, node2;
-    strengths = new Array(n);
-    for (i = 0; i < n; ++i) node2 = nodes[i], strengths[node2.index] = +strength(node2, i, nodes);
-  }
-  function accumulate(quad) {
-    var strength2 = 0, q, c2, weight = 0, x2, y2, i;
-    if (quad.length) {
-      for (x2 = y2 = i = 0; i < 4; ++i) {
-        if ((q = quad[i]) && (c2 = Math.abs(q.value))) {
-          strength2 += q.value, weight += c2, x2 += c2 * q.x, y2 += c2 * q.y;
-        }
-      }
-      quad.x = x2 / weight;
-      quad.y = y2 / weight;
-    } else {
-      q = quad;
-      q.x = q.data.x;
-      q.y = q.data.y;
-      do
-        strength2 += strengths[q.data.index];
-      while (q = q.next);
-    }
-    quad.value = strength2;
-  }
-  function apply(quad, x1, _, x2) {
-    if (!quad.value) return true;
-    var x3 = quad.x - node.x, y2 = quad.y - node.y, w = x2 - x1, l = x3 * x3 + y2 * y2;
-    if (w * w / theta2 < l) {
-      if (l < distanceMax2) {
-        if (x3 === 0) x3 = jiggle(random), l += x3 * x3;
-        if (y2 === 0) y2 = jiggle(random), l += y2 * y2;
-        if (l < distanceMin2) l = Math.sqrt(distanceMin2 * l);
-        node.vx += x3 * quad.value * alpha / l;
-        node.vy += y2 * quad.value * alpha / l;
-      }
-      return true;
-    } else if (quad.length || l >= distanceMax2) return;
-    if (quad.data !== node || quad.next) {
-      if (x3 === 0) x3 = jiggle(random), l += x3 * x3;
-      if (y2 === 0) y2 = jiggle(random), l += y2 * y2;
-      if (l < distanceMin2) l = Math.sqrt(distanceMin2 * l);
-    }
-    do
-      if (quad.data !== node) {
-        w = strengths[quad.data.index] * alpha / l;
-        node.vx += x3 * w;
-        node.vy += y2 * w;
-      }
-    while (quad = quad.next);
-  }
-  force.initialize = function(_nodes, _random) {
-    nodes = _nodes;
-    random = _random;
-    initialize();
-  };
-  force.strength = function(_) {
-    return arguments.length ? (strength = typeof _ === "function" ? _ : constant(+_), initialize(), force) : strength;
-  };
-  force.distanceMin = function(_) {
-    return arguments.length ? (distanceMin2 = _ * _, force) : Math.sqrt(distanceMin2);
-  };
-  force.distanceMax = function(_) {
-    return arguments.length ? (distanceMax2 = _ * _, force) : Math.sqrt(distanceMax2);
-  };
-  force.theta = function(_) {
-    return arguments.length ? (theta2 = _ * _, force) : Math.sqrt(theta2);
-  };
-  return force;
-}
 function x(x2) {
   var strength = constant(0.1), nodes, strengths, xz;
   if (typeof x2 !== "function") x2 = constant(x2 == null ? 0 : +x2);
@@ -2072,11 +1989,53 @@ function y(y2) {
 }
 
 // js/layout.js
-function relayout(nodes, edges, { ticks = 220 } = {}) {
+function relayout(nodes, edges, { ticks = 260 } = {}) {
+  if (!nodes || nodes.length < 2) return /* @__PURE__ */ new Map();
   const simNodes = nodes.map((n) => ({ id: n.id, x: n.x, y: n.y }));
   const byId = new Map(simNodes.map((n) => [n.id, n]));
   const links = edges.filter((e) => byId.has(e.from) && byId.has(e.to)).map((e) => ({ source: e.from, target: e.to }));
-  const sim = simulation(simNodes).force("link", link(links).id((d) => d.id).distance(0.24).strength(0.35)).force("charge", manyBody().strength(-0.09).distanceMax(1.6)).force("collide", collide().radius(0.045)).force("x", x((d) => anchorOf(nodes, d.id).x).strength(0.06)).force("y", y((d) => anchorOf(nodes, d.id).y).strength(0.06)).stop();
+  const edgeLens = [];
+  for (const l of links) {
+    const a2 = byId.get(l.source);
+    const b = byId.get(l.target);
+    edgeLens.push(Math.hypot(a2.x - b.x, a2.y - b.y));
+  }
+  const dMed = median(edgeLens) || 0.4;
+  const groups = /* @__PURE__ */ new Map();
+  for (const n of nodes) {
+    const key = n.cluster || n.concept_id || "";
+    (groups.get(key) || groups.set(key, []).get(key)).push(n);
+  }
+  const nn = [];
+  for (const g of groups.values()) {
+    if (g.length < 2) continue;
+    for (const a2 of g) {
+      let best = Infinity;
+      for (const b of g) {
+        if (a2 === b) continue;
+        const d = Math.hypot(a2.x - b.x, a2.y - b.y);
+        if (d < best) best = d;
+      }
+      if (Number.isFinite(best)) nn.push(best);
+    }
+  }
+  const nnMed = median(nn) || dMed * 0.2;
+  const anchor = /* @__PURE__ */ new Map();
+  for (const [key, g] of groups.entries()) {
+    let sx = 0;
+    let sy = 0;
+    for (const n of g) {
+      sx += n.x;
+      sy += n.y;
+    }
+    anchor.set(key, { x: sx / g.length, y: sy / g.length });
+  }
+  const anchorOf = (id) => {
+    const n = nodes.find((x2) => x2.id === id);
+    const key = n ? n.cluster || n.concept_id || "" : "";
+    return anchor.get(key) || { x: n ? n.x : 0, y: n ? n.y : 0 };
+  };
+  const sim = simulation(simNodes).force("link", link(links).id((d) => d.id).distance(dMed).strength(0.35)).force("collide", collide().radius(Math.max(nnMed / 2, 0.02)).iterations(2)).force("x", x((d) => anchorOf(d.id).x).strength(0.3)).force("y", y((d) => anchorOf(d.id).y).strength(0.3)).stop();
   for (let i = 0; i < ticks; i++) sim.tick();
   const out = /* @__PURE__ */ new Map();
   for (const n of simNodes) {
@@ -2087,12 +2046,38 @@ function relayout(nodes, edges, { ticks = 220 } = {}) {
   }
   return out;
 }
-function anchorOf(nodes, id) {
-  const n = nodes.find((x2) => x2.id === id);
-  return { x: n ? n.x : 0, y: n ? n.y : 0 };
+function median(arr) {
+  if (!arr || !arr.length) return 0;
+  const s = [...arr].sort((a2, b) => a2 - b);
+  const m2 = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m2] : (s[m2 - 1] + s[m2]) / 2;
 }
 function round(v) {
   return Math.round(v * 1e6) / 1e6;
+}
+function clusterCentroids(nodes, clusters, coords) {
+  if (!clusters || !clusters.length) return clusters;
+  const acc = /* @__PURE__ */ new Map();
+  for (const n of nodes) {
+    const c2 = coords.get(n.id);
+    if (!c2) continue;
+    const key = n.cluster || n.concept_id || "";
+    if (!key) continue;
+    const a2 = acc.get(key);
+    if (a2) {
+      a2.sx += c2.x;
+      a2.sy += c2.y;
+      a2.n += 1;
+    } else {
+      acc.set(key, { sx: c2.x, sy: c2.y, n: 1 });
+    }
+  }
+  return clusters.map((cl) => {
+    const key = cl.id || cl.concept_id || "";
+    const a2 = acc.get(key);
+    if (!a2 || a2.n === 0) return cl;
+    return { ...cl, x: round(a2.sx / a2.n), y: round(a2.sy / a2.n) };
+  });
 }
 function withLayout(scene, coords) {
   return {
@@ -2101,7 +2086,9 @@ function withLayout(scene, coords) {
     nodes: scene.nodes.map((n) => {
       const c2 = coords.get(n.id);
       return c2 ? { ...n, x: c2.x, y: c2.y } : n;
-    })
+    }),
+    // 团徽跟着自己的节点云走：不重算就会留在旧位置（实测脱节达 192px）。
+    clusters: clusterCentroids(scene.nodes, scene.clusters, coords)
   };
 }
 
