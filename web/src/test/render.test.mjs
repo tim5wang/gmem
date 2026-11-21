@@ -52,6 +52,16 @@ function installDOM() {
   };
 }
 
+// isEdgeEl 判定“这是一个边图元”。
+//
+// 边从 `<line>` 改成 `<path>`（二次贝塞尔：长跨团边不再横切画布、不从无关节点
+// 中间穿过），写死 `tagName === 'line'` 会一条边都选不到。这里两者都认。
+//
+// **这不是放宽断言**：真正的内容断言（stroke / dasharray / stroke-opacity /
+// 端点是否落在圆外）一条没改，改的只是“怎么定位到那个元素”。
+const isEdgeEl = (e) =>
+  (e.tagName === 'line' || e.tagName === 'path') && e.getAttribute('data-edge-id') !== null;
+
 function fixture() {
   return {
     meta: { mode: 'focus', budget: 200, budget_max: 2000, node_count: 4, truncated: false },
@@ -84,7 +94,7 @@ function renderFixture(overrides = {}) {
 
 test('渲染产出边 / 团 / 节点 / 标签四层，且图元数与场景一致', () => {
   const { svg, scene } = renderFixture();
-  const edges = svg.all((e) => e.tagName === 'line' && e.getAttribute('data-edge-id') !== null);
+  const edges = svg.all((e) => isEdgeEl(e));
   const nodes = svg.all((e) => e.tagName === 'g' && e.getAttribute('data-node-id') !== null);
   const clusters = svg.all((e) => e.tagName === 'g' && e.getAttribute('data-cluster-id') !== null);
   assert.equal(edges.length, scene.edges.length);
@@ -126,7 +136,7 @@ test('(c) 节点半径按 degree 递增（degree 9 > degree 1）', () => {
 
 test('(d) 当前有效边是实线（无 dasharray）', () => {
   const { svg } = renderFixture();
-  const line = svg.all((e) => e.tagName === 'line' && e.getAttribute('data-edge-id') === 'e-ok')[0];
+  const line = svg.all((e) => isEdgeEl(e) && e.getAttribute('data-edge-id') === 'e-ok')[0];
   assert.equal(line.getAttribute('stroke-dasharray'), 'none');
   assert.equal(line.getAttribute('stroke'), STYLE.edgeColor);
   assert.equal(line.getAttribute('stroke-opacity'), '1');
@@ -134,7 +144,7 @@ test('(d) 当前有效边是实线（无 dasharray）', () => {
 
 test('(e) t_invalid 非零的已失效边画虚线淡边，且**仍然出现在图里**（不过滤）', () => {
   const { svg } = renderFixture();
-  const dead = svg.all((e) => e.tagName === 'line' && e.getAttribute('data-edge-id') === 'e-dead');
+  const dead = svg.all((e) => isEdgeEl(e) && e.getAttribute('data-edge-id') === 'e-dead');
   assert.equal(dead.length, 1, '失效边不得被过滤掉');
   assert.equal(dead[0].getAttribute('stroke-dasharray'), '4 3');
   assert.ok(Number(dead[0].getAttribute('stroke-opacity')) < 1, '失效边必须变淡');
@@ -143,16 +153,16 @@ test('(e) t_invalid 非零的已失效边画虚线淡边，且**仍然出现在�
 
 test('(e2) 时间轴回拨到失效前：同一条边变回实线（只改样式，不增删图元）', () => {
   const { svg, scene } = renderFixture({ asOf: 50 });
-  const dead = svg.all((e) => e.tagName === 'line' && e.getAttribute('data-edge-id') === 'e-dead')[0];
+  const dead = svg.all((e) => isEdgeEl(e) && e.getAttribute('data-edge-id') === 'e-dead')[0];
   assert.equal(dead.getAttribute('stroke-dasharray'), 'none', 'as_of=50 时该边还没失效');
   assert.equal(dead.getAttribute('stroke-opacity'), '1');
   // 图元数不变 = 没有重排/重建结构。
-  assert.equal(svg.all((e) => e.tagName === 'line' && e.getAttribute('data-edge-id') !== null).length, scene.edges.length);
+  assert.equal(svg.all((e) => isEdgeEl(e)).length, scene.edges.length);
 });
 
 test('(f) possiblySame 边是蓝色（且可点裁决）', () => {
   const { svg } = renderFixture();
-  const same = svg.all((e) => e.tagName === 'line' && e.getAttribute('data-edge-id') === 'e-same')[0];
+  const same = svg.all((e) => isEdgeEl(e) && e.getAttribute('data-edge-id') === 'e-same')[0];
   assert.equal(same.getAttribute('stroke'), STYLE.edgePossiblySameColor);
   assert.equal(same.getAttribute('data-possibly-same'), '1');
   assert.match(same.getAttribute('class'), /possibly-same/, '需要 class 供点击裁决绑定');

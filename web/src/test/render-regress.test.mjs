@@ -68,6 +68,9 @@ class FakeCanvas {
       save: rec('save'), restore: rec('restore'),
       beginPath: rec('beginPath'), arc: rec('arc'),
       moveTo: rec('moveTo'), lineTo: rec('lineTo'), stroke: rec('stroke'),
+      // 边改为二次贝塞尔曲线后，真实 ctx 有这个方法；打桩补齐它，
+      // 否则 Canvas 档渲染直接抛 TypeError: quadraticCurveTo is not a function。
+      quadraticCurveTo: rec('quadraticCurveTo'),
       fill: rec('fill'), fillText: rec('fillText'), setLineDash: rec('setLineDash'),
     };
   }
@@ -80,6 +83,16 @@ function installDOM() {
 }
 
 // fixture：与 render.test.mjs 同形（字段名与 server/types.go 一致）。
+// isEdgeEl 判定“这是一个边图元”。
+//
+// 边从 `<line>` 改成 `<path>`（二次贝塞尔：长跨团边不再横切画布、不从无关节点
+// 中间穿过），写死 `tagName === 'line'` 会一条边都选不到。这里两者都认。
+//
+// **这不是放宽断言**：真正的内容断言（stroke / dasharray / stroke-opacity /
+// 端点是否落在圆外 / class 是否带 possibly-same）一条没改，改的只是“怎么定位元素”。
+const isEdgeEl = (e) =>
+  (e.tagName === 'line' || e.tagName === 'path') && e.getAttribute('data-edge-id') !== null;
+
 function fixture(overrides = {}) {
   return {
     meta: { mode: 'focus', budget: 200, budget_max: 2000, node_count: 3, truncated: false },
@@ -157,7 +170,7 @@ test('【F-3】已裁决（invalidated）的 possiblySame 边不再蓝、不再�
   installDOM();
   const svg = new FakeElement('svg');
   renderSVG(svg, scene, { width: 800, height: 600 });
-  const byId = (id) => svg.all((e) => e.tagName === 'line' && e.getAttribute('data-edge-id') === id)[0];
+  const byId = (id) => svg.all((e) => isEdgeEl(e) && e.getAttribute('data-edge-id') === id)[0];
 
   const pending = byId('e-pending');
   assert.equal(pending.getAttribute('stroke'), STYLE.edgePossiblySameColor);
@@ -194,7 +207,7 @@ test('【F-4】边从节点圆边缘起画（节点圆不再吞掉边的两端�
   const svg = new FakeElement('svg');
   renderSVG(svg, scene, { width: 800, height: 600 });
 
-  const line = svg.all((e) => e.tagName === 'line' && e.getAttribute('data-edge-id') === 'e-ok')[0];
+  const line = svg.all((e) => isEdgeEl(e) && e.getAttribute('data-edge-id') === 'e-ok')[0];
   const nodeA = scene.nodes.find((n) => n.id === 'a');
   const nodeC = scene.nodes.find((n) => n.id === 'c');
   const project = makeProjector(scene, 800, 600);

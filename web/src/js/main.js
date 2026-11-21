@@ -359,7 +359,10 @@ function bindInteractions(useCanvas) {
     //
     // 选择器只看 class：render 层已经把 class 定为 possiblySame **且未失效**，
     // 已裁决过的边不再带 possibly-same（不再蓝、不绑 click），与服务端门禁双保险。
-    for (const line of dom.svg.querySelectorAll('line.edge.possibly-same')) {
+    // 选择器**不加** `line` 标签前缀：边现在是 `<path>`（二次贝塞尔曲线，
+    // 长跨团边不再横切画布）。写成 `line.edge` 会一条边都选不中 —— 待审蓝边
+    // 就点不开裁决窗了，那是功能回退而不是样式问题。只依赖 class + data-edge-id。
+    for (const line of dom.svg.querySelectorAll('.edge.possibly-same')) {
       const edgeId = line.getAttribute('data-edge-id');
       line.addEventListener('click', (ev) => {
         ev.stopPropagation();
@@ -369,7 +372,7 @@ function bindInteractions(useCanvas) {
       line.addEventListener('mouseleave', hideTooltip);
     }
     // (d/e) 非待审边也允许悬停看标签（"边标签仅悬停显示"）。
-    for (const line of dom.svg.querySelectorAll('line.edge:not(.possibly-same)')) {
+    for (const line of dom.svg.querySelectorAll('.edge:not(.possibly-same)')) {
       const edgeId = line.getAttribute('data-edge-id');
       line.addEventListener('mouseenter', (ev) => showEdgeTooltip(edgeId, ev));
       line.addEventListener('mouseleave', hideTooltip);

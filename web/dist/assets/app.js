@@ -850,6 +850,41 @@ function edgeEndpoints(a2, b, ra, rb) {
     y2: a2.y + dy * t2
   };
 }
+function edgeLanes(edges) {
+  const groups = /* @__PURE__ */ new Map();
+  for (const e of edges) {
+    const key = e.from < e.to ? `${e.from}\0${e.to}` : `${e.to}\0${e.from}`;
+    const arr = groups.get(key);
+    if (arr) arr.push(e);
+    else groups.set(key, [e]);
+  }
+  const lane = /* @__PURE__ */ new Map();
+  for (const arr of groups.values()) {
+    arr.sort((x2, y2) => x2.id < y2.id ? -1 : x2.id > y2.id ? 1 : 0);
+    for (let i = 0; i < arr.length; i++) lane.set(arr[i].id, i);
+  }
+  return lane;
+}
+function edgeCurve(a2, b, ra, rb, lane) {
+  const seg = edgeEndpoints(a2, b, ra, rb);
+  const dx = seg.x2 - seg.x1;
+  const dy = seg.y2 - seg.y1;
+  const len = Math.hypot(dx, dy);
+  if (!(len > 1)) {
+    return { ...seg, cx: (seg.x1 + seg.x2) / 2, cy: (seg.y1 + seg.y2) / 2 };
+  }
+  const k = Number.isFinite(lane) ? lane : 0;
+  const sign = k % 2 === 0 ? 1 : -1;
+  const mult = 1 + Math.floor(k / 2) * 1.6;
+  const bulge = Math.min(len * 0.16, 26) * mult * sign;
+  const nx = -dy / len;
+  const ny = dx / len;
+  return {
+    ...seg,
+    cx: (seg.x1 + seg.x2) / 2 + nx * bulge,
+    cy: (seg.y1 + seg.y2) / 2 + ny * bulge
+  };
+}
 function renderSVG(svg, scene, opts) {
   const { width, height } = opts;
   const project = makeProjector(scene, width, height);
@@ -892,17 +927,23 @@ function renderSVG(svg, scene, opts) {
     ...scene.edges.filter((e) => !isPendingReview(e)),
     ...scene.edges.filter(isPendingReview)
   ];
+  const lanes = edgeLanes(scene.edges);
   for (const e of ordered) {
     const a2 = pos.get(e.from);
     const b = pos.get(e.to);
     if (!a2 || !b) continue;
     const pending = isPendingReview(e);
-    const seg = edgeEndpoints(a2, b, nodeRadius2.get(e.from) ?? 0, nodeRadius2.get(e.to) ?? 0);
-    const line = el("line", {
-      x1: seg.x1.toFixed(1),
-      y1: seg.y1.toFixed(1),
-      x2: seg.x2.toFixed(1),
-      y2: seg.y2.toFixed(1),
+    const c2 = edgeCurve(a2, b, nodeRadius2.get(e.from) ?? 0, nodeRadius2.get(e.to) ?? 0, lanes.get(e.id) ?? 0);
+    const path = el("path", {
+      // 二次贝塞尔：控制点偏离中点，形成微弯。
+      d: `M${c2.x1.toFixed(1)},${c2.y1.toFixed(1)} Q${c2.cx.toFixed(1)},${c2.cy.toFixed(1)} ${c2.x2.toFixed(1)},${c2.y2.toFixed(1)}`,
+      // path 默认会填充，必须显式 none，否则曲线围成的区域被涂黑。
+      fill: "none",
+      // 保留端点属性：F-4 用例据此断言“线从圆外起画”，调试时也能直接看出裁切结果。
+      x1: c2.x1.toFixed(1),
+      y1: c2.y1.toFixed(1),
+      x2: c2.x2.toFixed(1),
+      y2: c2.y2.toFixed(1),
       stroke: pending ? STYLE.edgePossiblySameColor : e.style.invalid ? STYLE.edgeInvalidColor : STYLE.edgeColor,
       "stroke-width": String(pending ? 2 : 1.2),
       "stroke-opacity": String(e.style.opacity),
@@ -917,7 +958,7 @@ function renderSVG(svg, scene, opts) {
       "data-pending": pending ? "1" : "0",
       class: `edge${pending ? " possibly-same" : ""}${e.style.invalid ? " invalidated" : ""}`
     });
-    gEdges.appendChild(line);
+    gEdges.appendChild(path);
   }
   const drillable = Boolean(scene.meta?.truncated);
   for (const c2 of scene.clusters) {
@@ -1063,20 +1104,21 @@ function renderCanvas(canvas, scene, opts) {
     ...scene.edges.filter((e) => !isPendingReview(e)),
     ...scene.edges.filter(isPendingReview)
   ];
+  const lanes = edgeLanes(scene.edges);
   for (const e of ordered) {
     const a2 = pos.get(e.from);
     const b = pos.get(e.to);
     if (!a2 || !b) continue;
     const pending = isPendingReview(e);
-    const seg = edgeEndpoints(a2, b, nodeRadius2.get(e.from) ?? 0, nodeRadius2.get(e.to) ?? 0);
+    const c2 = edgeCurve(a2, b, nodeRadius2.get(e.from) ?? 0, nodeRadius2.get(e.to) ?? 0, lanes.get(e.id) ?? 0);
     ctx.save();
     ctx.globalAlpha = e.style.opacity;
     ctx.strokeStyle = pending ? STYLE.edgePossiblySameColor : e.style.invalid ? STYLE.edgeInvalidColor : STYLE.edgeColor;
     ctx.lineWidth = pending ? 2 : 1;
     if (e.style.dashed) ctx.setLineDash([4, 3]);
     ctx.beginPath();
-    ctx.moveTo(seg.x1, seg.y1);
-    ctx.lineTo(seg.x2, seg.y2);
+    ctx.moveTo(c2.x1, c2.y1);
+    ctx.quadraticCurveTo(c2.cx, c2.cy, c2.x2, c2.y2);
     ctx.stroke();
     ctx.restore();
   }
@@ -2483,7 +2525,7 @@ function bindInteractions(useCanvas) {
       g.addEventListener("mouseenter", (ev) => showNodeTooltip(id, ev));
       g.addEventListener("mouseleave", hideTooltip);
     }
-    for (const line of dom.svg.querySelectorAll("line.edge.possibly-same")) {
+    for (const line of dom.svg.querySelectorAll(".edge.possibly-same")) {
       const edgeId = line.getAttribute("data-edge-id");
       line.addEventListener("click", (ev) => {
         ev.stopPropagation();
@@ -2492,7 +2534,7 @@ function bindInteractions(useCanvas) {
       line.addEventListener("mouseenter", (ev) => showEdgeTooltip(edgeId, ev));
       line.addEventListener("mouseleave", hideTooltip);
     }
-    for (const line of dom.svg.querySelectorAll("line.edge:not(.possibly-same)")) {
+    for (const line of dom.svg.querySelectorAll(".edge:not(.possibly-same)")) {
       const edgeId = line.getAttribute("data-edge-id");
       line.addEventListener("mouseenter", (ev) => showEdgeTooltip(edgeId, ev));
       line.addEventListener("mouseleave", hideTooltip);
